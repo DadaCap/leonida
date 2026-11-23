@@ -46,6 +46,14 @@ class BenchTranslateTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("us/instr", result.stdout)
 
+    def test_compare_runs_two_trees_and_prints_a_ratio(self):
+        tools = os.path.join(ROOT, "tools")
+        result = run("--compare", tools, tools, "--rounds", "1", "--runs", "1", "--size", "20")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("ratio", result.stdout)
+        self.assertIn(tools, result.stdout)
+        self.assertIn("us_per_instruction", result.stdout)
+
     def test_bad_arguments_are_rejected(self):
         for args in (("--runs", "0"), ("--size", "0")):
             result = run(*args)

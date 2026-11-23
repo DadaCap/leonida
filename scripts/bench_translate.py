@@ -26,13 +26,14 @@ import json
 import os
 import statistics
 import struct
+import subprocess
 import sys
 import tempfile
 import time
 import warnings
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-TOOLS = os.path.join(ROOT, "tools")
+TOOLS = os.environ.get("LEONIDA_TOOLS_DIR") or os.path.join(ROOT, "tools")
 FIXTURES = os.path.join(ROOT, "tests", "semantic", "fixtures", "disasm")
 sys.dont_write_bytecode = True
 sys.path.insert(0, TOOLS)
@@ -136,6 +137,47 @@ def summarise(rows):
 BASELINE = {"corpus_us_per_instruction": 55.4, "alu_us_per_instruction": 32.3, "nop_us_per_instruction": 14.0}
 
 
+def compare(reference, candidate, runs, size, rounds):
+    """Interleaved A/B over two tools/ trees: each round measures both, and the best per side is kept.
+
+    Loading the tree is the subprocess's job (LEONIDA_TOOLS_DIR, as tests/semantic/support.py does it), so the two
+    versions never share a module. Alternating the two in the same round is the point: a machine that slows down or
+    speeds up between measurements moves both sides, not just one.
+    """
+    def measure(path):
+        env = dict(os.environ, LEONIDA_TOOLS_DIR=os.path.abspath(path))
+        result = subprocess.run([sys.executable, "-I", os.path.abspath(__file__), "--json",
+                                 "--runs", str(runs), "--size", str(size)],
+                                capture_output=True, text=True, env=env)
+        if result.returncode != 0:
+            raise SystemExit(f"{path}: the benchmark failed\n{result.stderr.strip()}")
+        return json.loads(result.stdout)["measured"]
+
+    best = {"reference": {}, "candidate": {}}
+    for round_index in range(rounds + 1):   # the first round warms the caches and is not counted
+        order = [("reference", reference), ("candidate", candidate)]
+        if round_index % 2:
+            order.reverse()                 # whoever runs first pays the cold file cache, so the order alternates
+        for side, path in order:
+            measured = measure(path)
+            if round_index == 0:
+                continue
+            for key, value in measured.items():
+                best[side][key] = min(best[side].get(key, value), value)
+    rows = []
+    for key in best["reference"]:
+        ref = best["reference"][key]
+        cand = best["candidate"].get(key, float("nan"))
+        rows.append({"name": key, "reference": ref, "candidate": cand, "ratio": cand / ref if ref else None})
+    print(f"{'measurement':<32} {'reference':>10} {'candidate':>10} {'ratio':>7}")
+    for row in rows:
+        print(f"{row['name']:<32} {row['reference']:>10.1f} {row['candidate']:>10.1f} "
+              f"{row['ratio']:>6.2f}x")
+    print(f"\nreference {os.path.abspath(reference)}\ncandidate {os.path.abspath(candidate)}")
+    print("ratio below 1.00 is the candidate being faster; rounds %d, min per side" % rounds)
+    return 0
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--runs", type=int, default=3, help="translate() calls per program, best one counted")
@@ -143,7 +185,14 @@ def main(argv=None):
     parser.add_argument("--json", action="store_true", help="print one JSON object instead of the tables")
     parser.add_argument("--max-slowdown", type=float, default=None,
                         help="exit 1 when a per-instruction time exceeds BASELINE by this factor")
+    parser.add_argument("--compare", nargs=2, metavar=("REFERENCE", "CANDIDATE"), default=None,
+                        help="time two tools/ trees against each other, interleaved; prints a ratio per measurement")
+    parser.add_argument("--rounds", type=int, default=3, help="rounds of --compare; the best per side is kept")
     arguments = parser.parse_args(argv)
+    if arguments.rounds < 1:
+        parser.error("--rounds must be at least 1")
+    if arguments.compare:
+        return compare(*arguments.compare, arguments.runs, arguments.size, arguments.rounds)
     if arguments.runs < 1:
         parser.error("--runs must be at least 1")
     if arguments.size < 1:
