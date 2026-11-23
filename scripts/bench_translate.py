@@ -154,16 +154,27 @@ def compare(reference, candidate, runs, size, rounds, max_slowdown=None):
         return json.loads(result.stdout)["measured"]
 
     best = {"reference": {}, "candidate": {}}
+    measured_any = False
     for round_index in range(rounds + 1):   # the first round warms the caches and is not counted
         order = [("reference", reference), ("candidate", candidate)]
         if round_index % 2:
             order.reverse()                 # whoever runs first pays the cold file cache, so the order alternates
         for side, path in order:
             measured = measure(path)
+            measured_any = measured_any or bool(measured)
             if round_index == 0:
                 continue
             for key, value in measured.items():
                 best[side][key] = min(best[side].get(key, value), value)
+    if not measured_any:
+        raise SystemExit("both trees measured nothing (an empty corpus?); nothing to compare")
+    if sorted(best["reference"]) != sorted(best["candidate"]):
+        only_reference = sorted(set(best["reference"]) - set(best["candidate"]))
+        only_candidate = sorted(set(best["candidate"]) - set(best["reference"]))
+        raise SystemExit("the two trees do not cover the same measurements"
+                         + (f"; only in the reference: {', '.join(only_reference)}" if only_reference else "")
+                         + (f"; only in the candidate: {', '.join(only_candidate)}" if only_candidate else "")
+                         + "; a missing program would read as a ratio that looks like a win")
     rows = []
     for key in best["reference"]:
         ref = best["reference"][key]
@@ -171,8 +182,8 @@ def compare(reference, candidate, runs, size, rounds, max_slowdown=None):
         rows.append({"name": key, "reference": ref, "candidate": cand, "ratio": cand / ref if ref else None})
     print(f"{'measurement':<32} {'reference':>10} {'candidate':>10} {'ratio':>7}")
     for row in rows:
-        print(f"{row['name']:<32} {row['reference']:>10.1f} {row['candidate']:>10.1f} "
-              f"{row['ratio']:>6.2f}x")
+        ratio = f"{row['ratio']:>6.2f}x" if row["ratio"] is not None else "   n/a"
+        print(f"{row['name']:<32} {row['reference']:>10.1f} {row['candidate']:>10.1f} {ratio}")
     print(f"\nreference {os.path.abspath(reference)}\ncandidate {os.path.abspath(candidate)}")
     print("ratio below 1.00 is the candidate being faster; rounds %d, min per side" % rounds)
     if max_slowdown is not None:
@@ -206,9 +217,20 @@ def main(argv=None):
     arguments = parser.parse_args(argv)
     if arguments.rounds < 1:
         parser.error("--rounds must be at least 1")
+    if arguments.baseline and arguments.write_baseline and \
+            os.path.abspath(arguments.baseline) == os.path.abspath(arguments.write_baseline):
+        # One file for both: a run that fails the limit would still replace the reference it failed against, and the
+        # same workload would pass on the retry.
+        parser.error("--baseline and --write-baseline name the same file; write to a different one")
     if arguments.compare:
+        for flag, value in (("--json", arguments.json), ("--write-baseline", arguments.write_baseline),
+                            ("--baseline", arguments.baseline)):
+            if value:
+                parser.error(f"{flag} does not apply to --compare, which times two trees and prints its own table")
         return compare(*arguments.compare, arguments.runs, arguments.size, arguments.rounds,
                        arguments.max_slowdown)
+    if arguments.baseline and not os.path.isfile(arguments.baseline):
+        parser.error(f"--baseline {arguments.baseline} does not exist; --write-baseline records one")
     if arguments.runs < 1:
         parser.error("--runs must be at least 1")
     if arguments.size < 1:

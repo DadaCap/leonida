@@ -69,6 +69,32 @@ class BenchTranslateTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("no baseline for this measurement", result.stdout)
 
+    def test_flags_that_do_not_apply_to_compare_are_refused(self):
+        # Reported on the PR: --compare ignored --json, --write-baseline and --baseline, so a run looked like it had
+        # done something it had not.
+        tools = os.path.join(ROOT, "tools")
+        for extra in (("--json",), ("--write-baseline", "out.json"), ("--baseline", "ref.json")):
+            with self.subTest(extra=extra):
+                result = run("--compare", tools, tools, "--rounds", "1", "--runs", "1", "--size", "20", *extra)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("does not apply to --compare", result.stderr)
+
+    def test_a_baseline_and_a_write_baseline_may_not_name_one_file(self):
+        # One file for both: a run that fails the limit would replace the reference it failed against, and the same
+        # workload would pass on the retry.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "same.json")
+            result = run("--runs", "1", "--size", "20", "--baseline", path, "--write-baseline", path)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn("name the same file", result.stderr)
+
+    def test_a_baseline_that_does_not_exist_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = os.path.join(tmp, "nope.json")
+            result = run("--runs", "1", "--size", "20", "--baseline", missing)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn("does not exist", result.stderr)
+
     def test_a_local_baseline_replaces_the_committed_one(self):
         # The committed numbers come from one machine; on another they would fail a run with no regression in it.
         with tempfile.TemporaryDirectory() as tmp:
