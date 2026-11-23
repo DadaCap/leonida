@@ -50,6 +50,25 @@ class BenchTranslateTest(unittest.TestCase):
                 if extra:
                     self.assertTrue(json.loads(result.stdout)["over_limit"])
 
+    def test_compare_honours_the_limit_and_exits_one(self):
+        # Reported on the PR: --compare returned 0 whatever --max-slowdown said, while the help promised the limit in
+        # every output format. Two identical trees give ratios at 1.00, so a 0.01 limit has to fail.
+        tools = os.path.join(ROOT, "tools")
+        result = run("--compare", tools, tools, "--rounds", "1", "--runs", "1", "--size", "20",
+                     "--max-slowdown", "0.01")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("slower than the reference", result.stderr)
+
+    def test_a_partial_baseline_does_not_abort_the_text_output(self):
+        # Reported on the PR: a baseline holding only the corpus figure raised KeyError in the per-program lines.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "partial.json")
+            with open(path, "w", encoding="utf-8", newline="\n") as handle:
+                json.dump({"corpus_us_per_instruction": 1.0}, handle)
+            result = run("--runs", "1", "--size", "20", "--baseline", path)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("no baseline for this measurement", result.stdout)
+
     def test_a_local_baseline_replaces_the_committed_one(self):
         # The committed numbers come from one machine; on another they would fail a run with no regression in it.
         with tempfile.TemporaryDirectory() as tmp:

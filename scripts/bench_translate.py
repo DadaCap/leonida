@@ -137,7 +137,7 @@ def summarise(rows):
 BASELINE = {"corpus_us_per_instruction": 55.4, "alu_us_per_instruction": 32.3, "nop_us_per_instruction": 14.0}
 
 
-def compare(reference, candidate, runs, size, rounds):
+def compare(reference, candidate, runs, size, rounds, max_slowdown=None):
     """Interleaved A/B over two tools/ trees: each round measures both, and the best per side is kept.
 
     Loading the tree is the subprocess's job (LEONIDA_TOOLS_DIR, as tests/semantic/support.py does it), so the two
@@ -175,6 +175,15 @@ def compare(reference, candidate, runs, size, rounds):
               f"{row['ratio']:>6.2f}x")
     print(f"\nreference {os.path.abspath(reference)}\ncandidate {os.path.abspath(candidate)}")
     print("ratio below 1.00 is the candidate being faster; rounds %d, min per side" % rounds)
+    if max_slowdown is not None:
+        # The limit means here what it means against a baseline: a measurement over it is a failure. The ratio is
+        # already candidate/reference, so the limit applies to it directly.
+        slow = [row for row in rows if row["ratio"] is not None and row["ratio"] > max_slowdown]
+        if slow:
+            for row in slow:
+                print(f"slower than the reference by {row['ratio']:.2f}x (limit {max_slowdown:.2f}x): {row['name']}",
+                      file=sys.stderr)
+            return 1
     return 0
 
 
@@ -198,7 +207,8 @@ def main(argv=None):
     if arguments.rounds < 1:
         parser.error("--rounds must be at least 1")
     if arguments.compare:
-        return compare(*arguments.compare, arguments.runs, arguments.size, arguments.rounds)
+        return compare(*arguments.compare, arguments.runs, arguments.size, arguments.rounds,
+                       arguments.max_slowdown)
     if arguments.runs < 1:
         parser.error("--runs must be at least 1")
     if arguments.size < 1:
@@ -256,10 +266,11 @@ def main(argv=None):
               f"{row['us_per_instruction']:>6.1f} us/instr")
     print(f"\nsynthetic ({arguments.size} instructions):")
     for row in synthetic_programs:
+        reference = baseline.get(row["name"] + "_us_per_instruction")
+        compared = (f"({measured[row['name'] + '_us_per_instruction'] / reference:.2f}x the {baseline_source} baseline)"
+                    if reference else "(no baseline for this measurement)")
         print(f"  {row['name']:<28} {row['instructions']:>5} instr  {row['seconds'] * 1e3:>8.2f} ms  "
-              f"{row['us_per_instruction']:>6.1f} us/instr  "
-              f"({measured[row['name'] + '_us_per_instruction'] / baseline[row['name'] + '_us_per_instruction']:.2f}x "
-              f"the {baseline_source} baseline)")
+              f"{row['us_per_instruction']:>6.1f} us/instr  {compared}")
     if skipped:
         print("\nskipped (need the FSSM header, which these runs do not pass):")
         for line in skipped:
