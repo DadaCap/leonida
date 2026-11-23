@@ -184,7 +184,13 @@ def main(argv=None):
     parser.add_argument("--size", type=int, default=2000, help="instructions in each synthetic program")
     parser.add_argument("--json", action="store_true", help="print one JSON object instead of the tables")
     parser.add_argument("--max-slowdown", type=float, default=None,
-                        help="exit 1 when a per-instruction time exceeds BASELINE by this factor")
+                        help="exit 1 when a per-instruction time exceeds the baseline by this factor, in every output "
+                             "format")
+    parser.add_argument("--baseline", metavar="FILE", default=None,
+                        help="compare against a baseline written by --write-baseline instead of the committed one; "
+                             "the committed numbers are from one machine and mean nothing on another")
+    parser.add_argument("--write-baseline", metavar="FILE", default=None,
+                        help="write this run's numbers to FILE as a baseline for --baseline")
     parser.add_argument("--compare", nargs=2, metavar=("REFERENCE", "CANDIDATE"), default=None,
                         help="time two tools/ trees against each other, interleaved; prints a ratio per measurement")
     parser.add_argument("--rounds", type=int, default=3, help="rounds of --compare; the best per side is kept")
@@ -207,16 +213,39 @@ def main(argv=None):
     measured.update({f"{row['name']}_us_per_instruction": row["us_per_instruction"]
                      for row in synthetic_programs})
 
+    baseline, baseline_source = BASELINE, "committed"
+    if arguments.baseline:
+        with open(arguments.baseline, encoding="utf-8") as handle:
+            loaded = json.load(handle)
+        baseline = {key: float(value) for key, value in (loaded.get("measured") or loaded).items()}
+        baseline_source = os.path.abspath(arguments.baseline)
+    if arguments.write_baseline:
+        with open(arguments.write_baseline, "w", encoding="utf-8", newline="\n") as handle:
+            json.dump({"measured": measured, "runs": arguments.runs, "size": arguments.size}, handle,
+                      indent=2, sort_keys=True)
+            handle.write("\n")
+        print(f"baseline written to {os.path.abspath(arguments.write_baseline)}", file=sys.stderr)
+
+    # The limit is part of the contract of every output format: a job that collects --json must not read a success
+    # code for a run whose numbers are over the limit. It is evaluated here, once, before either format prints.
+    slow = {}
+    if arguments.max_slowdown is not None:
+        slow = {key: value / baseline[key] for key, value in measured.items()
+                if baseline.get(key) and value > baseline[key] * arguments.max_slowdown}
+
     if arguments.json:
         print(json.dumps({
             "runs": arguments.runs,
             "corpus": {"summary": corpus_summary, "programs": corpus, "skipped": skipped},
             "synthetic": {"summary": synthetic_summary, "programs": synthetic_programs, "size": arguments.size},
-            "baseline": BASELINE,
+            "baseline": baseline,
+            "baseline_source": baseline_source,
             "measured": measured,
-            "slowdown": {k: (measured[k] / BASELINE[k] if BASELINE.get(k) else None) for k in measured},
+            "slowdown": {k: (measured[k] / baseline[k] if baseline.get(k) else None) for k in measured},
+            "over_limit": sorted(slow),
+            "max_slowdown": arguments.max_slowdown,
         }, indent=2, sort_keys=True))
-        return 0
+        return 1 if slow else 0
 
     print(f"corpus: {corpus_summary['programs']} fixtures, {corpus_summary['instructions']} instructions, "
           f"{corpus_summary['seconds']:.3f} s, {corpus_summary['us_per_instruction']:.1f} us/instruction "
@@ -229,19 +258,17 @@ def main(argv=None):
     for row in synthetic_programs:
         print(f"  {row['name']:<28} {row['instructions']:>5} instr  {row['seconds'] * 1e3:>8.2f} ms  "
               f"{row['us_per_instruction']:>6.1f} us/instr  "
-              f"({measured[row['name'] + '_us_per_instruction'] / BASELINE[row['name'] + '_us_per_instruction']:.2f}x "
-              f"the recorded baseline)")
+              f"({measured[row['name'] + '_us_per_instruction'] / baseline[row['name'] + '_us_per_instruction']:.2f}x "
+              f"the {baseline_source} baseline)")
     if skipped:
         print("\nskipped (need the FSSM header, which these runs do not pass):")
         for line in skipped:
             print("  " + line)
 
-    if arguments.max_slowdown is not None:
-        slow = {k: v / BASELINE[k] for k, v in measured.items() if BASELINE.get(k) and v > BASELINE[k] * arguments.max_slowdown}
-        if slow:
-            for name, factor in sorted(slow.items()):
-                print(f"slower than baseline by {factor:.2f}x: {name}", file=sys.stderr)
-            return 1
+    if slow:
+        for name, factor in sorted(slow.items()):
+            print(f"slower than baseline ({baseline_source}) by {factor:.2f}x: {name}", file=sys.stderr)
+        return 1
     return 0
 
 

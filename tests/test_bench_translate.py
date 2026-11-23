@@ -10,6 +10,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -40,11 +41,28 @@ class BenchTranslateTest(unittest.TestCase):
         # A compute fixture needs the FSSM header the semantic tests pass, so it is reported, never silently counted.
         self.assertTrue(all("FSSM" in line for line in report["corpus"]["skipped"]), report["corpus"]["skipped"])
 
-    def test_a_slowdown_check_passes_at_the_recorded_baseline(self):
-        # 100x the recorded per-instruction time is never reached in a real run, so this only exercises the path.
-        result = run("--runs", "1", "--size", "20", "--max-slowdown", "100")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("us/instr", result.stdout)
+    def test_the_limit_is_honoured_in_both_output_formats(self):
+        # A job that collects --json must not read a success code for a run whose numbers are over the limit.
+        for extra in ((), ("--json",)):
+            with self.subTest(extra=extra):
+                result = run("--runs", "1", "--size", "20", "--max-slowdown", "0.01", *extra)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                if extra:
+                    self.assertTrue(json.loads(result.stdout)["over_limit"])
+
+    def test_a_local_baseline_replaces_the_committed_one(self):
+        # The committed numbers come from one machine; on another they would fail a run with no regression in it.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "baseline.json")
+            written = run("--runs", "1", "--size", "20", "--write-baseline", path)
+            self.assertEqual(written.returncode, 0, written.stderr)
+            self.assertTrue(os.path.isfile(path))
+            result = run("--runs", "1", "--size", "20", "--baseline", path, "--max-slowdown", "5", "--json")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            report = json.loads(result.stdout)
+            self.assertEqual(report["baseline_source"], os.path.abspath(path))
+            self.assertEqual(sorted(report["baseline"]), sorted(report["measured"]))
+            self.assertEqual(report["over_limit"], [])
 
     def test_compare_runs_two_trees_and_prints_a_ratio(self):
         tools = os.path.join(ROOT, "tools")
