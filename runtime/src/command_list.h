@@ -597,6 +597,9 @@ enum class IndirectKind : std::uint8_t {
     draw = 0,
     draw_indexed = 1,
     dispatch = 2,
+    // D3D12_DISPATCH_MESH_ARGUMENTS. Created on a device with mesh shaders; ExecuteIndirect with it records nothing
+    // yet (the replay is #3777's), so a title that only creates such a signature at startup goes on.
+    dispatch_mesh = 3,
 };
 
 struct ExecuteIndirect {
@@ -698,10 +701,11 @@ public:
         return append(barrier);
     }
 
+    // LayoutAfter UNDEFINED is legal: the subresources' contents are no longer needed, as before their memory is
+    // aliased (the retail title ends a depth buffer's use this way, #984; WARP closes such a list,
+    // d3d12_close_parity_test). Replay keeps the image's Vulkan layout and orders the accesses only.
     bool barrier(const TextureBarrier& barrier) {
         if (!barrier.resource || !valid_sync(barrier.sync_before, barrier.sync_after)) return false;
-        if (barrier.layout_after == d3d12_layout::undefined && barrier.layout_before != d3d12_layout::undefined)
-            return false;
         if (barrier.flags & ~texture_barrier_discard) return false;
         if (barrier.range.mip_count && (!barrier.range.layer_count || !barrier.range.plane_count)) return false;
         if (barrier.sync_after == d3d12_sync::split) return !closed_;

@@ -439,7 +439,12 @@ public:
             return;
         }
         if (!rects) return;
-        if (count > D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE) return check(false);
+        // WARP still closes a list after RSSetScissorRects(17) (d3d12_close_parity), so the call is not an error:
+        // the rectangles past the 16 a pipeline can have are dropped.
+        if (count > D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE) {
+            stub("ID3D12GraphicsCommandList::RSSetScissorRects(more than 16 rectangles; the first 16 are used)");
+            count = D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
+        }
         scissors_.fill({});
         for (UINT i = 0; i < count; ++i) {
             scissors_[i] = {rects[i].left, rects[i].top, rects[i].right, rects[i].bottom};
@@ -858,6 +863,7 @@ public:
             kind == leonida::IndirectKind::draw ? sizeof(D3D12_DRAW_ARGUMENTS)
             : kind == leonida::IndirectKind::draw_indexed ? sizeof(D3D12_DRAW_INDEXED_ARGUMENTS)
             : kind == leonida::IndirectKind::dispatch ? sizeof(D3D12_DISPATCH_ARGUMENTS)
+            : kind == leonida::IndirectKind::dispatch_mesh ? sizeof(D3D12_DISPATCH_MESH_ARGUMENTS)
             : 0;
         if (!record_size || stride < record_size || stride % 4 != 0) return check(false);
         // The argument range is the bytes the commands read: (max_command_count - 1) * stride + record_size, and
@@ -871,6 +877,15 @@ public:
             const UINT64 required = UINT64(max_command_count - 1) * stride + record_size;
             if (argument_buffer_offset > arg_desc.Width || arg_desc.Width - argument_buffer_offset < required)
                 return check(false);
+        }
+        if (kind == leonida::IndirectKind::dispatch_mesh) {
+            // Not replayed yet (#3777 replays it as vkCmdDrawMeshTasksIndirectEXT): nothing is recorded, and the
+            // first such call says so. The list stays valid.
+            static std::atomic<bool> logged{false};
+            if (!logged.exchange(true, std::memory_order_relaxed))
+                std::fprintf(stderr, "[rt] d3d12: ExecuteIndirect with a DISPATCH_MESH signature is not replayed yet; "
+                                     "nothing was recorded\n");
+            return;
         }
         leonida::ExecuteIndirect cmd{};
         cmd.kind = kind;
