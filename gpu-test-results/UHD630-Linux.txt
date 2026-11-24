@@ -1,0 +1,33 @@
+GPU:        Intel UHD Graphics 630 (Coffee Lake GT2, Gen9.5, PCI 8086:3e9b), integrated
+Driver:     Mesa 26.1.6 ANV (26.1.6-1~bpo13+1), Vulkan 1.4.354 (loader 1.4.309)
+Subgroup:   8..32 (minSubgroupSize 8, maxSubgroupSize 32; default 32)
+OS:         Linux, Debian 13 based (x86-64); a laptop with both GPUs, this one selected with
+            VK_LOADER_DRIVERS_SELECT='*intel_icd*'
+Commit:     3aa975421d470b76da1aa986a91282c59e20d642 (main, 2026-11-24)
+Tools:      GCC 14.2.0, CMake 3.31.6 with Ninja, llvm-mc 21.1.8 (apt.llvm.org), SPIRV-Tools v2025.1,
+            Vulkan headers 1.4.309 (system), Python 3.13.5
+Build:      cmake -S runtime -B runtime/build/linux -G Ninja -DCMAKE_BUILD_TYPE=Release, then
+            python3 -I scripts/run_gpu_tests.py --build runtime/build/linux
+
+run_gpu_tests.py, 252 fixtures, 0 failed in every run:
+            native:                 195/252 passed, 57 skipped
+            LEONIDA_W64_EMULATE=1:  226/252 passed, 26 skipped
+
+Skipped, all documented reasons (docs/testing.md):
+  native:   31 no 64-wide compute subgroup (run under LEONIDA_W64_EMULATE=1 below),
+            6  no VK_EXT_mesh_shader / mesh shading unavailable (ANV doesn't expose it on Gen9),
+            2  fragment subgroup can run narrower than 32 on an 8..32 device (one ran at 16),
+            1  needs a required 64-wide fragment subgroup (8..32),
+            1  computed I/J pairs (ps_ij_computed: needs PerVertexKHR),
+            15 run by d3d12_*_test, 1 run by w64_graphics.py.
+  W64 emulation: the 31 wave64 compute fixtures all pass; the other 26 skips are unchanged.
+
+Notes:
+- First record for an Intel Gen9 iGPU. ANV advertises fragment barycentrics here and the four
+  BaryCoordKHR fixtures (ps_bary, ps_persp_bary, ps_uniform_branch, ps_scc_mask32) pass natively,
+  so the ANV barycentric bug docs/testing.md lists for Arc (SHADER-925) did not show on Gen9.
+- ps_texoff and ps_texoff_implicit pass natively, but their +16/-32 offsets are not judged on
+  this device (its texel offset limits are narrower), as the tests print.
+- build.py / check.py, w64_graphics.py, vk_pipeline_check.py and the runtime ctest suite were
+  not run here; the counts come from run_gpu_tests.py alone.
+- AI-assisted (Claude Code). Synthetic tests only; no game files.
