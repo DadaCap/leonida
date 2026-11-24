@@ -51,8 +51,11 @@ def read_report(path):
         key = (case.get("classname", ""), name)
         if key in rows:
             raise ReportError("duplicate testcase identity")
-        status = "failed" if any(c.tag in ("failure", "error") for c in case) else (
-            "skipped" if any(c.tag == "skipped" for c in case) else "passed")
+        if (case.get("status") or "").strip().lower() == "disabled":
+            status = "skipped"
+        else:
+            status = "failed" if any(c.tag in ("failure", "error") for c in case) else (
+                "skipped" if any(c.tag == "skipped" for c in case) else "passed")
         duration = case.get("time")
         if duration is not None:
             try:

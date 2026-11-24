@@ -23,6 +23,23 @@ class JunitTriageTest(unittest.TestCase):
         path.write_text(xml, encoding="utf-8", newline="\n")
         return str(path)
 
+    def test_ctest_disabled_status_is_skipped(self):
+        for previous in ("failed", "passed"):
+            for status in ("disabled", "  DISABLED  "):
+                with self.subTest(previous=previous, status=status):
+                    body = '<failure/>' if previous == "failed" else ''
+                    before = self.report("before.xml", f'<testsuite><testcase name="sample" classname="ctest" time="0">{body}</testcase></testsuite>')
+                    after = self.report("after.xml", f'<testsuite><testcase name="sample" classname="ctest" time="0" status="{status}"/></testsuite>')
+                    result = jt.compare(jt.read_report(before), jt.read_report(after))
+                    self.assertEqual(result["fixed"], 0)
+                    self.assertEqual(result["newly_skipped"], 1)
+                    self.assertEqual(result["after"]["skipped"], 1)
+                    self.assertEqual(result["after"]["passed"], 0)
+
+    def test_disabled_status_takes_precedence_over_children(self):
+        report = self.report("disabled.xml", '<testsuite><testcase name="sample" classname="ctest" time="0" status="disabled"><failure/></testcase></testsuite>')
+        self.assertEqual(jt.read_report(report)[("ctest", "sample")], "skipped")
+
     def test_transitions_and_privacy(self):
         before = self.report("before.xml", '<testsuite><testcase classname="private" name="a"/>'
             '<testcase name="b"><failure>secret</failure></testcase><testcase name="c"><skipped/></testcase>'
