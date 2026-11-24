@@ -8,31 +8,32 @@ Tools:      llvm-mc 21.1.8 (native, built by scripts\build_llvm_mc.ps1),
             Ninja 1.12.1, MSVC 19.44.35229, Python 3.11.9
 run_gpu_tests.py: 257 shaders: 257 translated, 257 pass spirv-val
             wave64 VS/PS/GS on 32-wide subgroups: tier A: 1, tier C: 1
-            native:                 not run
+            native:                 197/248 passed, 49 skipped, 2 failed
             LEONIDA_W64_EMULATE=1:  229/248 passed, 17 skipped, 2 failed
 Failed:     cs_imgload_tfe, cs_imgload_d16_tfe: both exit 1 with "r32 sint (sint view):
-            64 bad, texel(5,3) = 2071". The two tests report an identical signature, and
-            the same pair is the known #31 tfe case in the RTX 5070 (621.14) entry above.
-            Same two failures, different driver build: this is #31, not a new defect.
-Skipped:    17 skips. 16 are the documented "run by d3d12_*_test / w64_graphics.py"
-            cases: cs_buf_counter, cs_buf_typed, cs_m4_fill, cs_m4_indirect,
-            ps_live_width, ps_m15, ps_m2, ps_m2_array, ps_m2_literal, ps_m2_uoff,
-            ps_m3, ps_m3_post, ps_m3_query, vs_m15, vs_m2, vs_m3.
-            The 17th is ps_w64x_readlane: "this device cannot require a 64-wide
-            fragment subgroup: subgroup 32..32" — a device-capability skip, not a
-            translator result. Every wave64 case that can run under emulation ran
+            64 bad, texel(5,3) = 2071", in native and emulated runs alike. The same
+            pair is the known #31 tfe case in the RTX 5070 (621.14) entry above, and the
+            native/emulated totals here (197/248, 229/248) match that entry exactly.
+            Same two failures on a different driver build: this is #31, not a new defect.
+Skipped:    native: 49 skips = the 16 documented "run by d3d12_*_test /
+            w64_graphics.py" cases, plus 32 wave64 compute/mesh cases that need a
+            64-wide subgroup this device does not have ("no 64-wide compute subgroup
+            on this device"), plus ps_w64x_readlane ("this device cannot require a
+            64-wide fragment subgroup: subgroup 32..32").
+            LEONIDA_W64_EMULATE=1: 17 skips = the same 16 documented cases, plus
+            ps_w64x_readlane. Every wave64 case that can run under emulation ran
             and passed.
 Notes:
 - Value of this entry: the RTX 5070 already has an entry on driver 621.14. This one is
-  a different driver build (617.42) on the same GPU. It fails exactly the same #31 tfe
-  pair and nothing else, which is evidence that on this hardware the tfe failure
-  follows the test, not the driver.
+  a different driver build (617.42) on the same GPU. It produces the same totals
+  (197/248 native, 229/248 emulated) and fails exactly the same #31 tfe pair and
+  nothing else, which is evidence that on this hardware the tfe failure follows the
+  test, not the driver.
 - Built with the Developer PowerShell for VS 2022 through the CMake + Ninja path
   (scripts\build_runtime.ps1), not the cl.exe fallback.
 - llvm-mc built locally by scripts\build_llvm_mc.ps1 (LLVM 21.1.8 with the AMDGPU
   target), verified by assembling `v_lshlrev_b16_e64 v34, v27, v27 op_sel:[0,1,1]`
-  for gfx1013 before the run.
-- The suite ran with LEONIDA_W64_EMULATE=1 because the device is 32-wide only.
-- Every other pixel, compute, vertex and geometry case was exact.
+  for gfx1013 before the runs.
+- Every other pixel, compute, vertex and geometry case was exact in both modes.
 - build.py and check.py were not run separately on this machine; the counts here come
   from run_gpu_tests.py, which builds and translates the same fixtures.
