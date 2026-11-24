@@ -2631,6 +2631,15 @@ The trace will enumerate them.
   `R8G8B8A8`, a `B8G8R8A8` and a `B8G8R8X8` texture each take their own and their listed format and refuse 3
   formats their lists don't name, `d3d12_draw_test` draws through the same views, and `typeless_rtv_test` checks
   the replay's crossing and its refusals.
+- **RGBA8 render targets on a console device:** the console views an RGBA8 render target as UNORM and as sRGB without
+  a castable-format list. The retail title draws its Bink movie through an `R8G8B8A8_UNORM` RTV of an
+  `R8G8B8A8_UNORM_SRGB` texture made with `ALLOW_RENDER_TARGET` and no list (measured on a retail boot, RTX 5080);
+  the RTV was refused, so the draw had no target. A device the Xbox-ABI proxy owns (`set_device_outer`) therefore
+  gives each such 2D `R8G8B8A8_UNORM` or `_SRGB` texture without a list of its own, and without unordered access, the
+  list {UNORM, SRGB} (`Resource::create_texture`), and views, clears and draws follow the castable-list rules above.
+  A device without the proxy still refuses the RTV, as the PC does. `d3d12_draw_test` clears and draws through both
+  casts, reads the bytes back and checks the refusal without the proxy. Textures with unordered access, the B8G8R8A8
+  formats and other families are not covered: no such cast has been seen.
 - **Typed RTV clears:** `ClearRenderTargetView` still takes `FLOAT[4]`. For every integer RTV format the device
   exposes (`R8G8`, `R8G8B8A8`, `R16G16`, `R16G16B16A16`, `R32`, `R32G32` and `R32G32B32A32` in `_UINT` and `_SINT`,
   plus `R10G10B10A2_UINT`; `R8`/`R16` `_UINT`/`_SINT` are handled in replay too) convert those values numerically

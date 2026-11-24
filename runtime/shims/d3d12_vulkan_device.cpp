@@ -624,6 +624,7 @@ struct DeviceState {
     // GPUs), backed by a mutable image of the UNORM format of the same order. The host runtime makes such textures.
     bool rgba8_srgb_uav_emulated = false;
     bool bgra8_srgb_uav_emulated = false;
+    bool console = false;  // the Xbox-ABI proxy owns the device (set_device_outer)
 
     // Cached physical-device no-attachment sample counts for D3D12_OPTIONS19.
     UINT no_output_sample_counts = 0;
@@ -2184,7 +2185,7 @@ public:
         return S_OK;
     }
 
-    HRESULT create_texture(const Format& format, const std::vector<VkFormat>& castable = {}) {
+    HRESULT create_texture(const Format& format, std::vector<VkFormat> castable = {}) {
         auto& vk = device_.context->vk;
         const bool volume = desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
         const UINT depth = volume ? desc_.DepthOrArraySize : 1;
@@ -2192,6 +2193,15 @@ public:
         if (desc_.MipLevels == 0) desc_.MipLevels = full_mips(desc_.Width, desc_.Height, depth);
         TextureCreateInfo create(desc_, format, device_.color_attachment_usable(format.format));
         VkImageCreateInfo& info = create.info;
+        if (castable.empty() && device_.console && desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+            (desc_.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) &&
+            !(desc_.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) &&
+            (desc_.Format == DXGI_FORMAT_R8G8B8A8_UNORM || desc_.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB)) {
+            // The console views an RGBA8 render target as UNORM and as sRGB without a list (the retail title's movie
+            // draws through a UNORM RTV of an sRGB texture); the PC needs the list.
+            castable = {VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_SRGB};
+            castable_formats_ = {DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB};
+        }
         if (!castable.empty()) {
             // D3D12 always allows a view in the resource's own format, whether or not the castable list names
             // it. Vulkan requires every view format to be in the image's format list, so add it when missing.
@@ -5524,7 +5534,10 @@ public:
     }
     bool bind_sampler(const leonida::gfx10::SamplerWords& words) { return state_.bind_sampler(words); }
     void own(const OwnedRuntime& owned) { owned_ = owned; }
-    void set_outer(IUnknown* outer) { outer_ = outer; }
+    void set_outer(IUnknown* outer) {
+        outer_ = outer;
+        state_.console = rt::d3d12_xs::is_device_proxy(outer);
+    }
 
     UINT STDMETHODCALLTYPE GetNodeCount() override { return 1; }
 

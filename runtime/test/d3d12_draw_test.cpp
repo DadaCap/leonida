@@ -11,7 +11,9 @@
 //   - full-screen blends that read destination alpha into B8G8R8X8 and B8G8R8A8 targets cleared with alpha 0.25:
 //     B8G8R8X8 has no alpha, so destination alpha reads 1 there, as on WARP and AMD's D3D12 driver;
 //   - draws through RTVs in a format the texture's castable list names, in the other channel order (RGBA8 and BGRA8)
-//     or across B8G8R8X8 and B8G8R8A8: the bytes land in the view's order and encoding.
+//     or across B8G8R8X8 and B8G8R8A8: the bytes land in the view's order and encoding;
+//   - a clear and a draw through the UNORM RTV of an sRGB render target (and the reverse) made without a castable list:
+//     the console allows them, so the proxied device does; a device without the proxy refuses the view, as the PC does.
 // The shaders are GLSL written to the translator's contract (test/glsl/vs_draw.vert, ps_draw.frag). No game data.
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation.
 #include "shader_fixture_path.h"
@@ -1007,6 +1009,100 @@ int main() {
             }
             std::printf("castable RTVs: %u draws stored in the view's channel order and encoding\n",
                         unsigned(std::size(casts)));
+        }
+
+        // Without a castable list: the RGBA8 render targets of a console device take RTVs in both encodings. The
+        // retail title's movie is drawn through a UNORM RTV of an sRGB texture this way.
+        {
+            struct ConsoleCast { DXGI_FORMAT resource, view; std::uint8_t clear[4], draw[4]; };
+            const ConsoleCast casts[] = {
+                {DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_FORMAT_R8G8B8A8_UNORM, {51, 102, 153, 255}, {204, 153, 0, 255}},
+                {DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, {124, 170, 203, 255}, {231, 203, 0, 255}},
+            };
+            const D3D12_DESCRIPTOR_HEAP_DESC console_heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1,
+                                                       D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+            Ref<ID3D12DescriptorHeap> heap;
+            EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&console_heap_desc, IID_PPV_ARGS(&heap.p))));
+            const D3D12_CPU_DESCRIPTOR_HANDLE console_rtv{
+                SIZE_T(reinterpret_cast<XboxHeapHandleFn>(slot(heap.p, 9))(heap.p))};
+            D3D12_RESOURCE_DESC desc{};
+            desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            desc.Width = desc.Height = 4;
+            desc.DepthOrArraySize = 1;
+            desc.MipLevels = 1;
+            desc.SampleDesc.Count = 1;
+            desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+            const D3D12_VIEWPORT cast_viewport{0, 0, 4, 4, 0, 1};
+            const D3D12_RECT cast_scissor{0, 0, 4, 4};
+            const float clear_value[4] = {0.2f, 0.4f, 0.6f, 1.0f};
+            UINT64 cast_fence = 90;  // after the castable draws' 71..78
+            for (const ConsoleCast& c : casts) {
+                desc.Format = c.resource;
+                D3D12_RENDER_TARGET_VIEW_DESC view{};
+                view.Format = c.view;
+                view.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+
+                // The same device without the proxy as its outer is a PC device: the RTV is refused.
+                rt::d3d12::set_device_outer(inner, nullptr);
+                Ref<ID3D12Resource> pc_target;
+                const HRESULT pc_created = inner->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &desc,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&pc_target.p));
+                rt::d3d12::set_device_outer(inner, device.p);
+                EXPECT(SUCCEEDED(pc_created));
+                device->CreateRenderTargetView(pc_target.p, &view, console_rtv);
+                EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, nullptr)));
+                list->ClearRenderTargetView(console_rtv, clear_value, 0, nullptr);
+                EXPECT(FAILED(list->Close()));
+
+                Ref<ID3D12Resource> console_target;
+                EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &desc,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&console_target.p))));
+                device->CreateRenderTargetView(console_target.p, &view, console_rtv);
+                D3D12_GRAPHICS_PIPELINE_STATE_DESC console_pso_desc = fullscreen_desc;
+                console_pso_desc.RTVFormats[0] = c.view;
+                Ref<ID3D12PipelineState> console_pso;
+                EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&console_pso_desc, IID_PPV_ARGS(&console_pso.p))));
+                for (const bool draw : {false, true}) {
+                    EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, console_pso.p)));
+                    list->SetGraphicsRootSignature(root.p);
+                    list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                    list->RSSetViewports(1, &cast_viewport);
+                    list->RSSetScissorRects(1, &cast_scissor);
+                    list->OMSetRenderTargets(1, &console_rtv, FALSE, nullptr);
+                    if (draw) {
+                        list->SetGraphicsRootConstantBufferView(1, upload_va + 2048);  // the castable draws' tint
+                        list->DrawInstanced(3, 1, 0, 0);
+                    } else {
+                        list->ClearRenderTargetView(console_rtv, clear_value, 0, nullptr);
+                    }
+                    const auto console_to_copy = transition(console_target.p, D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                                    D3D12_RESOURCE_STATE_COPY_SOURCE);
+                    list->ResourceBarrier(1, &console_to_copy);
+                    D3D12_TEXTURE_COPY_LOCATION to{readback.p, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {}};
+                    to.PlacedFootprint = {0, {c.resource, 4, 4, 1, 256}};
+                    D3D12_TEXTURE_COPY_LOCATION from{console_target.p, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
+                    list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+                    const auto console_to_target = transition(console_target.p, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                                      D3D12_RESOURCE_STATE_RENDER_TARGET);
+                    list->ResourceBarrier(1, &console_to_target);
+                    EXPECT(list->Close() == S_OK);
+                    queue->ExecuteCommandLists(1, lists);
+                    EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+                    ++cast_fence;
+                    EXPECT(SUCCEEDED(queue->Signal(fence.p, cast_fence)) &&
+                           SUCCEEDED(fence->SetEventOnCompletion(cast_fence, nullptr)));
+                    const auto* got = static_cast<const std::uint8_t*>(mapped);
+                    const std::uint8_t* want = draw ? c.draw : c.clear;
+                    for (unsigned b = 0; b < 4; ++b) {
+                        if (std::abs(int(got[b]) - int(want[b])) <= 1) continue;  // the encoding's rounding
+                        std::fprintf(stderr, "console cast, %s through RTV format %d of format %d: got %u,%u,%u,%u, "
+                                     "byte %u wants %u\n", draw ? "draw" : "clear", int(c.view), int(c.resource),
+                                     got[0], got[1], got[2], got[3], b, unsigned(want[b]));
+                        return 1;
+                    }
+                }
+            }
+            std::printf("console RGBA8 render targets: clears and draws through both encodings without a list\n");
         }
 
         // A draw without a topology is invalid; Close reports it.
