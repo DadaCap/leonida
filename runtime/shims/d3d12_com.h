@@ -402,6 +402,8 @@ struct ArenaImport {
     std::uint64_t size = 0, layer_bytes = 0;
 };
 inline ArenaImport g_arena_import;
+// Brings the images whose title memory changed up to date; the queue calls it before it submits. Null: none are.
+inline std::atomic<void (*)()> g_refresh_title_textures{nullptr};
 inline std::uint64_t arena_va(std::uint64_t va) {
     const std::uint64_t base = g_title_window.base.load(std::memory_order_relaxed);
     return base && va - base < g_title_window.size.load(std::memory_order_relaxed) ? va - base : va;

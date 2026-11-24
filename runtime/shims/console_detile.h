@@ -17,5 +17,10 @@ struct LinearSubresource {
 // or addressed, or when the texture's bytes are not all readable.
 using DetileFn = bool (*)(const void* desc, const void* memory, std::uint32_t subresource, LinearSubresource& out);
 inline DetileFn detile_fn = nullptr;
+// The texture's bytes in title memory; 0 when it cannot be laid out.
+using TextureBytesFn = std::uint64_t (*)(const void* desc, std::uint64_t* alignment);
+inline TextureBytesFn texture_bytes_fn = nullptr;
+using ReadableFn = bool (*)(const void* memory, std::uint64_t bytes);
+inline ReadableFn readable_fn = nullptr;
 
 }  // namespace rt::xg

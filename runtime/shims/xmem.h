@@ -7,6 +7,8 @@
 namespace rt::xmem {
 
 bool commit_physical_range(const void* address, std::size_t size);
+// The same, for a caller that does not link the shim; null without it.
+inline bool (*commit_range_fn)(const void* address, std::size_t size) = nullptr;
 bool commit_physical_pages(const std::uint64_t* page_array, std::size_t count);
 
 // Committed, zeroed memory of the D3D12 layer that the title's placeholder reservation is taken from, so that its
@@ -24,6 +26,14 @@ inline bool in_gpu_region(const void* address, std::size_t size) {
     return end && at >= region_start.load(std::memory_order_relaxed) && at < end && size <= end - at;
 }
 bool gpu_region(void*& base, std::size_t& size, std::size_t& layer_bytes);
+
+// Told of every write into the title's memory that the title did not make itself (DirectStorage, a page's bytes moving
+// to another address): the D3D12 layer refreshes the images placed there. Null without that layer.
+using WrittenFn = void (*)(std::uintptr_t address, std::size_t size);
+inline std::atomic<WrittenFn> written_fn{nullptr};
+inline void title_memory_written(std::uintptr_t address, std::size_t size) {
+    if (const WrittenFn fn = written_fn.load(std::memory_order_acquire)) fn(address, size);
+}
 
 // Writes `size` bytes into the physical pages `pages` names (64 KiB each), from byte `offset` of the first. Set by the
 // shim when it is linked, as title_write_fn below. False for a page that is not live.

@@ -310,6 +310,11 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_compile_definitions(cpu_emulation_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
   target_compile_options(cpu_emulation_test PRIVATE /W4 /permissive- /utf-8)
 
+  # The BCPack decoder of the DirectStorage shim: synthetic chunks against what tools/bcpack.py decodes. No game data.
+  add_executable(bcpack_test test/bcpack_test.cpp)
+  target_compile_options(bcpack_test PRIVATE /W4 /permissive- /utf-8)
+  target_compile_definitions(bcpack_test PRIVATE _CRT_SECURE_NO_WARNINGS)
+
   # Xbox DirectStorage (DStorageGetFactory under dstorage_xs.dll, xcrdapi.dll and dstorage.dll) over synthetic files:
   # GAME: paths through the file shims, queues, status arrays, fences and errors. No GPU, no game data.
   add_executable(dstorage_test
@@ -683,6 +688,8 @@ if(BUILD_TESTING)
     add_executable(tiny_ga_tls test/fixtures/tiny_ga_tls.cpp)
     target_compile_definitions(tiny_ga_tls PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(tiny_ga_tls PRIVATE /W4 /permissive- /utf-8 /GS- /GA)
+    # /GA can remove the _tls_index reference that pulls in the CRT TLS directory.
+    target_link_options(tiny_ga_tls PRIVATE /INCLUDE:_tls_used)
     set_target_properties(tiny_ga_tls PROPERTIES
       OUTPUT_NAME tiny_ga_tls
       RUNTIME_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}"

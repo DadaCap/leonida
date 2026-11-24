@@ -379,6 +379,7 @@ HRESULT __stdcall copy_from(Computer* c, uint8_t* linear, uint32_t plane, uint32
 
 bool readable(const void* memory, uint64_t bytes) {
     if (rt::xmem::in_gpu_region(memory, bytes)) return true;
+    if (rt::xmem::commit_range_fn) rt::xmem::commit_range_fn(memory, bytes);  // mapped pages commit on first touch
     auto at = reinterpret_cast<uintptr_t>(memory);
     const uintptr_t end = at + bytes;
     while (at < end) {
@@ -395,7 +396,8 @@ bool detile_subresource(const void* desc, const void* memory, uint32_t subresour
     Computer c{nullptr};
     std::memcpy(&c.desc, desc, sizeof(c.desc));
     auto texture = texture_of(c.desc);
-    if (!texture || texture->planes.empty() || !readable(memory, texture->size)) return false;
+    if (!texture || texture->planes.empty()) return false;
+    if (!readable(memory, texture->size)) return false;
     c.texture = std::move(*texture);
     c.mips = static_cast<uint32_t>(c.texture.planes[0].layout.mips.size());
     if (!c.mips) return false;
@@ -407,10 +409,18 @@ bool detile_subresource(const void* desc, const void* memory, uint32_t subresour
     out.row_pitch = static_cast<uint32_t>(row);
     out.depth_pitch = static_cast<uint32_t>(slice);
     out.bytes.resize(static_cast<size_t>(slice * depths));
-    return copy_from(&c, reinterpret_cast<uint8_t*>(out.bytes.data()), 0, subresource, 0,
-                     static_cast<const uint8_t*>(memory), out.row_pitch, out.depth_pitch) == S_OK;
+    const HRESULT hr = copy_from(&c, reinterpret_cast<uint8_t*>(out.bytes.data()), 0, subresource, 0,
+                                 static_cast<const uint8_t*>(memory), out.row_pitch, out.depth_pitch);
+    return hr == S_OK;
 }
-const bool g_detile_set = (rt::xg::detile_fn = &detile_subresource, true);
+uint64_t texture_bytes(const void* desc, uint64_t* alignment) {
+    Computer c{nullptr};
+    std::memcpy(&c.desc, desc, sizeof(c.desc));
+    const auto texture = texture_of(c.desc);
+    if (texture && alignment) *alignment = texture->alignment;
+    return texture ? texture->size : 0;
+}
+const bool g_detile_set = (rt::xg::detile_fn = &detile_subresource, rt::xg::texture_bytes_fn = &texture_bytes, rt::xg::readable_fn = &readable, true);
 
 // (total tiles, packed mips, tile shape in texels, in: room / out: count, first, subresource tilings), in 64 KiB
 // tiles of plane 0, for 2D 64 KiB modes only (others fail, as on the console). The mip tail is the packed part, tile 0

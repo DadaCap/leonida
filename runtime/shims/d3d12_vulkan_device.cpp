@@ -21,6 +21,7 @@
 #include "../src/depth24_fragment.h"
 #include "../src/rect_list_geometry.h"
 #include "console_detile.h"
+#include "xmem.h"
 #include "../src/uav_clear.h"
 #include "../src/vulkan_bindless.h"
 #include "../src/vulkan_memory.h"
@@ -1864,6 +1865,19 @@ private:
     bool console_addressed_ = false;
 };
 
+class Resource;
+// The textures the title placed on its own pages, by 64 KiB page, and those whose bytes changed since their upload.
+struct TitleTextures {
+    std::mutex mutex;
+    std::unordered_map<std::uintptr_t, std::vector<Resource*>> at;
+    std::set<Resource*> dirty;
+    std::map<Resource*, std::pair<std::uint64_t, std::uint64_t>> linear;  // a movie plane the CPU rewrites: (bytes' hash, tick)
+};
+TitleTextures& title_textures() {
+    static auto* t = new TitleTextures;  // outlives every resource
+    return *t;
+}
+
 class Resource final
     : public Child<Resource, ID3D12ResourceStubs, ID3D12Object, ID3D12DeviceChild, ID3D12Pageable, ID3D12Resource> {
 public:
@@ -1881,6 +1895,7 @@ public:
         : device_(device), desc_(desc), heap_(heap), heap_flags_(heap_flags), placed_(true), va_(placed_va) {}
 
     ~Resource() override {
+        if (title_bytes_) track_title_pages(false);
         if (accel_) {
             device_.context->unregister_acceleration_structure(gpu_va_);
             if (buffer_va_ && buffer_va_ != gpu_va_) device_.context->unregister_acceleration_structure(buffer_va_);
@@ -2435,12 +2450,67 @@ public:
             return;
         title_desc_ = *title;
         title_memory_ = reinterpret_cast<void*>(address);
+        title_bytes_ = rt::xg::texture_bytes_fn ? rt::xg::texture_bytes_fn(&title_desc_, nullptr) : 0;
+        if (title_bytes_) track_title_pages(true);
+    }
+    void track_title_pages(bool add) {
+        TitleTextures& t = title_textures();
+        const std::lock_guard lock(t.mutex);
+        const std::uintptr_t first = reinterpret_cast<std::uintptr_t>(title_memory_) >> 16;
+        const std::uintptr_t last = (reinterpret_cast<std::uintptr_t>(title_memory_) + title_bytes_ - 1) >> 16;
+        for (std::uintptr_t page = first; page <= last; ++page) {
+            auto& here = t.at[page];
+            if (add) here.push_back(this);
+            else here.erase(std::remove(here.begin(), here.end(), this), here.end());
+            if (here.empty()) t.at.erase(page);
+        }
+        if (!add) t.dirty.erase(this), t.linear.erase(this);
+    }
+    static void title_written(std::uintptr_t address, std::size_t size) {
+        if (!size) return;
+        TitleTextures& t = title_textures();
+        const std::lock_guard lock(t.mutex);
+        for (std::uintptr_t page = address >> 16; page <= (address + size - 1) >> 16; ++page)
+            if (const auto it = t.at.find(page); it != t.at.end())
+                for (Resource* r : it->second)
+                    if (r->title_uploaded_) t.dirty.insert(r);  // not uploaded yet: its first view will
+    }
+    static void refresh_title_textures() {
+        TitleTextures& t = title_textures();
+        const std::lock_guard lock(t.mutex);
+        // Linear planes are written by the title's CPU with no call that says so: look at a sample of the bytes.
+        for (auto& [r, state] : t.linear) {
+            const std::uint64_t now = GetTickCount64();
+            if (now - state.second < 8) continue;
+            state.second = now;
+            if (!rt::xg::readable_fn(r->title_memory_, r->title_bytes_)) continue;  // not mapped yet
+            std::uint64_t hash = 1469598103934665603ull;
+            const auto* bytes = static_cast<const std::uint8_t*>(r->title_memory_);
+            for (std::uint64_t at = 0; at + 8 <= r->title_bytes_; at += 1031 * 8) {
+                std::uint64_t v;
+                std::memcpy(&v, bytes + at, 8);
+                hash = (hash ^ v) * 1099511628211ull;
+            }
+            if (hash == state.first) continue;
+            state.first = hash;
+            t.dirty.insert(r);
+        }
+        while (!t.dirty.empty()) {
+            Resource* r = *t.dirty.begin();
+            t.dirty.erase(t.dirty.begin());
+            r->upload_title_pixels(false);
+        }
     }
     // The title's bytes, detiled into the image: what the GPU reads of a texture on the title's pages. Textures the GPU
     // writes are not among them (set_title_address). `once`: only if it has not been done yet.
     void upload_title_pixels(bool once) {
         if (!title_memory_ || !image_ || !rt::xg::detile_fn || (once && title_uploaded_)) return;
         title_uploaded_ = true;
+        if (once && title_bytes_ && (unsigned(title_desc_.Layout) == 0x100 || title_desc_.Layout == D3D12_TEXTURE_LAYOUT_ROW_MAJOR)) {
+            TitleTextures& t = title_textures();
+            const std::lock_guard lock(t.mutex);
+            t.linear.emplace(this, std::pair<std::uint64_t, std::uint64_t>{});
+        }
         const UINT count = binding_.mip_levels * binding_.array_layers;
         for (UINT i = 0; i < count; ++i) {
             rt::xg::LinearSubresource linear;
@@ -2767,6 +2837,7 @@ private:
     bool host_import_ = false;  // memory_ is the caller's pages (create_host_buffer): freed at once, not deferred
     void* title_memory_ = nullptr;  // a texture the title placed on its pages and only it writes
     D3D12_RESOURCE_DESC title_desc_{};
+    std::uint64_t title_bytes_ = 0;
     bool title_uploaded_ = false;
     bool reserved_ = false;
     bool sparse_image_ = false;
@@ -3244,8 +3315,6 @@ public:
     virtual HRESULT STDMETHODCALLTYPE xbox_slot11(UINT64, UINT64, void** out) = 0;
 };
 
-// A pipeline state. Compute only for now: the shader is found by the SHA-256 of its FSSM program in the
-// translator's index, and the FSSM blob is copied into the arena as the shader's code base.
 // A D3D12_PIPELINE_STATE_STREAM_DESC (ID3D12Device2::CreatePipelineState) as the descriptions the PSO creators take.
 // The stream is a run of subobjects, each a D3D12_PIPELINE_STATE_SUBOBJECT_TYPE followed by its description at that
 // description's alignment, each subobject starting at pointer alignment (the d3dx12.h layout, `alignas(void*)`). A
@@ -3461,6 +3530,8 @@ HRESULT parse_pipeline_stream(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, Pipe
     return S_OK;
 }
 
+// A pipeline state, compute (create_compute) or graphics (create_graphics): each shader is found by the SHA-256 of
+// its FSSM program in the translator's index, and the FSSM blob is copied into the arena as the shader's code base.
 class PipelineState final
     : public Child<PipelineState, XboxPipelineStateStubs, ID3D12Object, ID3D12DeviceChild, ID3D12Pageable,
                    ID3D12PipelineState> {
@@ -5533,7 +5604,8 @@ public:
         if (info.bindless && state_.context->loaded() && !create_bindless(get_device))
             std::fprintf(stderr, "[rt] d3d12: the bindless set 0 could not be created\n");
         query_luid_and_clock(get_device);
-        // Timestamps: what the one VkQueue every D3D12 queue submits to can write.
+        // Timestamps: the device's timestampPeriod, enabled when the graphics family (info.queue_family) has
+        // timestampValidBits.
         VkPhysicalDeviceProperties properties{};
         device_properties(info.physical, &properties);
         state_.max_sampler_lod_bias = properties.limits.maxSamplerLodBias;
@@ -7687,9 +7759,12 @@ public:
                 // The console answers the texture's GetGPUVirtualAddress with the title's address; without it a
                 // title that clears the texture through that pointer writes at address 0 (XCL measured this on a
                 // retail title). The image stays the committed fallback above, so only the address is folded in.
-                if (auto* texture = Resource::from<Resource>(static_cast<IUnknown*>(*out)))
+                if (auto* texture = Resource::from<Resource>(static_cast<IUnknown*>(*out))) {
+                    rt::xmem::written_fn.store(&Resource::title_written, std::memory_order_release);
+                    g_refresh_title_textures.store(&Resource::refresh_title_textures, std::memory_order_release);
                     texture->set_title_address(reinterpret_cast<D3D12_GPU_VIRTUAL_ADDRESS>(address),
                                                rt::d3d12_xs::placed_title_desc);
+                }
             }
             return d3d12_trace::result(method, hr);
         }
@@ -8497,8 +8572,7 @@ public:
             // Vulkan can still advertise buffer features for their backing formats.
             if (buffer != 0 && vk_fmt != VK_FORMAT_R8G8B8A8_SRGB && vk_fmt != VK_FORMAT_B8G8R8A8_SRGB)
                 s1 |= D3D12_FORMAT_SUPPORT1_BUFFER;
-            // Only what CreateGraphicsPipelineState's input layouts accept (vertex_format): R8/R16 SNORM and SINT
-            // have Vulkan vertex support but no input-layout mapping yet.
+            // Only what CreateGraphicsPipelineState's input layouts accept (vertex_format).
             VkFormat vertex_vk = VK_FORMAT_UNDEFINED;
             UINT vertex_bytes = 0;
             if ((buffer & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT) && vertex_format(fs->Format, vertex_vk, vertex_bytes))
@@ -8549,8 +8623,9 @@ public:
                 s1 |= D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW;
                 // A typed UAV texture read is not a storage-image read: the translator reads it through the
                 // texture's sampled binding with the T#'s numeric type (rdna2spirv.py image_read_typed), so a
-                // format that can be stored can be read. Typed buffer UAVs share the store side's limits: the layer
-                // creates no buffer UAV views yet, and rdna2spirv.py FORMATS decodes only some buffer formats.
+                // format that can be stored can be read. Typed buffer UAVs share the store side's limits: a buffer
+                // UAV is a typed V# the layer writes itself (write_buffer_uav, no VkBufferView), and rdna2spirv.py
+                // FORMATS decodes only some buffer formats.
                 s2 |= D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE | D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD;
                 // Image atomics go through the r32ui storage view, which an R32_UINT UAV view gets
                 // (StorageViews::r32ui). Today that is 2D UAVs only: the translator's image atomics cover 2D and 3D,

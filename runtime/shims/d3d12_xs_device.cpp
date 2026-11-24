@@ -24,6 +24,7 @@
 // for a trace that disagrees. The frame-event calls answer from a per-device token counter: there is no vblank source
 // behind the device before a presenter exists, so WaitFrameEventX returns at once with a fresh non-zero token.
 #include "d3d12_xs_device.h"
+#include "console_detile.h"
 #include "xmem.h"
 #include "d3d12_com.h"  // local: create_console_descriptor_heap
 #include "d3d12_trace.h"
@@ -1672,6 +1673,7 @@ std::uint64_t queue_present_x(ChildProxy*, std::uint64_t, std::uint64_t, std::ui
 std::uint64_t queue_execute_command_lists(ChildProxy* self, std::uint64_t count_word, std::uint64_t lists_word) {
     // The array holds what the title got from the proxy: list proxies are replaced by the real lists in a copy, as
     // for every other array of objects the real device or queue reads.
+    if (auto* refresh = rt::d3d12::g_refresh_title_textures.load(std::memory_order_acquire)) refresh();
     std::vector<leonida::ValueWrite> value_writes = collect_value_writes(lists_word, static_cast<UINT>(count_word));
     UnwrappedArray unwrapped_lists;
     if (!unwrapped_lists.fill(lists_word, static_cast<UINT>(count_word))) return hr_to_u64(E_OUTOFMEMORY);
@@ -2954,6 +2956,7 @@ HRESULT proxy_create_state_object(DeviceProxy* self, const D3D12_STATE_OBJECT_DE
 // stride (sizeof(D3D12_RESOURCE_DESC)), each entry is expanded into a zeroed D3D12_RESOURCE_DESC1 with
 // SamplerFeedbackMipRegion cleared, and Xbox layout words (e.g. 0x101, 0x105) and console flag bits above the PC
 // D3D12_RESOURCE_FLAGS are normalized on the copy before the PC call.
+bool console_texture_placement(const D3D12_RESOURCE_DESC*, UINT, D3D12_RESOURCE_ALLOCATION_INFO&, D3D12_RESOURCE_ALLOCATION_INFO1*);
 std::uint64_t proxy_get_resource_allocation_info2(DeviceProxy* self, std::uint64_t a1, std::uint64_t a2,
                                                   std::uint64_t a3, std::uint64_t a4, std::uint64_t a5) {
     note_slot(108);
@@ -2985,6 +2988,7 @@ std::uint64_t proxy_get_resource_allocation_info2(DeviceProxy* self, std::uint64
         return reinterpret_cast<std::uint64_t>(ret);
     }
 
+    if (console_texture_placement(raw_descs, count, *ret, info1)) return reinterpret_cast<std::uint64_t>(ret);
     std::vector<D3D12_RESOURCE_DESC1> cleaned;
     const D3D12_RESOURCE_DESC1* descs_to_pass = nullptr;
     if (raw_descs && count > 0) {
@@ -3269,6 +3273,34 @@ void apply_console_placement(const D3D12_RESOURCE_DESC* descs, UINT count, D3D12
     if (console.SizeInBytes >= info.SizeInBytes) info = console;
 }
 
+// The console size of textures whose description names a swizzle mode (0x100 | mode) or leaves it to the console (0): what the title's data files are
+// laid out by, so a PC size sends it to the wrong bytes of them. Every description must be such a texture; render
+// targets and depth keep apply_console_placement's answer. False: `info` is left as it was.
+bool console_texture_placement(const D3D12_RESOURCE_DESC* descs, UINT count, D3D12_RESOURCE_ALLOCATION_INFO& info,
+                               D3D12_RESOURCE_ALLOCATION_INFO1* each) {
+    if (!descs || !count || !rt::xg::texture_bytes_fn) return false;
+    UINT64 end = 0, alignment = 1;
+    std::vector<D3D12_RESOURCE_ALLOCATION_INFO1> placed(count);
+    for (UINT i = 0; i < count; ++i) {
+        const D3D12_RESOURCE_DESC& d = descs[i];
+        if (d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER || ((static_cast<UINT>(d.Layout) & ~0xffu) != 0x100 && d.Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN) ||
+            (d.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)))
+            return false;
+        UINT64 own = 0;
+        const UINT64 size = rt::xg::texture_bytes_fn(&d, &own);
+        if (!size || !own) return false;
+        placed[i].Offset = (end + own - 1) / own * own;
+        placed[i].SizeInBytes = size;
+        placed[i].Alignment = own;
+        end = placed[i].Offset + size;
+        alignment = (std::max)(alignment, own);
+    }
+    info.SizeInBytes = (end + alignment - 1) / alignment * alignment;
+    info.Alignment = alignment;
+    if (each) std::copy(placed.begin(), placed.end(), each);
+    return true;
+}
+
 void* WINAPI proxy_get_resource_allocation_info(std::uint64_t a0, std::uint64_t a1, std::uint64_t visible_mask,
                                                 std::uint64_t count, const D3D12_RESOURCE_DESC* descs) {
     note_slot(25);
@@ -3277,6 +3309,7 @@ void* WINAPI proxy_get_resource_allocation_info(std::uint64_t a0, std::uint64_t 
     // The descriptions are the console's. The PC device gets a copy with PC flags and layout; the title's array is
     // read only. A copy that cannot be made answers as an invalid description.
     const UINT desc_count = static_cast<UINT>(count);
+    if (console_texture_placement(descs, desc_count, *static_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(call.ret), nullptr)) return call.ret;
     std::unique_ptr<D3D12_RESOURCE_DESC[]> clean;
     if (descs && desc_count) {
         clean.reset(new (std::nothrow) D3D12_RESOURCE_DESC[desc_count]);

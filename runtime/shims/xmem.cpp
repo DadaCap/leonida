@@ -581,8 +581,10 @@ void map_pool_page(uintptr_t address, uint64_t page) {
         if (const void* const bytes = section_bytes(page))
             std::memcpy(reinterpret_cast<void*>(address), bytes, kPhysicalPageSize);
     }
+    const bool moved = now.address || now.stored;
     now = {address, false};
     g_pool_page_at[address] = page;
+    if (moved) rt::xmem::title_memory_written(address, kPhysicalPageSize);
 }
 
 enum class PageCommit { not_ours, committed_before, committed_now, failed };
@@ -1036,11 +1038,12 @@ bool write_physical_pages(const uint64_t* pages, size_t offset, const void* byte
         if (!to) return false;
         std::memcpy(to + offset, static_cast<const uint8_t*>(bytes) + done, part);
         if (!mapped) g_pool_pages[*pages].stored = true;
+        else title_memory_written(reinterpret_cast<uintptr_t>(to) + offset, part);
         done += part;
     }
     return true;
 }
-const bool g_physical_write_set = (physical_write_fn = &write_physical_pages, true);
+const bool g_physical_write_set = (physical_write_fn = &write_physical_pages, commit_range_fn = &commit_physical_range, true);
 
 bool commit_physical_pages(const uint64_t* page_array, size_t count) {
     if (count == 0) return true;
