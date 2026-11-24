@@ -977,6 +977,7 @@ struct ReplayFunctions {
     PFN_vkCmdDraw draw = nullptr;
     unsigned* mesh_draw_count = nullptr;  // opt-in count for this submission
     PFN_vkCmdDrawMeshTasksEXT draw_mesh_tasks = nullptr;  // VK_EXT_mesh_shader; null: mesh draws are unsupported
+    PFN_vkCmdDrawMeshTasksIndirectEXT draw_mesh_tasks_indirect = nullptr;
     PFN_vkCmdDrawIndexed draw_indexed = nullptr;
     std::function<const GraphicsPipeline*(std::uintptr_t)> graphics_pipeline;
     // The buffer and offset a console VA range starts in (from ResourceBinding::va), false when none does. `size` is
@@ -1751,6 +1752,7 @@ inline VkDeviceSize indirect_record_size(IndirectKind kind) {
     case IndirectKind::draw: return sizeof(VkDrawIndirectCommand);
     case IndirectKind::draw_indexed: return sizeof(VkDrawIndexedIndirectCommand);
     case IndirectKind::dispatch: return sizeof(VkDispatchIndirectCommand);
+    case IndirectKind::dispatch_mesh: return 0;  // Mesh dispatches use Draw to capture graphics state.
     }
     return 0;
 }
@@ -2388,7 +2390,8 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
     // A null pipeline with a variant builder is one built at its first draw: variant 0 (all slots bound).
     if (!pipeline || (!pipeline->pipeline && !pipeline->variant)) return unresolved_at(__LINE__);
     if (pipeline->mesh != draw.mesh) return ReplayResult::invalid_draw;
-    if (draw.mesh && !vk.draw_mesh_tasks) return unsupported_at(__LINE__);
+    if (draw.mesh_indirect && !vk.draw_mesh_tasks_indirect) return unsupported_at(__LINE__);
+    if (draw.mesh && !draw.mesh_indirect && !vk.draw_mesh_tasks) return unsupported_at(__LINE__);
     if (pipeline->viewport_with_count && (!vk.set_viewport_with_count || !vk.set_scissor_with_count))
         return unsupported_at(__LINE__);
     if (pipeline->bindless_set && !vk.bind_descriptor_sets) return unsupported_at(__LINE__);
@@ -3685,6 +3688,14 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             }
             if (pipeline->bindless_set && !vk.bind_descriptor_sets) return unsupported_at(__LINE__);
         } else if (const auto* draw = std::get_if<Draw>(&command)) {
+            if (draw->mesh_indirect) {
+                const auto& args = *draw->mesh_indirect;
+                if (!bind(args.buffer) || !p.binding.buffer) return ReplayResult::unresolved_resource;
+                constexpr VkDeviceSize record_size = sizeof(VkDrawMeshTasksIndirectCommandEXT);
+                if (!draw->mesh || !args.count || args.stride < record_size || args.stride % 4 ||
+                    !detail::indirect_range(p.binding, args.offset, VkDeviceSize(args.count - 1) * args.stride + record_size))
+                    return ReplayResult::invalid_indirect_arguments;
+            }
             if (out.draw_count == out.draws.size()) out.draws.emplace_back();
             auto& prepared_draw = out.draws[out.draw_count];
             prepared_draw.reset();
@@ -4892,7 +4903,14 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
                 vk.bind_vertex_buffers2(command_buffer, slot, 1, &d.vertex_buffers[slot], &d.vertex_offsets[slot],
                                         &d.vertex_sizes[slot], &d.vertex_strides[slot]);
             }
-            if (draw->mesh) {
+            if (draw->mesh_indirect) {
+                const auto& args = *draw->mesh_indirect;
+                const VkDeviceSize offset = p.binding.buffer_offset + args.offset;
+                // A single record per call also works without Vulkan's multiDrawIndirect feature.
+                for (std::uint32_t record = 0; record < args.count; ++record)
+                    vk.draw_mesh_tasks_indirect(command_buffer, p.binding.buffer,
+                                                offset + VkDeviceSize(record) * args.stride, 1, args.stride);
+            } else if (draw->mesh) {
                 vk.draw_mesh_tasks(command_buffer, draw->count, draw->instances, draw->first);
                 if (vk.mesh_draw_count) ++*vk.mesh_draw_count;
             } else if (draw->topology == topology_quad_list) {
