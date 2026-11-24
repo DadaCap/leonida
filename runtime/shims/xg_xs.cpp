@@ -45,6 +45,7 @@
 #include "../src/console_texture_layout.h"
 #include "console_detile.h"
 #include "shims.h"
+#include "xmem.h"
 
 namespace {
 
@@ -377,6 +378,7 @@ HRESULT __stdcall copy_from(Computer* c, uint8_t* linear, uint32_t plane, uint32
 }
 
 bool readable(const void* memory, uint64_t bytes) {
+    if (rt::xmem::in_gpu_region(memory, bytes)) return true;
     auto at = reinterpret_cast<uintptr_t>(memory);
     const uintptr_t end = at + bytes;
     while (at < end) {

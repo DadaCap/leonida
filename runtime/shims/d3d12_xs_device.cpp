@@ -24,6 +24,7 @@
 // for a trace that disagrees. The frame-event calls answer from a per-device token counter: there is no vblank source
 // behind the device before a presenter exists, so WaitFrameEventX returns at once with a fresh non-zero token.
 #include "d3d12_xs_device.h"
+#include "xmem.h"
 #include "d3d12_com.h"  // local: create_console_descriptor_heap
 #include "d3d12_trace.h"
 #include "d3d12_xs_alloc_size.h"
@@ -1568,8 +1569,7 @@ LONG CALLBACK table_overrun_handler(EXCEPTION_POINTERS* info) {
 // planes, parameters), the call the Xbox presentation core (xbox_present.h) implements. The first call on a device
 // builds a window and the Vulkan layer's presenter for it, once; a device that cannot present (no presenter, no
 // window) answers S_OK and shows nothing, so the title's frame loop keeps running either way.
-// ASSUMPTION: the window is one this layer creates. The title has a window of its own; presenting into that one is
-// a separate piece of work (old PR 8591).
+// The window is the title's own when it has one, else one this layer creates.
 constexpr unsigned kQueuePresentX = 32;
 
 #ifdef LEONIDA_VULKAN_DEVICE
@@ -1577,9 +1577,10 @@ constexpr unsigned kQueuePresentX = 32;
 struct PresentState {
     ~PresentState() {
         xbox.reset();
-        if (window) DestroyWindow(window);
+        if (window && own_window) DestroyWindow(window);
     }
     HWND window = nullptr;
+    bool own_window = false;  // else the title's, which is the title's to destroy
     std::unique_ptr<rt::d3d12::XboxPresentation> xbox;
 };
 
@@ -1587,6 +1588,24 @@ void destroy_present_state(void* present_state) { delete static_cast<PresentStat
 
 LRESULT CALLBACK present_window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
     return DefWindowProcW(window, message, wparam, lparam);
+}
+
+// The title's own window: the process's first visible, unowned top-level window. Null: none yet.
+// Nothing here may send the window a message (GetWindowText does): its thread can be waiting for this present.
+HWND title_window() {
+    HWND found = nullptr;
+    EnumWindows([](HWND window, LPARAM out) -> BOOL {
+        DWORD process = 0;
+        GetWindowThreadProcessId(window, &process);
+        wchar_t name[8] = L"";
+        GetClassNameW(window, name, 8);
+        if (process != GetCurrentProcessId() || !IsWindowVisible(window) || GetWindow(window, GW_OWNER) ||
+            window == GetConsoleWindow() || std::wcscmp(name, L"Console") == 0)
+            return TRUE;
+        *reinterpret_cast<HWND*>(out) = window;
+        return FALSE;
+    }, reinterpret_cast<LPARAM>(&found));
+    return found;
 }
 
 // Builds the window, presenter and XboxPresentation once per device. Returns the state even when `xbox` stays null:
@@ -1598,22 +1617,30 @@ PresentState* present_state_for(DeviceProxy* device) {
     auto* state = new (std::nothrow) PresentState;
     if (!state) return nullptr;
     device->present_state = state;
-    WNDCLASSW window_class{};
-    window_class.lpfnWndProc = present_window_proc;
-    window_class.hInstance = GetModuleHandleW(nullptr);
-    window_class.lpszClassName = L"LeonidaPresentX";
-    if (!RegisterClassW(&window_class) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
-        std::fprintf(stderr, "[rt] d3d12_xs: PresentX window class failed (error %lu)\n", GetLastError());
-        return state;
+    // The title pumps its own window, so it takes input and stays responsive; a window made here has no message loop.
+    state->window = title_window();
+    if (state->window) {
+        if (IsIconic(state->window)) ShowWindowAsync(state->window, SW_RESTORE);
+        SetWindowPos(state->window, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_ASYNCWINDOWPOS);
+    } else {
+        WNDCLASSW window_class{};
+        window_class.lpfnWndProc = present_window_proc;
+        window_class.hInstance = GetModuleHandleW(nullptr);
+        window_class.lpszClassName = L"LeonidaPresentX";
+        if (!RegisterClassW(&window_class) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+            std::fprintf(stderr, "[rt] d3d12_xs: PresentX window class failed (error %lu)\n", GetLastError());
+            return state;
+        }
+        state->window = CreateWindowExW(0, window_class.lpszClassName, L"Leonida", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT,
+                                        CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, nullptr, nullptr,
+                                        window_class.hInstance, nullptr);
+        if (!state->window) {
+            std::fprintf(stderr, "[rt] d3d12_xs: PresentX window failed (error %lu)\n", GetLastError());
+            return state;
+        }
+        state->own_window = true;
+        ShowWindow(state->window, SW_SHOWNOACTIVATE);
     }
-    state->window = CreateWindowExW(0, window_class.lpszClassName, L"Leonida", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT,
-                                    CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, nullptr, nullptr,
-                                    window_class.hInstance, nullptr);
-    if (!state->window) {
-        std::fprintf(stderr, "[rt] d3d12_xs: PresentX window failed (error %lu)\n", GetLastError());
-        return state;
-    }
-    ShowWindow(state->window, SW_SHOWNOACTIVATE);
     auto presenter = rt::d3d12::create_window_presenter(device->real, state->window);
     if (!presenter) {
         std::fprintf(stderr, "[rt] d3d12_xs: no window presenter on this device; PresentX shows nothing\n");
@@ -2199,6 +2226,7 @@ static bool console_heap_range_plausible(const D3D12_DESCRIPTOR_HEAP_DESC* desc,
 
 static bool readable_range(const void* ptr, std::size_t bytes) {
     if (!ptr || !bytes) return false;
+    if (rt::xmem::in_gpu_region(ptr, bytes)) return true;
     const auto* p = static_cast<const std::uint8_t*>(ptr);
     std::size_t remaining = bytes;
     while (remaining) {

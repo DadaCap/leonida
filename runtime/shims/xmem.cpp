@@ -289,6 +289,8 @@ bool make_region() {
     g_pool_end = start + kLowBytes;
     g_high_base = g_high_next = g_pool_end;
     g_high_end = reinterpret_cast<uintptr_t>(base) + bytes;
+    rt::xmem::region_start = reinterpret_cast<uintptr_t>(base);
+    rt::xmem::region_end.store(g_high_end, std::memory_order_release);
     std::fprintf(stderr, "[rt] xmem: the title's GPU memory is served from one %zu MiB region\n", mb);
     return true;
 }
@@ -300,6 +302,15 @@ bool in_pool(uintptr_t address, uint64_t bytes) {
 std::map<uintptr_t, Window> g_windows;              // base -> window
 std::unordered_map<uint64_t, PhysicalPage> g_pages;  // page number -> backing
 std::vector<uint64_t> g_free_slots;
+// The pool's addresses have memory of their own, so a physical page mapped there lives at the last address it was
+// mapped at; `stored` says its section holds its bytes instead (written before it was mapped, or displaced).
+// shortcut: one page mapped at two pool addresses at once does not alias; needs the pool made of sections.
+struct PoolPage {
+    uintptr_t address = 0;
+    bool stored = false;
+};
+std::unordered_map<uint64_t, PoolPage> g_pool_pages;         // page number -> where its bytes are
+std::unordered_map<uintptr_t, uint64_t> g_pool_page_at;      // pool address -> page number mapped there
 uint64_t g_next_slot = 1;
 struct MappedPage {
     uint64_t page;
@@ -538,6 +549,42 @@ bool map_page(uintptr_t address, uint64_t page, DWORD protect) {
     return true;
 }
 
+// With g_phys_mutex held: the section's own bytes of a live page, committed; null when it is not live.
+void* section_bytes(uint64_t page) {
+    const auto it = g_pages.find(page);
+    if (it == g_pages.end() || !it->second.section->scratch) return nullptr;
+    void* const backing = static_cast<uint8_t*>(it->second.section->scratch) + it->second.offset;
+    return VirtualAlloc(backing, kPhysicalPageSize, MEM_COMMIT, PAGE_READWRITE) ? backing : nullptr;
+}
+
+// With g_phys_mutex held. Maps `page` (0: unmap) at a pool address: the bytes follow the page.
+void map_pool_page(uintptr_t address, uint64_t page) {
+    const auto at = g_pool_page_at.find(address);
+    if (at != g_pool_page_at.end()) {
+        if (at->second == page) return;
+        const auto old = g_pool_pages.find(at->second);
+        if (old != g_pool_pages.end() && old->second.address == address) {
+            if (void* const bytes = section_bytes(at->second)) {
+                std::memcpy(bytes, reinterpret_cast<const void*>(address), kPhysicalPageSize);
+                old->second = {0, true};
+            } else {
+                g_pool_pages.erase(old);  // the page was freed
+            }
+        }
+        g_pool_page_at.erase(at);
+    }
+    if (!page) return;
+    PoolPage& now = g_pool_pages[page];
+    if (now.address) {
+        std::memcpy(reinterpret_cast<void*>(address), reinterpret_cast<const void*>(now.address), kPhysicalPageSize);
+    } else if (now.stored) {
+        if (const void* const bytes = section_bytes(page))
+            std::memcpy(reinterpret_cast<void*>(address), bytes, kPhysicalPageSize);
+    }
+    now = {address, false};
+    g_pool_page_at[address] = page;
+}
+
 enum class PageCommit { not_ours, committed_before, committed_now, failed };
 
 PageCommit commit_mapped_page(uintptr_t address, uintptr_t accessed, DWORD& protect) {
@@ -706,6 +753,7 @@ BOOL WINAPI XMemFreePhysicalPages(uint64_t page_count, const uint64_t* page_arra
             SetLastError(ERROR_INVALID_PARAMETER);
             return FALSE;
         }
+        g_pool_pages.erase(page_array[i]);
         g_pages.erase(it);
         g_free_slots.push_back(page_array[i] / kFramesPerPage);
     }
@@ -731,7 +779,11 @@ void* WINAPI XMemMapPhysicalPages(void* address, uint64_t page_count, const uint
         return nullptr;
     }
     const std::lock_guard lock(g_phys_mutex);
-    if (in_pool(start, page_count * kPhysicalPageSize)) return address;
+    if (in_pool(start, page_count * kPhysicalPageSize)) {
+        for (uint64_t i = 0; i < page_count; ++i)
+            map_pool_page(start + i * kPhysicalPageSize, page_array ? page_array[i] : 0);
+        return address;
+    }
     if (!page_array) {
         for (uint64_t i = 0; i < page_count; ++i) {
             if (!unmap_page(start + i * kPhysicalPageSize)) return nullptr;
@@ -771,7 +823,10 @@ BOOL WINAPI XMemMapPhysicalPagesScatter(void* const* addresses, uint32_t page_co
             return FALSE;
         }
         const uint64_t page = page_array ? page_array[i] : 0;
-        if (in_pool(address, kPhysicalPageSize)) continue;
+        if (in_pool(address, kPhysicalPageSize)) {
+            map_pool_page(address, page);
+            continue;
+        }
         if (page == 0) {
             if (!unmap_page(address)) return FALSE;
             continue;
@@ -877,6 +932,7 @@ std::uint8_t* host_page_bytes(std::uintptr_t page) {
 
 // True when the host may write at `address`: the page is committed and writable.
 bool writable_at(std::uintptr_t address) {
+    if (rt::xmem::in_gpu_region(reinterpret_cast<const void*>(address), 1)) return true;
     MEMORY_BASIC_INFORMATION info{};
     if (!VirtualQuery(reinterpret_cast<void*>(address), &info, sizeof(info))) return false;
     if (info.State != MEM_COMMIT) return false;
@@ -967,6 +1023,24 @@ bool write_title_bytes(const void* address, const void* bytes, std::size_t size)
             TitleWriteRegistration() { title_write_fn = &write_title_bytes; }
         } title_write_registration;
     }
+
+bool write_physical_pages(const uint64_t* pages, size_t offset, const void* bytes, size_t size) {
+    const std::lock_guard lock(g_phys_mutex);
+    pages += offset / kPhysicalPageSize;
+    offset %= kPhysicalPageSize;
+    for (size_t done = 0; done < size; ++pages, offset = 0) {
+        const size_t part = (std::min)(size - done, static_cast<size_t>(kPhysicalPageSize) - offset);
+        const auto pool = g_pool_pages.find(*pages);
+        const bool mapped = pool != g_pool_pages.end() && pool->second.address && g_pages.count(*pages);
+        auto* const to = static_cast<uint8_t*>(mapped ? reinterpret_cast<void*>(pool->second.address) : section_bytes(*pages));
+        if (!to) return false;
+        std::memcpy(to + offset, static_cast<const uint8_t*>(bytes) + done, part);
+        if (!mapped) g_pool_pages[*pages].stored = true;
+        done += part;
+    }
+    return true;
+}
+const bool g_physical_write_set = (physical_write_fn = &write_physical_pages, true);
 
 bool commit_physical_pages(const uint64_t* page_array, size_t count) {
     if (count == 0) return true;

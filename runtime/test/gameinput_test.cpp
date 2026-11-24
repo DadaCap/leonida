@@ -2195,6 +2195,22 @@ int main() {
     release_all(seen);
     if (pair_ref) pair_ref->Release();
 
+    // A slow reader: a press that came and went between two reads of a pad is answered once, then the real state.
+    if (IGameInputReading* r = current(input, dev)) r->Release();
+    Sleep(80);
+    SDL_SetJoystickVirtualButton(xbox2.js, SDL_GAMEPAD_BUTTON_WEST, true);
+    rt::gameinput::poll();
+    SDL_SetJoystickVirtualButton(xbox2.js, SDL_GAMEPAD_BUTTON_WEST, false);
+    rt::gameinput::poll();
+    {
+        IGameInputReading* first = current(input, dev);
+        IGameInputReading* second = current(input, dev);
+        check(first && second && (buttons_of(first) & GameInputGamepadX) && !(buttons_of(second) & GameInputGamepadX),
+              "a slow reader sees a missed press once");
+        if (first) first->Release();
+        if (second) second->Release();
+    }
+
     // Ageing: a reading leaves the history once the reading after it is more than half a second old.
     IGameInputReading* aged = current(input, dev);
     SDL_SetJoystickVirtualButton(xbox2.js, SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, true);

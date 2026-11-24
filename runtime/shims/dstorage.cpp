@@ -35,6 +35,7 @@
 #include "../src/shader_library.h"  // leonida::zlib_inflate
 #include "dstorage_xs_abi.h"
 #include "shims.h"
+#include "xmem.h"
 
 using namespace dsx;
 
@@ -466,6 +467,7 @@ HRESULT read_file_range(HANDLE handle, uint64_t offset, void* destination, uint3
 struct Entry {
     enum class Type { Request, Status, Signal, Event } type = Type::Request;
     DSTORAGE_REQUEST request{};
+    std::vector<uint64_t> pages;   // DestinationIsPhysicalPages: the array, copied at enqueue
     File* file = nullptr;          // a reference, for a file request naming a live file
     bool file_counted = false;     // the file's pending count was raised at submit
     bool cancelled = false;        // CancelRequestsWithTag matched it before it started
@@ -533,6 +535,11 @@ public:
         } else {
             e.request = *request;  // the title may reuse its structure as soon as this returns
             const uint64_t o = e.request.Options.AsUINT64;
+            if ((o & options::kDestinationPages) && e.request.DestinationPageArray && e.request.DestinationSize) {
+                const uint64_t end = uint64_t{e.request.DestinationPageOffset} + e.request.DestinationSize;
+                e.pages.resize(static_cast<size_t>((end + 0xffff) >> 16));
+                if (!guarded_move(e.pages.data(), e.request.DestinationPageArray, e.pages.size() * 8)) e.pages.clear();
+            }
             if (options::source_type(o) == DSTORAGE_REQUEST_SOURCE_FILE &&
                 desc_.SourceType == DSTORAGE_REQUEST_SOURCE_FILE && e.request.File) {
                 e.file = live_file(e.request.File);
@@ -800,9 +807,22 @@ private:
             log_once("decompress", "BCPack and swizzle requests are not implemented yet (E_NOTIMPL)");
             return E_NOTIMPL;
         }
-        if (o & (options::kDestinationPages | options::kSourcePages)) {
-            log_once("pages", "physical-page requests are not implemented yet (E_NOTIMPL)");
+        if (o & options::kSourcePages) {
+            log_once("pages", "physical-page sources are not implemented yet (E_NOTIMPL)");
             return E_NOTIMPL;
+        }
+        if (o & options::kDestinationPages) {
+            if (!rt::xmem::physical_write_fn || e.pages.empty()) return E_INVALIDARG;
+            if (r.DestinationSize > kMax4kPageDestinationSize * 4ull) return E_DSTORAGE_REQUEST_TOO_LARGE;
+            log_once("pages", "requests with physical-page destinations go through a staging buffer");
+            std::vector<uint8_t> staging(r.DestinationSize);
+            Entry plain = e;
+            plain.pages.clear();
+            plain.request.Options.AsUINT64 &= ~options::kDestinationPages;
+            plain.request.Destination = staging.data();
+            if (const HRESULT hr = execute_request(plain); FAILED(hr)) return hr;
+            return rt::xmem::physical_write_fn(e.pages.data(), r.DestinationPageOffset, staging.data(), staging.size())
+                       ? S_OK : E_DSTORAGE_ACCESS_VIOLATION;
         }
         const bool zlib = options::zlib(o);
         // IntermediateSize is the BCPack data's size between the inflate and the BCPack decode (DSTORAGE_REQUEST), so
