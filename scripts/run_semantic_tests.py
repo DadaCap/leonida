@@ -16,9 +16,9 @@ It runs the files `python -m unittest discover -s tests/semantic` finds (`test*.
 
 The files can run side by side because each one writes only into its own temporary folder; a new test must do the same. With -j 1,
 or on a single core, it runs that discover command itself. Prints the output of every failing file, headed by its
-exit code (a crash shows as its signal or Windows NTSTATUS, e.g. 0xC0000005 for an access violation, since a file
-that crashes prints nothing), and one summary line, and exits 1 if a file fails, none is found, or no test ran.
-Standard library only.
+exit code (a POSIX signal by name, a known Windows NTSTATUS with its meaning, e.g. 0xC0000005 access violation,
+since a file that crashes prints nothing), and one summary line, and exits 1 if a file fails, none is found, or no
+test ran. Standard library only.
 
 The count of tests comes from unittest's own result object, not from its output: a module that writes a line shaped like unittest's summary to stderr - a nested runner, or an atexit handler that runs after unittest's own summary - cannot change it.
 
@@ -105,30 +105,38 @@ CHILD_PROGRAM = (
     "    sys.exit(5)\n"
     "sys.exit(0)\n")
 
-# Windows NTSTATUS codes a crashed python.exe exits with. A file that dies this way prints nothing, so the code is
-# the only clue there is (an access violation in a pure-Python test points at the machine, not at the test).
-NTSTATUS = {
+# Windows NTSTATUS codes python.exe exits with when it crashes. A file that dies this way prints nothing, so the code
+# is the only clue there is (an access violation in a pure-Python test points at the machine, not at the test).
+NTSTATUS_CRASHES = {
     0xC0000005: "access violation",
     0xC000001D: "illegal instruction",
     0xC0000017: "out of memory",
     0xC00000FD: "stack overflow",
-    0xC000013A: "interrupted with Ctrl+C",
     0xC0000374: "heap corruption",
     0xC0000409: "fail fast / stack buffer overrun",
+}
+# Known statuses that end a process without it crashing.
+NTSTATUS_OTHER = {
+    0xC000013A: "interrupted with Ctrl+C",
 }
 
 
 def describe_exit(code):
-    """A failed module's exit code in words: `exit code 1`, `killed by SIGSEGV (-11)` for a POSIX signal, or the
-    hexadecimal NTSTATUS and its meaning for a Windows crash (3221225477 -> 0xC0000005, access violation)."""
+    """A failed module's exit code in words: `exit code 1`, `killed by SIGSEGV (-11)` for a POSIX signal, or for a
+    known Windows NTSTATUS its hexadecimal value and meaning (3221225477 -> 0xC0000005, access violation). Only the
+    statuses in NTSTATUS_CRASHES are called a crash: a process can also exit with any 32-bit value on purpose, so an
+    unknown one is reported as just its value."""
     if code < 0:
         try:
             return f"killed by {signal.Signals(-code).name} ({code})"
         except ValueError:
             return f"killed by signal {-code} ({code})"
-    if code >= 0xC0000000:
-        meaning = NTSTATUS.get(code)
-        return f"exit code 0x{code:08X}" + (f", {meaning}" if meaning else "") + " (the process crashed)"
+    if code in NTSTATUS_CRASHES:
+        return f"exit code 0x{code:08X}, {NTSTATUS_CRASHES[code]} (the process crashed)"
+    if code in NTSTATUS_OTHER:
+        return f"exit code 0x{code:08X}, {NTSTATUS_OTHER[code]}"
+    if code > 0xFFFF:  # an NTSTATUS-sized value reads better in hexadecimal
+        return f"exit code 0x{code:08X}"
     return f"exit code {code}"
 
 

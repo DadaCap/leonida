@@ -303,7 +303,12 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(r.describe_exit(-1000), "killed by signal 1000 (-1000)")
         self.assertEqual(r.describe_exit(3221225477), "exit code 0xC0000005, access violation (the process crashed)")
         self.assertEqual(r.describe_exit(0xC00000FD), "exit code 0xC00000FD, stack overflow (the process crashed)")
-        self.assertEqual(r.describe_exit(0xC0001234), "exit code 0xC0001234 (the process crashed)")
+        # Ctrl+C is a known status but not a crash.
+        self.assertEqual(r.describe_exit(0xC000013A), "exit code 0xC000013A, interrupted with Ctrl+C")
+        # A process can exit with any 32-bit value on purpose: an unknown one is only its value, not called a crash.
+        self.assertEqual(r.describe_exit(0xC0001234), "exit code 0xC0001234")
+        self.assertEqual(r.describe_exit(0xDEADBEEF), "exit code 0xDEADBEEF")
+        self.assertEqual(r.describe_exit(255), "exit code 255")
 
     def test_one_job_runs_discover_and_keeps_its_exit_code(self):
         with tempfile.TemporaryDirectory() as tmp:
