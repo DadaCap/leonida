@@ -11,6 +11,7 @@ post counts and pass/fail lines there, never game shaders, logs or private paths
 | AMD Radeon RX 7900 GRE (RDNA3, gfx1100), subgroup 32..64 | AMD proprietary 26.11.2 (LLPC), Vulkan 1.4.359, Windows 11 x64 | `5d74c27` | 247/247 translated and valid | run via run_gpu_tests.py | 225/241 passed, 16 skipped | none | [#166](https://github.com/ItsNotRexed/Leonida/issues/166#issuecomment-7115041436) |
 | Intel Graphics (Meteor Lake, Xe-LPG), subgroup 8..32 | ANV, Mesa 26.2.7, Vulkan 1.4.354, Fedora 45 | `84347bb` | 279/279 translated and valid | 177/219 pass, 40 skipped, 2 failed | 194/248 passed, 52 skipped (native); 226/248 passed, 20 skipped (`LEONIDA_W64_EMULATE=1`) | `cs_imgload_tfe`, `cs_imgload_d16_tfe` (#31; pass with #98) | [local note](../gpu-test-results/IntelMTL.txt) |
 | Apple M5 Pro (16-core GPU, Metal 4), subgroup 4..32 | MoltenVK 1.4.2 (Homebrew), Vulkan 1.4.357, macOS 26.7.3 (25G342) | `d42773d07` | 280/280 translated and valid | 175/219 pass, 39 skipped, 5 failed | 183/248 passed, 61 skipped, 4 failed (native); 214/248 passed, 30 skipped, 4 failed (`LEONIDA_W64_EMULATE=1`) | `cs_fma_fused` (known row), `cs_imgload_tfe`, `cs_imgload_d16_tfe` (pass with #291), `ps_imgatomic` flake (#543) | [local note](../gpu-test-results/AppleM5Pro.txt) |
+| AMD Radeon 660M (RDNA2 iGPU, gfx1035, Ryzen 5 7535HS), subgroup 32..64 | AMD Adrenalin 32.0.21045.1000 (Vulkan driver 2.0.353), Vulkan 1.4.315, Windows 11 26200 | `21625bc` | 280/280 translated and valid | 213/219 pass, 4 skipped, 2 failed | 223/248 passed, 23 skipped, 2 failed (native and emulated alike) | `cs_imgload_tfe`, `cs_imgload_d16_tfe` (#31) | [below](#amd-radeon-660m--2026-11-24) |
 
 ## AMD Radeon RX 9070 GRE — 2026-11-23
 
@@ -124,3 +125,26 @@ distribution's build. The full record, with every skip by name, is in
 
 AI-assisted (Claude Code): built `main` at `84347bb`, ran `build.py`, `check.py` and `run_gpu_tests.py` native and
 emulated on this GPU, and reran the tfe pair with #98 applied.
+
+## AMD Radeon 660M — 2026-11-24
+
+```
+GPU:        AMD Radeon 660M (RDNA2 iGPU, gfx1035, Ryzen 5 7535HS), subgroup 32..64
+Driver:     AMD Adrenalin 32.0.21045.1000 (Vulkan driver 2.0.353), Vulkan 1.4.315
+Subgroup:   32..64 (native wave64 compute; no 64-wide fragment subgroup can be required)
+OS:         Windows 11 build 26200
+Commit:     21625bca8c675c62f9dbffc318ce6a59d57faf31 (main, 2026-11-24)
+Tools:      llvm-mc 23.1.6 (conda-forge llvm-tools), Vulkan SDK 1.4.363 (SPIRV-Tools), Visual Studio 2026 (MSVC, RelWithDebInfo), Python 3.14.2
+build.py:   280 shaders: 280 translated, 280 pass spirv-val (6 mesh fixtures not built: ms_clip, ms_f16_pack, ms_tri, ms_v5_workgroup, ms_w64x_ballot, ms_wave_info_s3)
+check.py:   213 of 219 pass, 4 skipped, 2 failed
+run_gpu_tests.py: 223/248 passed, 23 skipped, 2 failed (native and LEONIDA_W64_EMULATE=1 alike; 257/257 shaders translated and passed spirv-val in both runs)
+Failed:     cs_imgload_tfe, cs_imgload_d16_tfe: r32 sint (sint view) 64 bad, texel(5,3) = 2071 (the uint view is exact). Same signature as #31 (Radeon 780M); both pass 2/2 with #291 (de87b1a9e) applied.
+Skipped:    6 mesh fixtures (no VK_EXT_mesh_shader on this driver), ps_w64x_readlane (cannot require a 64-wide fragment subgroup), and the 16 documented "run by d3d12_*_test / w64_graphics.py" cases.
+```
+
+Setup: `cmake -S runtime -B runtime/build` (Visual Studio 18 2026 generator, `VULKAN_SDK=C:\VulkanSDK\1.4.363.0`),
+`cmake --build runtime/build --config RelWithDebInfo`; implicit Vulkan layers disabled (`VK_LOADER_LAYERS_DISABLE='~implicit~'`).
+No mesh shaders on this driver, so every mesh fixture is skipped; apart from the two tfe cases above, every other pixel and compute test was exact.
+
+AI-assisted (Claude and OpenCode): built `main` at `21625bc`, ran `build.py`, `check.py` and `run_gpu_tests.py`
+(native and emulated) on this GPU, and checked the two failures against #31 and #291.
