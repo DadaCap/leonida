@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import argparse
 import compileall
+import contextlib
+import io
 import json
 import os
 from pathlib import Path
@@ -106,25 +108,29 @@ def run_checks(root: Path, quick: bool = False, verbose: bool = False) -> list[d
     t0 = time.monotonic()
     compile_ok = True
     compile_err = None
+    compile_buf = io.StringIO()
     try:
-        if quick:
-            # Quick mode: verify core entry points compile
-            for p in (root / "make_game.py", root / "tools" / "rdna2spirv.py", root / "scripts" / "dev.py", root / "scripts" / "smoke.py"):
-                if p.is_file() and not compileall.compile_file(str(p), quiet=1, force=False):
+        with contextlib.redirect_stdout(compile_buf):
+            if quick:
+                # Quick mode: verify core entry points compile
+                for p in (root / "make_game.py", root / "tools" / "rdna2spirv.py", root / "scripts" / "dev.py", root / "scripts" / "smoke.py"):
+                    if p.is_file() and not compileall.compile_file(str(p), quiet=1, force=False):
+                        compile_ok = False
+                        compile_err = f"{p.name} failed bytecode compilation"
+                        break
+            else:
+                # Full mode: verify all tools and scripts
+                res = compileall.compile_dir(str(root / "tools"), quiet=1, force=False)
+                res = compileall.compile_dir(str(root / "scripts"), quiet=1, force=False) and res
+                res = compileall.compile_file(str(root / "make_game.py"), quiet=1, force=False) and res
+                if not res:
                     compile_ok = False
-                    compile_err = f"{p.name} failed bytecode compilation"
-                    break
-        else:
-            # Full mode: verify all tools and scripts
-            res = compileall.compile_dir(str(root / "tools"), quiet=1, force=False)
-            res = compileall.compile_dir(str(root / "scripts"), quiet=1, force=False) and res
-            res = compileall.compile_file(str(root / "make_game.py"), quiet=1, force=False) and res
-            if not res:
-                compile_ok = False
-                compile_err = "One or more files failed bytecode compilation"
+                    compile_err = "One or more files failed bytecode compilation"
     except Exception as exc:  # noqa: BLE001
         compile_ok = False
         compile_err = str(exc)
+    if not compile_ok and compile_buf.getvalue().strip():
+        print(compile_buf.getvalue().rstrip(), file=sys.stderr)
 
     checks.append({
         "name": "python_compileall",
@@ -292,7 +298,11 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"  - {k}: {status}{detail}")
         return 0
 
-    checks = run_checks(ROOT, quick=args.quick, verbose=args.verbose)
+    if args.json:
+        with contextlib.redirect_stdout(sys.stderr):
+            checks = run_checks(ROOT, quick=args.quick, verbose=args.verbose)
+    else:
+        checks = run_checks(ROOT, quick=args.quick, verbose=args.verbose)
     all_passed = all(c["status"] in ("PASS", "SKIP") for c in checks)
 
     if args.json:

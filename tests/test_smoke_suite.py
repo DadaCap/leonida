@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import shutil
 import subprocess
 import sys
+import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -89,6 +91,35 @@ class SmokeSuiteTests(unittest.TestCase):
         data = json.loads(proc.stdout)
         self.assertEqual(data["verdict"], "ERROR")
         self.assertIn("error", data)
+
+    def test_compile_failure_keeps_json_stdout_clean(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_root = Path(tmp)
+            scripts_dir = tmp_root / "scripts"
+            tools_dir = tmp_root / "tools"
+            scripts_dir.mkdir()
+            tools_dir.mkdir()
+            shutil.copy2(SMOKE_SCRIPT, scripts_dir / "smoke.py")
+            shutil.copy2(DEV_SCRIPT, scripts_dir / "dev.py")
+            (tmp_root / "make_game.py").write_text("def broken(:\n", encoding="utf-8", newline="\n")
+            for args in (
+                [str(scripts_dir / "smoke.py"), "--quick", "--json"],
+                [str(scripts_dir / "dev.py"), "smoke", "--quick", "--json"],
+            ):
+                with self.subTest(entry=args[0]):
+                    proc = subprocess.run(
+                        [sys.executable, "-I", "-B", *args],
+                        cwd=tmp_root,
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                    )
+                    self.assertEqual(proc.returncode, 1, proc.stderr)
+                    data = json.loads(proc.stdout)
+                    self.assertEqual(data["verdict"], "FAIL")
+                    compile_chk = next(c for c in data["checks"] if c["name"] == "python_compileall")
+                    self.assertEqual(compile_chk["status"], "FAIL")
+                    self.assertTrue(proc.stderr.strip())
 
 
 if __name__ == "__main__":
