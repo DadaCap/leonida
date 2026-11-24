@@ -11,6 +11,7 @@ post counts and pass/fail lines there, never game shaders, logs or private paths
 | AMD Radeon RX 7900 GRE (RDNA3, gfx1100), subgroup 32..64 | AMD proprietary 26.11.2 (LLPC), Vulkan 1.4.359, Windows 11 x64 | `5d74c27` | 247/247 translated and valid | run via run_gpu_tests.py | 225/241 passed, 16 skipped | none | [#166](https://github.com/ItsNotRexed/Leonida/issues/166#issuecomment-7115041436) |
 | Intel Graphics (Meteor Lake, Xe-LPG), subgroup 8..32 | ANV, Mesa 26.2.7, Vulkan 1.4.354, Fedora 45 | `84347bb` | 279/279 translated and valid | 177/219 pass, 40 skipped, 2 failed | 194/248 passed, 52 skipped (native); 226/248 passed, 20 skipped (`LEONIDA_W64_EMULATE=1`) | `cs_imgload_tfe`, `cs_imgload_d16_tfe` (#31; pass with #98) | [local note](../gpu-test-results/IntelMTL.txt) |
 | Apple M5 Pro (16-core GPU, Metal 4), subgroup 4..32 | MoltenVK 1.4.2 (Homebrew), Vulkan 1.4.357, macOS 26.7.3 (25G342) | `d42773d07` | 280/280 translated and valid | 175/219 pass, 39 skipped, 5 failed | 183/248 passed, 61 skipped, 4 failed (native); 214/248 passed, 30 skipped, 4 failed (`LEONIDA_W64_EMULATE=1`) | `cs_fma_fused` (known row), `cs_imgload_tfe`, `cs_imgload_d16_tfe` (pass with #291), `ps_imgatomic` flake (#543) | [local note](../gpu-test-results/AppleM5Pro.txt) |
+| AMD Radeon RX 6900 XT (RDNA2, GFX1030), subgroup 32..64 | RADV, Mesa 26.2.4, Vulkan 1.4.354, Nobara Linux 44 (kernel 7.2.10) | `21625bc` | 280/280 translated and valid | 214/219 pass, 3 skipped, 2 failed | 230/248 passed, 16 skipped, 2 failed (native and emulated alike) | `cs_imgload_tfe`, `cs_imgload_d16_tfe` (SHADER-1266 / #31; see below) | [local note](../gpu-test-results/RX6900XT.txt) |
 
 ## AMD Radeon RX 9070 GRE — 2026-11-23
 
@@ -124,3 +125,51 @@ distribution's build. The full record, with every skip by name, is in
 
 AI-assisted (Claude Code): built `main` at `84347bb`, ran `build.py`, `check.py` and `run_gpu_tests.py` native and
 emulated on this GPU, and reran the tfe pair with #98 applied.
+
+That last note is now out of date: #98 was closed unmerged and the tfe pair is the open SHADER-1266 (#31) question in
+the coordination issue, where the current position is that `main`'s translator is exact and the two fixtures expect
+the wrong value. The RX 6900 XT record below describes the failure without claiming a translator bug, and says why;
+the Radeon 610M record in the table above still carries the older "#98 fixes it" reading.
+
+## AMD Radeon RX 6900 XT — 2026-11-24
+
+```
+GPU:        AMD Radeon RX 6900 XT (RDNA2 / GFX1030, Navi 21, PCI 1002:73bf), subgroup 32..64
+Driver:     RADV, Mesa 26.2.4, Vulkan 1.4.354 (conformance 1.4.5.3)
+Subgroup:   32..64 (minSubgroupSize 32, maxSubgroupSize 64; subgroupSizeControl true)
+OS:         Nobara Linux 44 (Fedora 44), kernel 7.2.10-200.nobara.fc44.x86_64
+Commit:     21625bca8c675c62f9dbffc318ce6a59d57faf31 (main, 2026-11-24)
+Tools:      llvm-mc 22.1.8 (Fedora llvm package, AMDGPU target; unpacked into a local prefix), SPIRV-Tools v2026.1,
+            CMake 3.31.10, GCC 16.2.1, Python 3.14.9
+build.py:   280 shaders: 280 translated, 280 pass spirv-val
+            wave64 VS/PS/GS on 32-wide subgroups: tier A: 11, tier B: 8, tier C: 13
+check.py:   214 of 219 pass, 3 skipped, 2 failed
+run_gpu_tests.py: native 230/248 passed, 16 skipped, 2 failed
+            LEONIDA_W64_EMULATE=1: 230/248 passed, 16 skipped, 2 failed
+Failed:     cs_imgload_tfe, cs_imgload_d16_tfe: "r32 sint (sint view): 64 bad, texel(5,3) = 2071"
+```
+
+This is the first RDNA2 discrete desktop card in this folder, and it agrees with the 610M record (`gfx1036`, RADV) on
+every count: 230/248 passed, 16 skipped, the same two fixtures. Every wave64 fixture ran natively — the device is
+32..64, so nothing needs `LEONIDA_W64_EMULATE=1`, and setting it changed no result.
+
+The one failure is the open `tfe` question, not a driver difference. The fixture stores `100 + 8y + x` in the r32 uint
+image (129 at (5,3)) and `-2 (8y + x)` in the r32 sint image (-58 there) and expects their sum, 71. It seeds each of
+its two fetch-status VGPRs with 1000 (`0x3e8`), and `2071 - 71 = 2000` is exactly both seeds, so the status dwords are
+read but never written. The uint view is exact in the same run (0 bad, texel 129), so only those two dwords differ,
+and `check.py` and `run_gpu_tests.py` report identically.
+
+Setup: `cmake -S runtime -B runtime/build/linux` and `cmake --build runtime/build/linux --parallel` with GCC 16.2.1;
+this host has no Windows surface, so `gta6rt` and the shims are not built. `llvm-mc` is Fedora's LLVM 22 package
+unpacked into a local prefix (no `llvm-mc` or `spirv-val` on `PATH` and no root, per [testing.md](testing.md)'s
+distro-package route).
+
+The overlay layers that would need suppressing on other hosts are not installed here: `VK_LOADER_DEBUG=layer` shows
+MangoHud, vkBasalt, gamescope WSI and Mesa's `device_select` (which the loader does insert), so
+`DISABLE_RTSS_LAYER=1`/`DISABLE_VULKAN_OBS_CAPTURE=1` are no-ops. As a control, the whole native suite was rerun under
+`VK_LOADER_LAYERS_DISABLE='~implicit~'` and gave the same 230/248 with the same two failures.
+
+AI-assisted (Hermes Agent): built `main` at `21625bc`, ran `build.py`, `check.py` and `run_gpu_tests.py` native and
+emulated, reproduced the two failures alone with `--filter tfe`, and reran the native suite with implicit layers
+disabled. The entry was first measured at `1c93c86`; `main` moved 42 commits while it was written, so every count
+above is from `21625bc`.
