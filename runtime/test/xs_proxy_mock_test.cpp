@@ -11,6 +11,7 @@
 //   - --fail-virtualalloc / --fail-virtualprotect / --fail-veh: the guard region's setup failing, injected by
 //     patching this executable's own import table before the first proxy table is built (one process each).
 // Every device, queue, fence and resource here is a mock that records the calls it gets. No game data, no Xbox DLLs.
+#include "../shims/console_texture_size.h"
 #include "../shims/d3d12_xs_device.h"
 
 #include <d3d12.h>
@@ -1155,6 +1156,35 @@ int check_resource_allocation_info() {
     EXPECT(raw(device, 25, word(&pc), 1, 1, word(descs)) == word(&pc));
     EXPECT(mock->calls[25] == 2 && mock->args[25][2] == 1 && mock->args[25][3] == word(descs));
     EXPECT(pc.SizeInBytes == kAllocationMarker + 1 && pc.Alignment == 1);
+
+    // With the xg_xs shim in the process, textures it lays out get their console size, each at its own alignment: here
+    // 0x3000 at 0x1000, then 0x10000 at 0x10000. The PC device is not asked.
+    rt::xg::texture_size_fn = [](const void* desc, std::uint64_t& alignment) -> std::uint64_t {
+        const UINT64 width = static_cast<const D3D12_RESOURCE_DESC*>(desc)->Width;
+        alignment = width == 128 ? 0x1000 : 0x10000;
+        return width == 128 ? 0x3000 : width == 256 ? 0x10000 : 0;
+    };
+    D3D12_RESOURCE_DESC textures[2] = {};
+    textures[0].Dimension = textures[1].Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    textures[0].Width = 128;
+    textures[1].Width = 256;
+    textures[1].Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x109);
+    EXPECT(raw(device, 25, word(&pc), 1, 1, word(textures)) == word(&pc));
+    EXPECT(mock->calls[25] == 2 && pc.SizeInBytes == 0x3000 && pc.Alignment == 0x1000);
+    raw(device, 25, word(&pc), 1, 2, word(textures));
+    EXPECT(mock->calls[25] == 2 && pc.SizeInBytes == 0x20000 && pc.Alignment == 0x10000);
+    // Anything else keeps the PC answer for the whole list: a target, depth, a buffer, another layout, no layout.
+    for (int k = 0; k < 5; ++k) {
+        D3D12_RESOURCE_DESC other[2] = {textures[0], textures[1]};
+        if (k == 0) other[1].Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        if (k == 1) other[1].Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+        if (k == 2) other[1].Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        if (k == 3) other[1].Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        if (k == 4) other[1].Width = 64;
+        raw(device, 25, word(&pc), 1, 2, word(other));
+        EXPECT(mock->calls[25] == static_cast<unsigned>(3 + k) && pc.SizeInBytes == kAllocationMarker + 2);
+    }
+    rt::xg::texture_size_fn = nullptr;
 
     EXPECT(release(device) == 0 && mock->refs == 0);
     std::printf("%s: device slot 25 with the buffer in RCX and the device in RDX reaches the PC method and writes "

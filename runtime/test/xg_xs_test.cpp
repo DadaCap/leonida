@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "../src/console_texture_layout.h"
+#include "console_texture_size.h"
 #include "shims.h"
 
 namespace {
@@ -272,6 +273,18 @@ void test_shim(CreateFn create, SuggestFn suggest) {
     d.flags = 2;
     check(suggest(&d, 0, &mode) == S_OK && mode == 0x118, "suggest: a depth target gets 64KB_Z_X");
     check(suggest(nullptr, 0, &mode) == kInvalidArg, "suggest: a null description is E_INVALIDARG");
+
+    // The size the device proxy answers GetResourceAllocationInfo with: 4 KiB tiles where the layout is left open.
+    uint64_t alignment = 0;
+    check(rt::xg::texture_size_fn != nullptr, "the shim offers its sizes");
+    d = rdesc(128, 4, 1, 11, 0);
+    check(rt::xg::texture_size_fn(&d, alignment) == 0x4000 && alignment == 0x1000, "128x4 R16G16B16A16 is four 4 KiB tiles");
+    d = rdesc(128, 128, 6, 71, 0);
+    check(rt::xg::texture_size_fn(&d, alignment) == 0x3000 && alignment == 0x1000, "128x128 BC1 with 6 mips is three");
+    d = rdesc(128, 128, 6, 71, 0x109);
+    check(rt::xg::texture_size_fn(&d, alignment) == 0x10000 && alignment == 0x10000, "in a 64 KiB mode it is one of those");
+    d = rdesc(256, 256, 1, 0, 0);
+    check(rt::xg::texture_size_fn(&d, alignment) == 0, "an unknown format has no size");
 
     check(create(&d, nullptr) == E_POINTER, "XGCreateTextureComputer(desc, nullptr) is E_POINTER");
 

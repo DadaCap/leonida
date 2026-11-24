@@ -43,6 +43,7 @@
 #include <utility>
 
 #include "../src/console_texture_layout.h"
+#include "console_texture_size.h"
 #include "shims.h"
 
 namespace {
@@ -500,6 +501,17 @@ HRESULT __stdcall XGSuggestSwizzleMode(const ResourceDesc* desc, uint32_t /*flag
     *mode = kSwizzled | suggested(*desc);
     return S_OK;
 }
+
+uint64_t texture_size(const void* desc, uint64_t& alignment) {
+    ResourceDesc d;
+    static_assert(sizeof(d) == 56);
+    std::memcpy(&d, desc, sizeof(d));
+    const auto texture = texture_of(d);
+    if (!texture) return 0;
+    alignment = texture->alignment;
+    return texture->size;
+}
+const bool g_texture_size_set = (rt::xg::texture_size_fn = &texture_size, true);
 
 }  // namespace
 

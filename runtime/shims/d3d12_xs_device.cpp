@@ -24,6 +24,7 @@
 // for a trace that disagrees. The frame-event calls answer from a per-device token counter: there is no vblank source
 // behind the device before a presenter exists, so WaitFrameEventX returns at once with a fresh non-zero token.
 #include "d3d12_xs_device.h"
+#include "console_texture_size.h"
 #include "d3d12_trace.h"
 #include "../src/shader_library.h"  // leonida::fspx_payload_from_parts for slot 67
 
@@ -2225,11 +2226,38 @@ StructReturnCall struct_return_call(std::uint64_t a0, std::uint64_t a1) {
     return {reinterpret_cast<DeviceProxy*>(a1), reinterpret_cast<void*>(a0)};  // C form: return buffer, this
 }
 
+// The console's answer for textures it lays out itself: those whose layout is a swizzle mode (0x100 | mode) or left to
+// the runtime (0, the mode XGSuggestSwizzleMode gives). The retail title sizes its streamed textures with slot 25 and
+// computes offsets and lengths inside its texture archives from the answers, so a PC GPU's sizes send it to the wrong
+// bytes (it asserted at game_scarlett_master.exe+0x4ffd879, 1.0.2.1). Every description must be such a texture, else
+// `info` is left alone: render targets, depth, buffers and shapes xg_xs cannot lay out keep the PC answer.
+bool console_texture_sizes(const D3D12_RESOURCE_DESC* descs, UINT count, D3D12_RESOURCE_ALLOCATION_INFO& info) {
+    if (!descs || !count || !rt::xg::texture_size_fn) return false;
+    UINT64 end = 0, alignment = 1;
+    for (UINT i = 0; i < count; ++i) {
+        const D3D12_RESOURCE_DESC& d = descs[i];
+        const UINT layout = static_cast<UINT>(d.Layout);
+        if (d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER || (layout != 0 && (layout & ~0xffu) != 0x100) ||
+            (d.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)))
+            return false;
+        std::uint64_t own = 0;
+        const std::uint64_t size = rt::xg::texture_size_fn(&d, own);
+        if (!size || !own) return false;
+        end = (end + own - 1) / own * own + size;
+        alignment = (std::max)(alignment, own);
+    }
+    info.SizeInBytes = (end + alignment - 1) / alignment * alignment;
+    info.Alignment = alignment;
+    return true;
+}
+
 void* WINAPI proxy_get_resource_allocation_info(std::uint64_t a0, std::uint64_t a1, std::uint64_t visible_mask,
                                                 std::uint64_t count, const D3D12_RESOURCE_DESC* descs) {
     note_slot(25);
     const StructReturnCall call = struct_return_call(a0, a1);
-    *static_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(call.ret) = call.self->real->GetResourceAllocationInfo(
+    auto& info = *static_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(call.ret);
+    if (console_texture_sizes(descs, static_cast<UINT>(count), info)) return call.ret;
+    info = call.self->real->GetResourceAllocationInfo(
         static_cast<UINT>(visible_mask), static_cast<UINT>(count), descs);
     return call.ret;
 }
