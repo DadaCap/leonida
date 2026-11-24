@@ -598,6 +598,17 @@ void test_commit_physical_pages(const PhysicalApi& api) {
               "the two committed by number are committed in the window and the third is not yet");
         check(read_u32(window, 0) == 0 && read_u32(window + kPage64k, 0) == 0,
               "pages committed by number read as zero");
+        // Across the end of one page into the next, the third page named first.
+        const uint64_t order[2] = {pages[2], pages[0]};
+        const uint8_t bytes[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+        check(rt::xmem::write_physical_pages(order, kPage64k - 4, bytes, 8) &&
+                  std::memcmp(window + 3 * kPage64k - 4, bytes, 4) == 0 && std::memcmp(window, bytes + 4, 4) == 0,
+              "write_physical_pages writes the pages in the array's order, uncommitted ones too");
+        check(rt::xmem::write_physical_pages(order, kPage64k + 16, bytes, 8) && std::memcmp(window + 16, bytes, 8) == 0,
+              "an offset past the first page starts in a later one");
+        check(!rt::xmem::write_physical_pages(&unknown, 0, bytes, 8) && !rt::xmem::write_physical_pages(nullptr, 0, bytes, 8) &&
+                  rt::xmem::write_physical_pages(nullptr, 0, bytes, 0),
+              "a page that is not live or a null array fails, no bytes succeed");
         api.map(window, kPages, nullptr);
     }
     check(api.free_pages(kPages, pages) == TRUE, "XMemFreePhysicalPages frees them");

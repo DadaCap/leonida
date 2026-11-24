@@ -11,7 +11,10 @@
 //   - A zlib request (ZlibDecompress alone) reads its source into a staging buffer, inflates it on the worker with
 //     the runtime's RFC 1950 inflater (leonida::zlib_inflate, src/shader_library.h) and copies the result to the
 //     destination only when it is exactly DestinationSize bytes; a stream that fails leaves the destination as it was.
-//   - BCPack, swizzle and physical-page requests fail with E_NOTIMPL for now (later PRs: they become stages between
+//   - DestinationIsPhysicalPages: the request runs into a staging buffer, then its bytes go to the pages xmem allocated
+//     (rt::xmem::write_physical_pages). The page array is read when the request runs: the retail title passes a pointer
+//     into its own live page table, whose entries are still 0 when it enqueues.
+//   - BCPack, swizzle and physical-page sources fail with E_NOTIMPL for now (later PRs: they become stages between
 //     the read and the destination write, BCPack after the inflate).
 // Nothing here goes online or touches the GPU.
 #include <windows.h>
@@ -35,6 +38,7 @@
 #include "../src/shader_library.h"  // leonida::zlib_inflate
 #include "dstorage_xs_abi.h"
 #include "shims.h"
+#include "xmem.h"
 
 using namespace dsx;
 
@@ -800,10 +804,11 @@ private:
             log_once("decompress", "BCPack and swizzle requests are not implemented yet (E_NOTIMPL)");
             return E_NOTIMPL;
         }
-        if (o & (options::kDestinationPages | options::kSourcePages)) {
-            log_once("pages", "physical-page requests are not implemented yet (E_NOTIMPL)");
+        if (o & options::kSourcePages) {
+            log_once("pages", "physical-page sources are not implemented yet (E_NOTIMPL)");
             return E_NOTIMPL;
         }
+        if (o & options::kDestinationPages) return paged_request(e);
         const bool zlib = options::zlib(o);
         // IntermediateSize is the BCPack data's size between the inflate and the BCPack decode (DSTORAGE_REQUEST), so
         // it is 0 for every request that gets here (BCPack is refused above).
@@ -832,6 +837,32 @@ private:
         if (r.SourceSize == 0) return S_OK;  // nothing to move; the reference does not say this fails
         if (memory) return guarded_move(r.Destination, r.Source, r.SourceSize) ? S_OK : E_DSTORAGE_ACCESS_VIOLATION;
         return read_file_range(e.file->handle(), r.FileOffset, r.Destination, r.SourceSize);
+    }
+
+    // A request into physical pages: the same request into a staging buffer, then that to the pages.
+    HRESULT paged_request(const Entry& e) {
+        const DSTORAGE_REQUEST& r = e.request;
+        if (!rt::xmem::write_physical_fn) return E_NOTIMPL;  // a process without the xmem shim
+        if (r.DestinationSize > kMax4kPageDestinationSize) return E_DSTORAGE_REQUEST_TOO_LARGE;
+        if (!r.DestinationPageArray) return E_INVALIDARG;
+        std::vector<uint8_t> staging;
+        std::vector<uint64_t> pages;
+        try {
+            staging.resize((std::max)(r.DestinationSize, 1u));  // never empty: the plain request checks its destination
+            pages.resize(static_cast<size_t>((uint64_t{r.DestinationPageOffset} + r.DestinationSize + 0xffff) >> 16));
+        } catch (const std::bad_alloc&) {
+            return E_OUTOFMEMORY;
+        }
+        Entry plain = e;
+        plain.request.Options.AsUINT64 &= ~options::kDestinationPages;
+        plain.request.Destination = staging.data();
+        if (const HRESULT hr = execute_request(plain); FAILED(hr) || r.DestinationSize == 0) return hr;
+        static_assert(sizeof(ULONG_PTR) == sizeof(uint64_t));
+        if (!guarded_move(pages.data(), r.DestinationPageArray, pages.size() * sizeof(uint64_t)))
+            return E_DSTORAGE_ACCESS_VIOLATION;
+        return rt::xmem::write_physical_fn(pages.data(), r.DestinationPageOffset, staging.data(), r.DestinationSize)
+                   ? S_OK
+                   : E_DSTORAGE_ACCESS_VIOLATION;
     }
 
     // A zlib request whose checks have passed: the source (SourceSize bytes of the file or of memory) goes into a

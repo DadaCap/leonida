@@ -15,6 +15,7 @@
 #include <thread>
 #include <vector>
 
+#include "xmem.h"
 #include "dstorage_xs_abi.h"
 #include "file_system.h"
 #include "shims.h"
@@ -419,7 +420,10 @@ void test_reads_and_errors(Env& env) {
         cases.push_back({r, E_DSTORAGE_RESERVED_FIELDS, "a reserved option bit"});
         r = file_request(b, 0, few.data(), 8);
         r.Options.DestinationIsPhysicalPages = 1;
-        cases.push_back({r, E_NOTIMPL, "physical pages are not implemented yet"});
+        cases.push_back({r, E_NOTIMPL, "physical-page destinations without the xmem shim"});
+        r = file_request(b, 0, few.data(), 8);
+        r.Options.SourceIsPhysicalPages = 1;
+        cases.push_back({r, E_NOTIMPL, "physical-page sources are not implemented yet"});
         r = file_request(b, 0, few.data(), 8);
         r.IntermediateSize = 4;
         cases.push_back({r, E_DSTORAGE_INVALID_INTERMEDIATE_SIZE, "IntermediateSize without zlib and BCPack"});
@@ -499,6 +503,60 @@ void test_reads_and_errors(Env& env) {
     q->Release();
     b->Release();
     big->Release();
+}
+
+// DestinationIsPhysicalPages, with a stand-in for the xmem shim: which pages, at what offset, with what bytes.
+std::vector<uint64_t> g_written_pages;
+size_t g_written_offset = 0;
+std::vector<uint8_t> g_written;
+bool g_refuse_pages = false;
+bool fake_write_physical(const uint64_t* pages, size_t offset, const void* bytes, size_t size) {
+    if (g_refuse_pages) return false;
+    g_written_pages.assign(pages, pages + (offset + size + 0xffff) / 0x10000);
+    g_written_offset = offset;
+    g_written.assign(static_cast<const uint8_t*>(bytes), static_cast<const uint8_t*>(bytes) + size);
+    return true;
+}
+
+void test_physical_page_destinations(Env& env) {
+    rt::xmem::write_physical_fn = &fake_write_physical;
+    IDStorageFileX* big = open(env, L"GAME:\\data\\big.bin");
+    IDStorageQueueX2* q = make_queue(env, 0x80, false);
+    IDStorageStatusArrayX* s = make_status(env, 4);
+    ULONG_PTR table[3] = {};  // still 0 when the request is enqueued, as in the title's page table
+    DSTORAGE_REQUEST r = file_request(big, 4096, nullptr, 0x18000);
+    r.Options.DestinationIsPhysicalPages = 1;
+    r.DestinationPageArray = table;
+    r.DestinationPageOffset = 0xC000;
+    q->EnqueueRequest(&r);
+    q->EnqueueStatus(s, 0);
+    table[0] = 0x10, table[1] = 0x50, table[2] = 0x20;
+    q->Submit();
+    check(wait_complete(s, 0), "a request into physical pages completes");
+    check_hr(s->GetHResult(0), S_OK, "a request into physical pages");
+    check(g_written_pages == std::vector<uint64_t>({0x10, 0x50, 0x20}) && g_written_offset == 0xC000,
+          "the page table is read when the request runs, for as many pages as offset and size reach");
+    check(g_written.size() == 0x18000 && std::memcmp(g_written.data(), env.big.data() + 4096, g_written.size()) == 0,
+          "the pages get the file's bytes");
+    g_refuse_pages = true;
+    q->EnqueueRequest(&r);
+    q->EnqueueStatus(s, 1);
+    r.DestinationPageArray = nullptr;
+    q->EnqueueRequest(&r);
+    q->EnqueueStatus(s, 2);
+    r.DestinationPageArray = reinterpret_cast<PULONG_PTR>(0x10);
+    q->EnqueueRequest(&r);
+    q->EnqueueStatus(s, 3);
+    q->Submit();
+    check(wait_complete(s, 3), "the bad ones complete");
+    check_hr(s->GetHResult(1), E_DSTORAGE_ACCESS_VIOLATION, "a page that is not live");
+    check_hr(s->GetHResult(2), E_INVALIDARG, "a null page array");
+    check_hr(s->GetHResult(3), E_DSTORAGE_ACCESS_VIOLATION, "a page array that cannot be read");
+    g_refuse_pages = false;
+    rt::xmem::write_physical_fn = nullptr;
+    big->Release();
+    s->Release();
+    q->Release();
 }
 
 void test_fence_order_and_events(Env& env) {
@@ -1243,6 +1301,7 @@ int main() {
     test_factory_checks(env);
     test_open_paths(env);
     test_reads_and_errors(env);
+    test_physical_page_destinations(env);
     test_fence_order_and_events(env);
     test_cancel(env);
     test_auto_submit_and_full_queue(env);

@@ -93,7 +93,8 @@ The first boot with the executable settles most of this: the dry-run report show
   3. reserved option bits (`E_DSTORAGE_RESERVED_FIELDS`), then the source type against the queue's
      (`E_DSTORAGE_INVALID_SOURCE_TYPE`);
   4. BCPack mode above 7, swizzle mode above 4 (`_INVALID_BCPACK_MODE`, `_INVALID_SWIZZLE_MODE`), then BCPack or
-     swizzle, with or without zlib, then physical pages (`E_NOTIMPL`, logged once: later PRs);
+     swizzle, with or without zlib, then physical-page sources (`E_NOTIMPL`, logged once: later PRs); a request into
+     physical pages goes on as the same request into a staging buffer (below);
   5. an `IntermediateSize` (`_INVALID_INTERMEDIATE_SIZE`: it is the size between the inflate and the BCPack decode,
      so only a zlib + BCPack request has one), a `DestinationSize` other than `SourceSize` without zlib, or not
      larger than `SourceSize` with it (`_INVALID_DESTINATION_SIZE`: the rule `dstorageerr.h` gives for that code,
@@ -152,6 +153,17 @@ The first boot with the executable settles most of this: the dry-run report show
   worker; later enqueues are dropped and recorded as `E_DSTORAGE_QUEUE_CLOSED`. The last `Release` closes the same
   way, so a queue released with requests in flight finishes them first.
 
+## Physical-page destinations
+
+`DestinationIsPhysicalPages` names an array of 64 KiB page numbers from `XMemAllocatePhysicalPages` and a byte offset
+into the first page. The request runs into a staging buffer and its bytes then go to the memory behind those pages
+(`rt::xmem::write_physical_pages`), so every address they are mapped at sees them. The shim reads the array **when the
+request runs**, not at enqueue: the retail title (1.0.2.1) passes a pointer into its own page table, indexed by the
+destination address, and the entries are still 0 when it enqueues and filled by the time the request runs (measured:
+with a copy taken at enqueue nearly every such request named page 0; read late, none failed over 240 s). A page number
+that is not live is `E_DSTORAGE_ACCESS_VIOLATION`, and so is an array that cannot be read; without the xmem shim in the
+process the request is `E_NOTIMPL`.
+
 ## Not done yet (later PRs)
 
 - **BCPack** (`BcpackMode`; `tools/bcpack.py` is the reference decoder), then **swizzle** (`SwizzleMode`). The
@@ -159,8 +171,7 @@ The first boot with the executable settles most of this: the dry-run report show
   (the inflate's output, the BCPack decoder's input), and `FileOffset` must be 16-byte aligned. Each becomes a stage
   after `inflate_request`'s inflate and before its destination write, so the request checks above stay where they
   are.
-- **Physical pages** (`SourceIsPhysicalPages`, `DestinationIsPhysicalPages`): arrays of 64 KiB page numbers from
-  `XMemAllocatePhysicalPages`; needs the `xmem` shim to translate a page number to the address it mapped.
+- **Physical-page sources** (`SourceIsPhysicalPages`): no request of the retail title has been seen with one.
 - **GPU memory**: the console API has no GPU destinations of its own (memory is unified, so a destination is an
   address). An address inside memory the Vulkan layer backs will need its write routed to that memory. The destination
   is written in two places, both in `execute_request` (`read_file_range` for a file source, `guarded_move` for a

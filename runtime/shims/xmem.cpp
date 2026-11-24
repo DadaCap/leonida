@@ -823,6 +823,34 @@ bool commit_physical_range(const void* address, size_t size) {
     return true;
 }
 
+bool write_physical_pages(const uint64_t* page_array, size_t offset, const void* bytes, size_t size) {
+    if (size == 0) return true;
+    if (!page_array || !bytes) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return false;
+    }
+    const std::lock_guard lock(g_phys_mutex);
+    page_array += offset / kPhysicalPageSize;
+    offset %= kPhysicalPageSize;
+    for (size_t done = 0; done < size; ++page_array, offset = 0) {
+        const auto it = g_pages.find(*page_array);
+        if (it == g_pages.end() || !it->second.section->scratch) {
+            SetLastError(ERROR_INVALID_PARAMETER);
+            return false;
+        }
+        auto* const backing = static_cast<uint8_t*>(it->second.section->scratch) + it->second.offset;
+        if (!VirtualAlloc(backing, kPhysicalPageSize, MEM_COMMIT, PAGE_READWRITE)) return false;
+        const size_t part = (std::min)(size - done, static_cast<size_t>(kPhysicalPageSize) - offset);
+        std::memcpy(backing + offset, static_cast<const uint8_t*>(bytes) + done, part);
+        done += part;
+    }
+    return true;
+}
+
+namespace {
+const bool g_write_physical_set = (write_physical_fn = &write_physical_pages, true);
+}
+
 bool commit_physical_pages(const uint64_t* page_array, size_t count) {
     if (count == 0) return true;
     if (!page_array) {
