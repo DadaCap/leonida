@@ -1682,7 +1682,14 @@ constexpr int kStickDiagonal = 23170;  // 32767 / sqrt(2)
 constexpr int kMouseAxisPerPixel = 1024;
 constexpr int kMouseDecayNum = 7, kMouseDecayDen = 8;
 
-bool async_key_down(int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; }
+bool async_key_down(int vk) {
+    static const bool automatic = GetEnvironmentVariableA("LEONIDA_AUTOPRESS", nullptr, 0) != 0;  // local test aid
+    if (automatic) {
+        const ULONGLONG t = GetTickCount64() % 6000;
+        return (vk == VK_RETURN && t < 250) || (vk == VK_ESCAPE && t >= 3000 && t < 3250);
+    }
+    return (GetAsyncKeyState(vk) & 0x8000) != 0;
+}
 
 // ---- raw mouse input (its own thread) ----
 //

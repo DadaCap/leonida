@@ -23,6 +23,7 @@
 #include "queue_families.h"
 #include "resource_tiling.h"
 #include "xdxr_build.h"
+#include "xs_value_writes.h"
 
 #include <algorithm>
 #include <atomic>
@@ -1004,7 +1005,14 @@ public:
         // buffer as out of bounds, which is no reason to drop the submission.
         replay_.buffer_at = [this](std::uint64_t va, std::uint64_t& size, VkBuffer& buffer, VkDeviceSize& offset) {
             BufferVaIndex<ResourceId>::Hit hit{};
-            if (!buffer_vas_.find(va, hit, size)) return false;  // prefers an aliasing buffer that holds all of it
+            if (!buffer_vas_.find(va, hit, size)) {  // prefers an aliasing buffer that holds all of it
+                // The title's own memory in the arena has no resource: a view names it by address alone.
+                if (va < title_first_ || va >= title_end_) return false;
+                buffer = title_buffer_;
+                offset = va;
+                size = std::min<std::uint64_t>(size, title_end_ - va);
+                return true;
+            }
             const ResourceBinding* b = resolve(hit.id);
             if (!b) return false;
             buffer = b->buffer;
@@ -1272,6 +1280,14 @@ public:
 
     // The device address of the GPU address arena: console VAs are offsets from it (docs section 3.3).
     // execute() copies replay_ under a shared resource_mutex_, so writers hold it uniquely.
+    // The part [first, end) of the arena's buffer that is the title's memory (buffer_at).
+    void set_title_memory(VkBuffer buffer, std::uint64_t first, std::uint64_t end) {
+        std::unique_lock lock(resource_mutex_);
+        title_buffer_ = buffer;
+        title_first_ = first;
+        title_end_ = end;
+    }
+
     void set_heap_base(std::uint64_t heap_base) {
         std::unique_lock lock(resource_mutex_);
         replay_.heap_base = heap_base;
@@ -1283,6 +1299,14 @@ public:
         replay_.zero_buffer = buffer;
         replay_.zero_offset = offset;
         replay_.zero_size = size;
+    }
+
+    // Pre-expanded 32-bit triangle indices for non-indexed quad lists (ReplayFunctions::quad_indices).
+    void set_quad_indices(VkBuffer buffer, VkDeviceSize offset, std::uint32_t count) {
+        std::unique_lock lock(resource_mutex_);
+        replay_.quad_indices = buffer;
+        replay_.quad_indices_offset = offset;
+        replay_.quad_index_count = count;
     }
 
     // Physical-device COLOR_ATTACHMENT format check for reinterpreted UAV clears.
@@ -1512,6 +1536,16 @@ public:
         deletion_queue_.drain(current_ticket, device_, vk);
     }
 
+    // True when the VA names a sparse resource: the sparse pass binds its memory, not the arena's mapping, so the
+    // host's bytes at that offset are not the resource's. The console's value writes skip those.
+    bool is_sparse_va(std::uint64_t va) {
+        const std::shared_lock lock(resource_mutex_);
+        BufferVaIndex<ResourceId>::Hit hit{};
+        if (!buffer_vas_.find(va, hit)) return false;
+        const ResourceBinding* const b = resolve(hit.id);
+        return b && b->sparse_buffer;
+    }
+
     // Both methods are called with submit_mutex_ held. A queue's own progress timeline is
     // monotonic even when another queue completes first; global tickets are retired in order.
     void record_submit_locked(VkSemaphore progress, std::uint64_t value) {
@@ -1546,6 +1580,28 @@ public:
     }
     void enqueue_fence_callback(VkSemaphore sem, std::uint64_t value, std::function<void()> cb) {
         if (fence_dispatcher_) fence_dispatcher_->enqueue_callback(sem, value, std::move(cb));
+    }
+
+    // The console's value writes (console list slots 69 and 70, src/xs_value_writes.h): the sink puts the bytes
+    // into the title's memory, the clocks answer the two timestamp forms.
+    void set_value_write_sink(ValueWriteSink sink) { value_write_sink_ = std::move(sink); }
+    const ValueWriteSink& value_write_sink() const { return value_write_sink_; }
+    void set_value_write_clocks(std::function<std::uint64_t()> gpu_clock,
+                                 std::function<std::uint64_t()> system_clock) {
+        value_write_gpu_clock_ = std::move(gpu_clock);
+        value_write_system_clock_ = std::move(system_clock);
+    }
+    const std::function<std::uint64_t()>& value_write_gpu_clock() const { return value_write_gpu_clock_; }
+    const std::function<std::uint64_t()>& value_write_system_clock() const { return value_write_system_clock_; }
+
+    // Runs `cb` once the submission that reached `ticket` on a queue's own timeline has completed on the GPU.
+    // Without a dispatcher (a device that never loaded) nothing was submitted either, so the callback runs at once.
+    void enqueue_submit_callback(VkSemaphore progress, std::uint64_t ticket, std::function<void()> cb) {
+        if (fence_dispatcher_) {
+            fence_dispatcher_->enqueue_callback(progress, ticket, std::move(cb));
+        } else if (cb) {
+            cb();
+        }
     }
     void cancel_fence_waits(VkSemaphore sem) {
         if (fence_dispatcher_) fence_dispatcher_->cancel(sem);
@@ -1687,8 +1743,13 @@ private:
     std::atomic<std::uint64_t> submitted_ticket_{0};
     DeferredDeletionQueue deletion_queue_;
     std::unique_ptr<FenceWaitDispatcher> fence_dispatcher_;
+    ValueWriteSink value_write_sink_;                          // where the console's value writes land
+    std::function<std::uint64_t()> value_write_gpu_clock_;    // the GPU clock a timestamp write takes
+    std::function<std::uint64_t()> value_write_system_clock_; // the system clock a timestamp write takes
     QueueHolds<VkSemaphore> holds_;
     std::unordered_map<ResourceId, ResourceBinding> resources_;
+    VkBuffer title_buffer_ = VK_NULL_HANDLE;
+    std::uint64_t title_first_ = 0, title_end_ = 0;
     BufferVaIndex<ResourceId> buffer_vas_;  // the addressable buffers of resources_, by VA range (buffer_at)
     std::unordered_map<ResourceId, std::shared_ptr<SparseResource>> sparse_resources_;
     std::unordered_map<std::uintptr_t, ComputePipeline> pipelines_;
@@ -1994,14 +2055,15 @@ public:
     // the lists as soon as the call returns).
     using PinFn = std::function<std::shared_ptr<void>()>;
 
-    ReplayResult execute(std::span<const CommandList* const> lists, const PinFn& pin = {}) {
+    ReplayResult execute(std::span<const CommandList* const> lists, const PinFn& pin = {},
+                          std::vector<ValueWrite> value_writes = {}) {
         ReplayResult result = ReplayResult::success;
         bool held = false;
         std::vector<std::shared_ptr<void>> retired;  // destroyed after state_mutex_ is released
         {
             std::lock_guard state(state_mutex_);
             if (!must_hold()) {
-                result = execute_now(lists);
+                result = execute_now(lists, std::move(value_writes));
             } else if (context_.is_device_lost()) {
                 result = ReplayResult::unsupported;
             } else {
@@ -2010,6 +2072,7 @@ public:
                 op.lists.reserve(lists.size());
                 for (const CommandList* list : lists) op.lists.push_back(*list);
                 if (pin) op.pins.push_back(pin());
+                op.value_writes = std::move(value_writes);
                 hold(std::move(op));
                 held = true;
             }
@@ -2018,6 +2081,43 @@ public:
         retired.clear();
         if (held) context_.holds().pump_ready();  // a Signal may have been submitted since the check
         return result;
+    }
+
+    // The console's value writes: they land in the title's memory once the submission that carried them has
+    // completed on the GPU, which is what the queue's own timeline says. The batches wait in submission order, so
+    // a later submission's write lands after the earlier one's.
+    void schedule_value_writes(std::vector<ValueWrite> batch) {
+        if (batch.empty()) return;
+        const ValueWriteSink write = context_.value_write_sink();
+        if (!write) return;
+        const std::function<std::uint64_t()> gpu_clock = context_.value_write_gpu_clock();
+        const std::function<std::uint64_t()> system_clock = context_.value_write_system_clock();
+        const std::shared_ptr<PendingValueWrites> pending = value_writes_;
+        {
+            // The submitting thread pushes while the completion thread pops: the lock is what keeps the two
+            // apart.
+            const std::lock_guard lock(pending->mutex);
+            pending->batches.push_back(std::move(batch));
+        }
+        const std::uint64_t ticket = submitted_;
+        context_.enqueue_submit_callback(progress_, ticket, [pending, write, gpu_clock, system_clock] {
+            std::vector<ValueWrite> ready;
+            {
+                const std::lock_guard lock(pending->mutex);
+                if (pending->batches.empty()) return;
+                ready = std::move(pending->batches.front());
+                pending->batches.pop_front();
+            }
+            const std::size_t applied = apply_value_writes(ready, write, gpu_clock, system_clock);
+            if (applied == ready.size()) return;
+            // A write that did not land is one the CPU cannot reach (a sparse resource, or a page the title has
+            // not mapped). Say so once: the title's counter would stay where it was.
+            static std::atomic<bool> warned{false};
+            if (!warned.exchange(true, std::memory_order_relaxed))
+                std::fprintf(stderr, "[rt] d3d12: %zu of %zu console value writes did not land: the address is not "
+                                     "one the CPU can write\n",
+                             ready.size() - applied, ready.size());
+        });
     }
 
     // ID3D12CommandQueue::Signal: the fence reaches `value` after all work submitted so far. Held behind earlier
@@ -2265,7 +2365,7 @@ private:
         return ReplayResult::success;
     }
 
-    ReplayResult execute_now(std::span<const CommandList* const> lists) {
+    ReplayResult execute_now(std::span<const CommandList* const> lists, std::vector<ValueWrite> value_writes = {}) {
         if (context_.is_device_lost() || !wait_for_room()) return ReplayResult::unsupported;
         if (kind_ != QueueKind::direct)
             for (const auto* list : lists)
@@ -2689,6 +2789,7 @@ private:
             slot->counted_dispatch = std::move(counted_batch);
             queries.commit();
             slot->segments = std::move(queries.retained);
+            schedule_value_writes(std::move(value_writes));
         } else {
             discard();
         }
@@ -2735,6 +2836,7 @@ private:
         std::vector<VkSemaphore> waits;
         std::vector<std::uint64_t> wait_values;
         std::vector<CommandList> lists;  // batch: copies, so the application may Reset its lists after the call
+        std::vector<ValueWrite> value_writes;  // the console's value writes, which wait for the submission
         VkSemaphore fence = VK_NULL_HANDLE;  // signal
         std::uint64_t value = 0;
         DebugMarker::Kind marker_kind = DebugMarker::Kind::set;  // marker
@@ -2816,7 +2918,7 @@ private:
             for (const CommandList& list : op.lists) lists.push_back(&list);
             // The pipeline states and root signatures of the lists are in op.pins (see execute()): they live until
             // the batch has been recorded and then, with the fences, until its submission has completed (below).
-            const ReplayResult result = execute_now(lists);
+            const ReplayResult result = execute_now(lists, std::move(op.value_writes));
             if (result != ReplayResult::success) {
                 int none = static_cast<int>(ReplayResult::success);
                 held_failure_.compare_exchange_strong(none, static_cast<int>(result));
@@ -3272,6 +3374,13 @@ private:
         std::shared_ptr<void> pin;
     };
     std::deque<TicketedPin> pin_queue_;  // released once progress_ reaches the ticket
+    // The console's value writes that wait for their submission, in submission order. Shared with the callbacks
+    // that apply them, so a queue that goes away first leaves them alive.
+    struct PendingValueWrites {
+        std::mutex mutex;
+        std::deque<std::vector<ValueWrite>> batches;
+    };
+    std::shared_ptr<PendingValueWrites> value_writes_ = std::make_shared<PendingValueWrites>();
     std::atomic<int> held_failure_{0};                 // a ReplayResult: the first held batch that failed
 };
 

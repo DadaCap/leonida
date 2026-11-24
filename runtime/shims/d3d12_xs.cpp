@@ -22,6 +22,7 @@
 #include "d3d12_xs_device.h"
 #include "d3d12_xs_rootsig.h"
 #include "shims.h"
+#include "xmem.h"
 
 namespace {
 
@@ -117,11 +118,22 @@ HRESULT WINAPI create_root_signature_deserializer(const void* data, SIZE_T size,
     return fn(data, size, iid, out);
 }
 
+void* xmem_descriptor_heap_alloc(std::size_t byte_size, std::uint64_t attributes) {
+    const rt::shims::XMemAllocationHooks* hooks = rt::shims::xmem_allocation_hooks();
+    return (hooks && hooks->alloc) ? hooks->alloc(byte_size, attributes) : nullptr;
+}
+
+void xmem_descriptor_heap_free(void* ptr, std::uint64_t attributes) {
+    const rt::shims::XMemAllocationHooks* hooks = rt::shims::xmem_allocation_hooks();
+    if (hooks && hooks->free) hooks->free(ptr, attributes);
+}
+
 // Measured shape: D3D12XboxCreateDevice(adapter, params, riid, out), where params is a 24-word block that is only
 // logged and not used to create the device. The struct's total size is unknown, so the log reads 24 x 32-bit words
 // (96 bytes) and no more. The PC D3D12CreateDevice needs a minimum feature level instead, so 12_0 is used as the
 // least restrictive floor; higher feature levels are still exposed by the created device.
 HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, const IID* riid, void** out) {
+    rt::d3d12_xs::set_default_descriptor_heap_allocator(&xmem_descriptor_heap_alloc, &xmem_descriptor_heap_free);
     constexpr auto method = "D3D12XboxCreateDevice";
     using rt::d3d12_trace::result;
     if (!out) return result(method, E_POINTER);
@@ -155,6 +167,12 @@ HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, cons
         std::fprintf(stderr,
                      "[rt] d3d12_xs: D3D12XboxCreateDevice: wrapping the PC ID3D12Device in the Xbox-ABI proxy "
                      "(slot 62 -> CreateComputePipelineState, slot 76 -> CreateCommittedResource).\n");
+        // A console method whose slot is another PC method (61) is served only to the title: a caller in an image
+        // this loader mapped.
+        rt::d3d12_xs::set_console_caller([](std::uint64_t address) {
+            std::uint64_t base = 0;
+            return rt::shims::mapped_image_base(address, base);
+        });
     }
 
 #ifdef LEONIDA_VULKAN_DEVICE
@@ -164,6 +182,15 @@ HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, cons
     size_t backend_length = 0;
     if (getenv_s(&backend_length, backend, "LEONIDA_D3D12") == 0 && std::strcmp(backend, "vulkan") == 0) {
         ID3D12Device* vulkan = nullptr;
+        if (void* region = nullptr; true) {
+            size_t region_size = 0, layer_bytes = 0;
+            if (rt::xmem::gpu_region(region, region_size, layer_bytes))
+                rt::d3d12::g_arena_import = {region, region_size, layer_bytes};
+        }
+        // The title's 256 MiB window pool comes out of the arena, so the arena's 256 MiB default is too small for it.
+        size_t arena_length = 0;
+        char arena_mb[16] = {};
+        if (getenv_s(&arena_length, arena_mb, "LEONIDA_ARENA_MB") == 0 && arena_length <= 1) _putenv_s("LEONIDA_ARENA_MB", "1024");
         HRESULT vhr = rt::d3d12::create_vulkan_device_standalone(
             __uuidof(ID3D12Device), reinterpret_cast<void**>(&vulkan), rt::d3d12::QueueTestSettings::ignore);
         if (FAILED(vhr)) {
@@ -179,6 +206,15 @@ HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, cons
             return result(method, vhr);
         }
         rt::d3d12::set_device_outer(vulkan, static_cast<IUnknown*>(*out));
+        // The title's GPU-visible windows come out of the layer's address arena (one placeholder of 185 MiB measured).
+        constexpr size_t kWindowPool = size_t{256} << 20;
+        char no_pool[4] = {};
+        size_t no_pool_length = 0;
+        const bool off = rt::d3d12::g_title_window.base.load() != 0 || getenv_s(&no_pool_length, no_pool, "LEONIDA_TITLE_WINDOW") == 0 && no_pool_length > 1 && no_pool[0] == '0';
+        if (void* const pool = off ? nullptr : rt::d3d12::reserve_title_window(vulkan, kWindowPool)) {
+            rt::xmem::set_window_pool(pool, kWindowPool);
+            std::fprintf(stderr, "[rt] d3d12_xs: the title's placeholder windows are taken from the GPU address arena\n");
+        }
         if (!tracing)
             std::fprintf(stderr, "[rt] d3d12_xs: D3D12XboxCreateDevice -> proxy %p (Vulkan device %p)\n", *out,
                          static_cast<void*>(vulkan));

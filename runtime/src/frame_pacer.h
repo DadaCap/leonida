@@ -37,7 +37,9 @@
 #include <deque>
 #include <functional>
 #include <limits>
+#include <memory>
 #include <mutex>
+#include <utility>
 
 namespace leonida {
 
@@ -102,14 +104,8 @@ private:
     std::function<void()> wake_;
 };
 
-// Provisional definitions of ours: the real constants and layouts of the console API are unmeasured. Frame event
-// kinds (0: origin, 1: vblank, 2: flip) and wait flags.
+// Provisional definitions of ours: the real constants and layouts of the console API are unmeasured.
 inline constexpr std::uint32_t frame_event_origin = 0;
-inline constexpr std::uint32_t frame_event_vblank = 1;
-inline constexpr std::uint32_t frame_event_flip = 2;
-inline constexpr std::uint32_t frame_event_count = 3;
-// Issue a consecutive frame token even when WaitFrameEventX(origin, ...) times out (returns S_FALSE).
-inline constexpr std::uint32_t frame_wait_flag_token_on_timeout = 2;
 // Statistics types (bit mask). Interval and render entries are never produced here.
 inline constexpr std::uint32_t stat_frame_interval = 0x01;
 inline constexpr std::uint32_t stat_frame_event = 0x02;
@@ -149,9 +145,19 @@ struct FrameStatistic {
     float percent_scanned = 0.0f;    // display entries: where the scan was when the frame came up (0 at a vblank)
 };
 
+class FrameTokenSource {
+public:
+    std::uint64_t issue() { return last_.fetch_add(1, std::memory_order_acq_rel) + 1; }
+    std::uint64_t issued() const { return last_.load(std::memory_order_acquire); }
+
+private:
+    std::atomic<std::uint64_t> last_{0};
+};
+
 class FramePacer {
 public:
-    explicit FramePacer(FrameClock& clock) : clock_(clock) {
+    explicit FramePacer(FrameClock& clock, std::shared_ptr<FrameTokenSource> tokens = nullptr)
+        : clock_(clock), tokens_(tokens ? std::move(tokens) : std::make_shared<FrameTokenSource>()) {
         clock_.set_wake([this] {
             { std::lock_guard guard(mutex_); }
             cv_.notify_all();
@@ -183,42 +189,38 @@ public:
         latency_ = std::max(latency, 1u);
         epoch_us_ = clock_.now_us();
         interval_set_ = true;
-        for (std::uint32_t k = 0; k < frame_event_count; ++k) {
-            event_offset_us_[k] = std::min(event_offset_us_[k], period_us - 1);
-            last_event_tick_[k] = 0;  // tick 0 is the epoch itself, which has passed
-        }
+        offset_us_ = std::min(offset_us_, period_us - 1);
+        last_origin_ = 0;  // origin 0 is the epoch itself, which has passed
         cv_.notify_all();
         return pacer_hr::ok;
     }
 
-    // ScheduleFrameEventX(event, offset, ..., flags). Supports origin (0), vblank (1), and flip (2).
+    // ScheduleFrameEventX(event, offset, ..., flags). Only the origin event exists here.
     std::int32_t schedule_frame_event(std::uint32_t event, std::uint32_t offset_us, std::uint32_t flags) {
         (void)flags;
-        if (event >= frame_event_count) return pacer_hr::invalid_arg;
+        if (event != frame_event_origin) return pacer_hr::invalid_arg;
         std::lock_guard guard(mutex_);
         if (suspended_ || !interval_set_) return pacer_hr::invalid_state;
         if (offset_us >= period_us_) return pacer_hr::invalid_arg;
-        event_offset_us_[event] = offset_us;
-        event_armed_[event] = true;
-        // The first event is the next one that has not come yet: tick n is due at epoch + n * period + offset.
+        offset_us_ = offset_us;
+        armed_ = true;
+        // The first origin is the next one that has not come yet: origin n is due at epoch + n * period + offset.
         const std::uint64_t now = clock_.now_us();
-        last_event_tick_[event] =
-            now >= epoch_us_ + offset_us ? std::int64_t((now - epoch_us_ - offset_us) / period_us_) : 0;
+        last_origin_ = now >= epoch_us_ + offset_us_ ? std::int64_t((now - epoch_us_ - offset_us_) / period_us_) : 0;
         cv_.notify_all();
         return pacer_hr::ok;
     }
 
-    // WaitFrameEventX(event, timeout, ..., flags, &token). Origin waits block until the next origin tick and while
-    // `latency` frames are in flight, issuing a consecutive token on success (or on timeout with
-    // frame_wait_flag_token_on_timeout, returning S_FALSE). Vblank/flip waits pace independently per event kind and
-    // leave `*token` untouched.
+    // WaitFrameEventX(event, timeout, ..., flags, &token). Blocks until the next origin, and while `latency` frames
+    // are in flight. pacer_hr::timeout when `timeout_ms` passes first (infinite_timeout_ms: never); the token is left
+    // alone then. invalid_state when nothing is registered, the pacer is suspended, or one of those happens while waiting.
     std::int32_t wait_frame_event(std::uint32_t event, std::uint32_t timeout_ms, std::uint32_t flags,
                                   std::uint64_t* token) {
-        if (event >= frame_event_count) return pacer_hr::invalid_arg;
-        if (event == frame_event_origin && !token) return pacer_hr::invalid_arg;
+        (void)flags;
+        if (event != frame_event_origin || !token) return pacer_hr::invalid_arg;
         std::unique_lock lock(mutex_);
         ++waiters_;
-        const std::int32_t result = wait_locked(lock, event, timeout_ms, flags, token);
+        const std::int32_t result = wait_locked(lock, timeout_ms, token);
         if (--waiters_ == 0) cv_.notify_all();
         return result;
     }
@@ -273,7 +275,7 @@ public:
         std::lock_guard guard(mutex_);
         if (issue) *issue = TokenIssue::none;
         if (suspended_) return pacer_hr::invalid_state;
-        if (token > issued_) return pacer_hr::invalid_arg;
+        if (token > tokens_->issued()) return pacer_hr::invalid_arg;
         if (issue) {
             if (token == 0) *issue = TokenIssue::null_token;
             else if (token == last_presented_) *issue = TokenIssue::repeated;
@@ -312,7 +314,7 @@ public:
         const std::uint64_t now = clock_.now_us();
         retire_locked(now);
         last_presented_ = std::max(last_presented_, token);
-        if (!interval_set_ || !any_armed_locked() || uncapped_) {  // not paced or uncapped: shows at once
+        if (!interval_set_ || !armed_ || uncapped_) {  // not paced or uncapped: shows at once
             for (Record& r : records_)
                 if (r.token == token) { r.presented = r.displayed = true; r.present_us = r.display_us = now; }
             return;
@@ -340,7 +342,7 @@ public:
     // the origin event not armed or the cap off it is not paced: it shows at once and is not counted.
     void note_untokened_present() {
         std::lock_guard guard(mutex_);
-        if (!interval_set_ || !any_armed_locked() || uncapped_) return;
+        if (!interval_set_ || !armed_ || uncapped_) return;
         const std::uint64_t now = clock_.now_us();
         retire_locked(now);
         const std::uint64_t since = now > epoch_us_ ? now - epoch_us_ : 0;
@@ -354,8 +356,7 @@ public:
     void suspend() {
         std::lock_guard guard(mutex_);
         suspended_ = true;
-        interval_set_ = false;
-        for (bool& a : event_armed_) a = false;
+        interval_set_ = armed_ = false;
         pending_.clear();
         cv_.notify_all();
     }
@@ -363,13 +364,13 @@ public:
     void resume() {
         std::lock_guard guard(mutex_);
         suspended_ = false;
-        interval_set_ = false;
-        for (bool& a : event_armed_) a = false;
+        interval_set_ = armed_ = false;
         cv_.notify_all();
     }
 
     bool suspended() const { std::lock_guard guard(mutex_); return suspended_; }
-    std::uint64_t tokens_issued() const { std::lock_guard guard(mutex_); return issued_; }
+    std::uint64_t tokens_issued() const { return tokens_->issued(); }
+    const std::shared_ptr<FrameTokenSource>& token_source() const { return tokens_; }
     std::uint32_t frames_in_flight() {
         std::lock_guard guard(mutex_);
         retire_locked(clock_.now_us());
@@ -378,7 +379,7 @@ public:
     // Frames that were flipped mid-scan because of ImmediateThresholdPercent.
     std::uint64_t immediate_presents() const { std::lock_guard guard(mutex_); return immediate_presents_; }
     std::uint32_t period_us() const { std::lock_guard guard(mutex_); return period_us_; }
-    bool registered() const { std::lock_guard guard(mutex_); return interval_set_ && any_armed_locked(); }
+    bool registered() const { std::lock_guard guard(mutex_); return interval_set_ && armed_; }
 
     // The fps cap off (LEONIDA_PRESENT_UNCAP; see the top comment): waits never block and presents count as shown
     // at once. Registration and suspension keep meaning what they did; the flag survives suspend/resume.
@@ -411,67 +412,45 @@ private:
         }
     }
 
-    bool any_armed_locked() const {
-        return event_armed_[0] || event_armed_[1] || event_armed_[2];
-    }
-
-    std::uint64_t issue_token_locked(std::uint64_t origin_us, std::uint64_t due_us) {
-        const std::uint64_t tok = ++issued_;
-        Record record;
-        record.token = tok;
-        record.origin_us = origin_us;
-        record.due_us = due_us;
-        records_.push_back(record);
-        if (records_.size() > 64) records_.pop_front();
-        return tok;
-    }
-
-    std::int32_t wait_locked(std::unique_lock<std::mutex>& lock, std::uint32_t event, std::uint32_t timeout_ms,
-                             std::uint32_t flags, std::uint64_t* token) {
-        const bool is_origin = (event == frame_event_origin);
-        const bool token_on_timeout = (flags & frame_wait_flag_token_on_timeout) != 0;
+    std::int32_t wait_locked(std::unique_lock<std::mutex>& lock, std::uint32_t timeout_ms, std::uint64_t* token) {
         const std::uint64_t start = clock_.now_us();
         const std::uint64_t give_up = timeout_ms == infinite_timeout_ms ? no_deadline
                                                                          : start + std::uint64_t(timeout_ms) * 1000;
         for (;;) {
-            if (shutdown_ || suspended_ || !interval_set_) return pacer_hr::invalid_state;
-            if (is_origin ? !event_armed_[frame_event_origin]
-                          : (!event_armed_[event] && !event_armed_[frame_event_origin])) {
-                return pacer_hr::invalid_state;
-            }
+            if (shutdown_ || suspended_ || !interval_set_ || !armed_) return pacer_hr::invalid_state;
             const std::uint64_t now = clock_.now_us();
             retire_locked(now);
-            if (uncapped_) {  // no vblank grid and no latency throttle
-                if (is_origin) *token = issue_token_locked(now, now);
+            if (uncapped_) {  // no vblank grid and no latency throttle: a token at once, due now
+                *token = tokens_->issue();
+                Record record;
+                record.token = *token;
+                record.origin_us = now;
+                record.due_us = now;
+                records_.push_back(record);
+                if (records_.size() > 64) records_.pop_front();
                 return pacer_hr::ok;
             }
-            const std::uint32_t offset = event_offset_us_[event];
-            const std::uint64_t first = epoch_us_ + offset;  // tick 0
-            const std::int64_t next = last_event_tick_[event] + 1;
+            const std::uint64_t first = epoch_us_ + offset_us_;  // origin 0
+            const std::int64_t next = last_origin_ + 1;
             const std::uint64_t next_us = first + std::uint64_t(next) * period_us_;
             std::uint64_t wake = next_us;
             if (now >= next_us) {
-                if (!is_origin || pending_.size() < latency_) {
+                if (pending_.size() < latency_) {
                     const std::int64_t newest = std::int64_t((now - first) / period_us_);
-                    const std::int64_t tick = std::max(next, newest);
-                    last_event_tick_[event] = tick;
-                    if (is_origin) {
-                        const std::uint64_t origin_us = first + std::uint64_t(tick) * period_us_;
-                        const std::uint64_t due_us = origin_us - offset + period_us_;
-                        *token = issue_token_locked(origin_us, due_us);
-                    }
+                    const std::int64_t origin = std::max(next, newest);
+                    last_origin_ = origin;
+                    *token = tokens_->issue();
+                    Record record;
+                    record.token = *token;
+                    record.origin_us = first + std::uint64_t(origin) * period_us_;
+                    record.due_us = record.origin_us - offset_us_ + period_us_;
+                    records_.push_back(record);
+                    if (records_.size() > 64) records_.pop_front();
                     return pacer_hr::ok;
                 }
                 wake = pending_.front().flip_us;  // blocked by the latency: until the oldest frame is shown
             }
-            if (give_up != no_deadline && now >= give_up) {
-                if (is_origin && token_on_timeout) {
-                    // Frame started early on timeout: issue a consecutive token without consuming the tick.
-                    *token = issue_token_locked(now, next_us - offset + period_us_);
-                    return pacer_hr::false_;
-                }
-                return token_on_timeout ? pacer_hr::false_ : pacer_hr::timeout;
-            }
+            if (give_up != no_deadline && now >= give_up) return pacer_hr::timeout;
             clock_.wait(lock, cv_, give_up == no_deadline ? wake : std::min(wake, give_up));
         }
     }
@@ -484,14 +463,14 @@ private:
 
     bool suspended_ = false;
     bool interval_set_ = false;
-    bool event_armed_[frame_event_count] = {false, false, false};
+    bool armed_ = false;
     bool uncapped_ = false;
     std::uint32_t period_us_ = 0;
     std::uint32_t latency_ = 1;
-    std::uint32_t event_offset_us_[frame_event_count] = {0, 0, 0};
+    std::uint32_t offset_us_ = 0;
     std::uint64_t epoch_us_ = 0;
-    std::int64_t last_event_tick_[frame_event_count] = {0, 0, 0};  // tick 0 is the epoch itself, which has passed
-    std::uint64_t issued_ = 0;
+    std::int64_t last_origin_ = 0;  // origin 0 is the epoch itself, which has passed
+    std::shared_ptr<FrameTokenSource> tokens_;
     std::uint64_t last_presented_ = 0;
     std::uint64_t immediate_presents_ = 0;
     std::deque<Pending> pending_;

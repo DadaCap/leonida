@@ -7581,8 +7581,15 @@ class Gen:
             if self.is_mask_op(x):
                 raise Unsupported(op + " on a lane mask")
             if d["k"] == "special" and d.get("t", "").startswith(("exec", "vcc")):
-                if op != "s_bitreplicate_b64_b32" or d["t"] != "exec":
+                if op != "s_bitreplicate_b64_b32" or d["t"] not in ("exec", "vcc"):
                     raise Unsupported(op + " on a lane mask")
+                if d["t"] == "vcc":
+                    # VCC's bit for lane L is scalar-source bit L // 2 too, stored as mov64 stores a mask into VCC
+                    # (this lane's bit as 0xFFFFFFFF / 0).
+                    half = self.tmp()
+                    self.emit(f"{half} = OpShiftRightLogical %uint {self.wave_lane()} {self.cu(1)}")
+                    self.emit(f"OpStore %vcc {self._scalar_word_lane_bit(self.src_u(x), half)}")
+                    return
                 # EXEC's bit for lane L comes from scalar-source bit L // 2.
                 shift, shifted, bit = (self.tmp() for _ in range(3))
                 lane = self.wave_lane()
@@ -8342,11 +8349,15 @@ class Gen:
             # Leading-bit count of a 64-bit value, from bit 63 down: b64 counts the zeros before the first 1; i64
             # counts the bits before the first one that differs from the sign bit (b64 of ~S0 when S0 < 0). -1 when
             # there is none (0, and for i64 also -1). SCC is not written. The pair is 64-bit data (as for
-            # s_lshl_b64); a lane-mask source stays Unsupported (#210).
+            # s_lshl_b64); a lane-mask source of b64 is the wave's mask (wave_mask); of i64 it stays Unsupported.
             x = a[1]
             if self.holds_lane_mask(x):
-                raise Unsupported(op + " of a lane mask")
-            if x["k"] == "sgpr" and x.get("n") == 2:
+                if op != "s_flbit_i32_b64":
+                    raise Unsupported(op + " of a lane mask")
+                # The wave's mask as real bits, as s_ff1_i32_b64 reads one: the result is the zeros above the
+                # wave's last active lane.
+                lo, hi = self.wave_mask(x)
+            elif x["k"] == "sgpr" and x.get("n") == 2:
                 lo, hi = self.load_reg("sgpr", x["r"]), self.load_reg("sgpr", x["r"] + 1)
             elif x["k"] == "imm":
                 v = x["v"] & 0xFFFFFFFFFFFFFFFF
@@ -12436,7 +12447,9 @@ class Gen:
             (n == 2 and d["k"] == "special" and d["t"] == "vcc")
         slist_dst = d["k"] == "slist" and len(d["r"]) == n
         base_slots = (list(range(base["r"], base["r"] + base.get("n", 1))) if base["k"] == "sgpr"
-                      else list(base["r"]) if base["k"] == "slist" else None)
+                      else list(base["r"]) if base["k"] == "slist"
+                      else ["vcc_lo", "vcc_hi"] if (base["k"] == "special" and base["t"] == "vcc")
+                      else None)
         if (d["k"] != "sgpr" and not single_special and not slist_dst) or base_slots is None:
             raise Unsupported(f"{op} operands {d.get('t', d['k'])} {base.get('t', base['k'])}")
 
@@ -17147,6 +17160,62 @@ def restore_mix_inline_literal(ins, raw, literal):
     ins["enc"] = raw.hex()
 
 
+def restore_vcc_tuples(insns, blob, code_start, code_end):
+    """Put back the scalar-memory, image and buffer instructions whose register tuple runs into vcc.
+
+    llvm-mc rejects a tuple that reaches SGPRs 106 and 107 (s_load_dwordx8 into s[100:107], an image resource in
+    s[100:107], a buffer resource in s[104:107]): it skips the first word as invalid and then prints the second word
+    as an instruction of its own, one that is junk or does not match the blob (docs/shader_library.md section 5).
+    The pure-Python decoder reads such a word as a VCCTuple list, [s100,...,s105,vcc_lo,vcc_hi], the form the
+    translator takes for these instructions. Every blob dword in the code range that no matched instruction covers
+    is offered to it; the instruction is used only if its operands hold such a list, so no other undecodable word
+    changes. Instructions printed inside the words of a restored one are dropped. The instructions already carry
+    their blob offsets in "pc"; returns the list sorted by it.
+
+    The junk can be longer than the second word it starts at, and then it also swallows the instruction after the
+    tuple, which no printed instruction covers once the junk is dropped. The words after a restored instruction are
+    therefore decoded the same way until the stream is back at an instruction llvm-mc printed there. A word that
+    llvm-mc itself rejected, inside no printed instruction, is not one of those and stays undecodable."""
+    import rdna2_decode
+    printed, covered, starts = set(), set(), set()
+    unplaced = None    # the pc of the first junk since an instruction that matched the blob
+    for ins in insns:
+        if ins.get("normalized"):
+            # Its pc is a lower bound: the word llvm-mc rejected before it was not counted.
+            unplaced = ins["pc"] if unplaced is None else unplaced
+            continue
+        if unplaced is not None:
+            printed.update(range(unplaced, ins["pc"], 4))
+            unplaced = None
+        words = range(ins["pc"], ins["pc"] + len(ins["enc"]) // 2, 4)
+        printed.update(words)
+        starts.add(ins["pc"])
+        covered.update(words)
+    stop = min(len(blob), code_end if code_end is not None else len(blob))
+    restored, at = [], code_start
+    resync = False     # at follows a restored instruction and is inside junk llvm-mc printed, not at a start
+    while at + 4 <= stop:
+        found = None
+        if resync or at not in covered:
+            found = rdna2_decode.decode_bytes(blob[at:min(at + 20, stop)])["insns"][:1]
+        if found and found[0]["pc"] == 0 and at + len(found[0]["enc"]) // 2 <= stop and (resync or any(
+                a["k"] == "slist" and ("vcc_lo" in a["r"] or "vcc_hi" in a["r"]) for a in found[0]["args"])):
+            ins = found[0]
+            ins["pc"] = at
+            restored.append(ins)
+            at += len(ins["enc"]) // 2
+            # nothing runs on past these, so the words after them are not known to be code
+            resync = at in printed and at not in starts and base_op(ins["op"]) not in ("s_branch", "s_endpgm", "s_setpc_b64")
+            continue
+        resync = False
+        at += 4
+    if not restored:
+        return insns
+    spans = [(r["pc"], r["pc"] + len(r["enc"]) // 2) for r in restored]
+    kept = [i for i in insns if not any(i["pc"] < hi and i["pc"] + len(i["enc"]) // 2 > lo for lo, hi in spans)]
+    return sorted(kept + restored, key=lambda i: i["pc"])
+
+
 def output_signature(path, name):
     """OSG1 elements as (register, system value), one per register (first element wins)."""
     d = shader_container(path, name)
@@ -17421,6 +17490,7 @@ def translate(path):
                 ins["normalized"] = True
             ins["pc"] = at
             pos = at + len(enc)
+        insns = restore_vcc_tuples(insns, blob, info["code_start"], info.get("code_end"))
         insns = fold_far_branches(insns)
         insns = reachable_code(insns, info.get("code_end"))
         if any(i.get("normalized") for i in insns):

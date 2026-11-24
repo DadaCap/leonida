@@ -262,6 +262,41 @@ constexpr uint64_t kFramesPerPage = kPhysicalPageSize / 0x1000;
 constexpr uint64_t kPageSlotLimit = uint64_t{1} << 21;
 
 std::mutex g_phys_mutex;
+// Both under g_phys_mutex. The pool's windows are always backed: mapping physical pages there changes nothing. A page
+// mapped there does not alias the same page mapped elsewhere; the measured title maps each of them once.
+// The region: [base, +kLayerBytes) is the D3D12 layer's, then the low pool (placeholder windows: descriptor tables live
+// there, so it ends below 4 GiB from the start), then the rest.
+constexpr size_t kLayerBytes = size_t{1} << 30, kLowBytes = size_t{512} << 20;
+uintptr_t g_pool_base = 0, g_pool_next = 0, g_pool_end = 0;  // the low pool
+uintptr_t g_high_base = 0, g_high_next = 0, g_high_end = 0;
+size_t g_region_bytes = 0;
+
+// With g_phys_mutex held.
+bool make_region() {
+    static bool tried = false;
+    if (tried) return g_region_bytes != 0;
+    tried = true;
+    char text[16] = {};
+    const DWORD n = GetEnvironmentVariableA("LEONIDA_GPU_REGION_MB", text, sizeof text);
+    const size_t mb = n && n < sizeof text ? std::strtoull(text, nullptr, 10) : 14336;
+    if (mb < 2048) return false;
+    const size_t bytes = mb << 20;
+    void* const base = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (!base) return false;
+    g_region_bytes = bytes;
+    const uintptr_t start = (reinterpret_cast<uintptr_t>(base) + kLayerBytes + 0x1FFFFF) & ~uintptr_t{0x1FFFFF};
+    g_pool_base = g_pool_next = start;
+    g_pool_end = start + kLowBytes;
+    g_high_base = g_high_next = g_pool_end;
+    g_high_end = reinterpret_cast<uintptr_t>(base) + bytes;
+    std::fprintf(stderr, "[rt] xmem: the title's GPU memory is served from one %zu MiB region\n", mb);
+    return true;
+}
+
+bool in_pool(uintptr_t address, uint64_t bytes) {
+    return (address >= g_pool_base && address < g_pool_next && bytes <= g_pool_next - address) ||
+           (address >= g_high_base && address < g_high_next && bytes <= g_high_next - address);
+}
 std::map<uintptr_t, Window> g_windows;              // base -> window
 std::unordered_map<uint64_t, PhysicalPage> g_pages;  // page number -> backing
 std::vector<uint64_t> g_free_slots;
@@ -422,6 +457,10 @@ void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type,
 
     if (replace) {
         const std::lock_guard lock(g_phys_mutex);
+        if (in_pool(reinterpret_cast<uintptr_t>(address), size)) {
+            if (window) record_window(address, size, host_prot);
+            return address;
+        }
         if (!isolate_placeholder(address, size)) return nullptr;
         if (window) {
             // A reserve-only replacement stays a placeholder: the physical pages are mapped into it.
@@ -430,6 +469,20 @@ void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type,
         }
         return placeholder_api().virtual_alloc2(GetCurrentProcess(), address, size, host_type | MEM_RESERVE, host_prot,
                                                 nullptr, 0);
+    }
+    // GPU-visible memory (PAGE_GRAPHICS_* bits, or the placeholder its windows are carved from) comes from the region.
+    if (!address && !replace && (new_placeholder || (protect & 0x7F800))) {
+        const std::lock_guard lock(g_phys_mutex);
+        if (make_region()) {
+            uintptr_t& next = new_placeholder ? g_pool_next : g_high_next;
+            const uintptr_t end = new_placeholder ? g_pool_end : g_high_end;
+            const uintptr_t start = (next + base_granularity - 1) & ~(static_cast<uintptr_t>(base_granularity) - 1);
+            if (start < end && size <= end - start) {
+                next = start + size;
+                if (window) record_window(reinterpret_cast<void*>(start), size, host_prot);
+                return reinterpret_cast<void*>(start);
+            }
+        }
     }
     if (new_placeholder || window) {
         void* const result = reserve_placeholder(address, size, base_granularity);
@@ -678,6 +731,7 @@ void* WINAPI XMemMapPhysicalPages(void* address, uint64_t page_count, const uint
         return nullptr;
     }
     const std::lock_guard lock(g_phys_mutex);
+    if (in_pool(start, page_count * kPhysicalPageSize)) return address;
     if (!page_array) {
         for (uint64_t i = 0; i < page_count; ++i) {
             if (!unmap_page(start + i * kPhysicalPageSize)) return nullptr;
@@ -717,6 +771,7 @@ BOOL WINAPI XMemMapPhysicalPagesScatter(void* const* addresses, uint32_t page_co
             return FALSE;
         }
         const uint64_t page = page_array ? page_array[i] : 0;
+        if (in_pool(address, kPhysicalPageSize)) continue;
         if (page == 0) {
             if (!unmap_page(address)) return FALSE;
             continue;
@@ -800,9 +855,61 @@ LPVOID WINAPI TitleVirtualAlloc(LPVOID address, SIZE_T size, DWORD allocation_ty
     return VirtualAlloc(address, size, allocation_type & ~(kMemGraphics | kMemTitle), host_protect(protect));
 }
 
+// A title carves its placeholder with VirtualFree(MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER); the pool's windows are not
+// placeholders, and need no carving.
+BOOL WINAPI TitleVirtualFree(LPVOID address, SIZE_T size, DWORD type) {
+    {
+        const std::lock_guard lock(g_phys_mutex);
+        if (in_pool(reinterpret_cast<uintptr_t>(address), size)) return TRUE;
+    }
+    return VirtualFree(address, size, type);
+}
+
+// The host bytes of the 64 KiB page at `page`, or null when the page is not one of xmem's physical pages. The
+// page's own view at the title's address may be PAGE_NOACCESS (the GPU memory windows), while the section's
+// mapping of the same bytes is the host's own copy, which the CPU may write.
+std::uint8_t* host_page_bytes(std::uintptr_t page) {
+    const std::lock_guard lock(g_phys_mutex);
+    const auto it = g_mapped.find(page);
+    if (it == g_mapped.end() || !it->second.section->scratch) return nullptr;
+    return static_cast<std::uint8_t*>(it->second.section->scratch) + it->second.offset;
+}
+
+// True when the host may write at `address`: the page is committed and writable.
+bool writable_at(std::uintptr_t address) {
+    MEMORY_BASIC_INFORMATION info{};
+    if (!VirtualQuery(reinterpret_cast<void*>(address), &info, sizeof(info))) return false;
+    if (info.State != MEM_COMMIT) return false;
+    if (info.Protect & PAGE_GUARD) return false;
+    switch (info.Protect & 0xff) {
+    case PAGE_READWRITE:
+    case PAGE_WRITECOPY:
+    case PAGE_EXECUTE_READWRITE:
+    case PAGE_EXECUTE_WRITECOPY:
+        return true;
+    default:
+        return false;
+    }
+}
+
 }  // namespace
 
 namespace rt::xmem {
+
+bool gpu_region(void*& base, size_t& size, size_t& layer_bytes) {
+    const std::lock_guard lock(g_phys_mutex);
+    if (!make_region()) return false;
+    base = reinterpret_cast<void*>(g_high_end - g_region_bytes);
+    size = g_region_bytes;
+    layer_bytes = kLayerBytes;
+    return true;
+}
+
+void set_window_pool(void* base, size_t size) {
+    const std::lock_guard lock(g_phys_mutex);
+    g_pool_base = g_pool_next = reinterpret_cast<uintptr_t>(base);
+    g_pool_end = g_pool_base + size;
+}
 
 bool commit_physical_range(const void* address, size_t size) {
     if (size == 0) return true;
@@ -822,6 +929,44 @@ bool commit_physical_range(const void* address, size_t size) {
     }
     return true;
 }
+
+// Writes `size` bytes at `address` in the title's memory. The bytes land in the host pages xmem manages: the
+// section's own mapping of a physical page (which the CPU may write even where the title's view is PAGE_NOACCESS,
+// as the GPU memory windows are), or the window's own bytes when the range is not one of xmem's pages. False when
+// the range is not mapped, or not writable where it is.
+bool write_title_bytes(const void* address, const void* bytes, std::size_t size) {
+    if (!size) return true;
+    if (!address || !bytes) return false;
+    if (!commit_physical_range(address, size)) return false;
+    const auto start = reinterpret_cast<std::uintptr_t>(address);
+    const std::uintptr_t mask = ~static_cast<std::uintptr_t>(kPhysicalPageSize - 1);
+    std::size_t done = 0;
+    while (done < size) {
+        const std::uintptr_t at = start + done;
+        const std::uintptr_t page = at & mask;
+        const std::size_t offset = static_cast<std::size_t>(at - page);
+        std::size_t chunk = kPhysicalPageSize - offset;
+        if (chunk > size - done) chunk = size - done;
+        std::uint8_t* const host = host_page_bytes(page);
+        if (host) {
+            std::memcpy(host + offset, static_cast<const std::uint8_t*>(bytes) + done, chunk);
+        } else {
+            if (!writable_at(at)) return false;
+            std::memcpy(reinterpret_cast<void*>(at), static_cast<const std::uint8_t*>(bytes) + done, chunk);
+        }
+        done += chunk;
+    }
+    return true;
+}
+
+    // The D3D12 layer calls this through a pointer (xmem.h), so that the D3D12 library does not have to link
+    // the xmem shim into every consumer of that library. A process that links the shim gets the real write; one
+    // that does not keeps the console's value writes dropped.
+    namespace {
+        struct TitleWriteRegistration {
+            TitleWriteRegistration() { title_write_fn = &write_title_bytes; }
+        } title_write_registration;
+    }
 
 bool commit_physical_pages(const uint64_t* page_array, size_t count) {
     if (count == 0) return true;
@@ -855,7 +1000,7 @@ bool commit_physical_pages(const uint64_t* page_array, size_t count) {
 
 }
 
-#define TITLE_VIRTUAL_ALLOC(dll) {dll, "VirtualAlloc", reinterpret_cast<void*>(&TitleVirtualAlloc)}
+#define TITLE_VIRTUAL_ALLOC(dll) {dll, "VirtualAlloc", reinterpret_cast<void*>(&TitleVirtualAlloc)}, {dll, "VirtualFree", reinterpret_cast<void*>(&TitleVirtualFree)}
 
 // The classic libraries and the memory api sets a title's imports name.
 SHIM_TABLE(title_memory,

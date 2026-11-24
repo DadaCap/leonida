@@ -564,8 +564,24 @@ shape and the shift around them, but the shape alone does not single the method 
 | 55 (`+0x1b8`) | **51** | `DiscardResource` | `(resource, null)` at `0x6dcb`, after the pending barriers are flushed through slot 26 |
 | 59 (`+0x1d8`) | — | console only (shape) | four calls, two shapes: `(1, blob, size)` at `0x6b5a` and `0x6d53`, the blob a run of qwords whose first is `0xf3080 \| (qword count & 0x7f)`; and `(0, &qword, 8)` with the qword 1 at `0x6e52` and `0x6eb8`, only when a profiling bit of the context is set (`0x6e2a`). The first argument is set as a byte (`mov dl, 1` / `xor edx, edx`). It looks like one slot for both ends of a GPU event; no public method takes a bool first. With 55 at +4 and 61 at +2, the two slots the console lacks are among 56–60 |
 | 61 (`+0x1e8`) | **59** | `ExecuteIndirect` | `(signature, 1, argument buffer, offset, null, 0)` at `0x59a0` |
+| 69 (`+0x228`) | — | `Write32BitValueBottomOfPipeX` | `(address, u32 value, flush, flags)`: the value goes into memory at the bottom of the pipe, after the work before it in the queue has run. The shape is measured with xcl (`crates/xcl/src/hle/d3d12x/list_x.rs`, GPL-2.0-only), cited for the shape only |
+| 70 (`+0x230`) | — | `Write64BitValueBottomOfPipeX` | `(address, u64 value, flush, flags)`, the same source; flags 1 and 2 write the GPU and the system timestamp instead of the value the call carries |
+| 71 (`+0x238`) | — | `Wait32BitValueX` | **a no-op in the port**: the word that follows slot 72's on the stack is a 32-bit 1 with garbage in the high bits, and taking it for the wait's mask makes every `>=` wait time out (xcl issue 218) |
+| 72 (`+0x240`) | — | `Wait64BitValueX` | as slot 71 |
 | 85 (`+0x2a8`) | — | `CopyTextureRegion` shape (inferred) | run: `(stack pointer, 0, 0)`, twice per dispatch. Statically six arguments, `(&dst, 0, 0, 0, &src, null)`: the public `CopyTextureRegion` (PC 16) with two `D3D12_TEXTURE_COPY_LOCATION`s, not one pointer. At `0x7147` dst is `{texture, SUBRESOURCE_INDEX, 0}` and src `{buffer, PLACED_FOOTPRINT, footprint}`, the footprint from device slot 38 (`GetCopyableFootprints`, `0x708b`); at `0x7191` both are subresource 0 (texture to texture). The caller also clears the next stack argument (`0x70e7`); whether the method takes a seventh is open, as is what console slot 16 is |
 | 141 (`+0x468`) | — | console only | `(2, GPU VA, size, n)` at `0x65f8`: binds a buffer the DLL names `FFX_XBox_ComputeScratch`; `n` is the bound pipeline's scratch value from pipeline slot 11 (see above) |
+
+**The console's value writes.** Slots 69 and 70 write a value into memory at the bottom of the pipe:
+after every command that precedes them in the queue has run. The port records each write in the list proxy
+(`runtime/shims/d3d12_xs_device.cpp`), collects the records when the queue proxy submits the list, and writes them
+into the title's memory once that submission has completed on the GPU, in submission order
+(`runtime/src/xs_value_writes.h`). The write is a CPU write into the title's own memory, the way VIctory
+(`crates/victory-gpu/src/list.rs`, GPL-3.0-only) defers `write32`/`write64` to the end of the list; it is not a
+GPU command, because the Vulkan layer's immediate-write path refuses an address that is in no D3D12 resource
+(`runtime/src/vulkan_replay.h`, `unresolved_resource`) and these addresses are ordinary title memory, which no
+resource covers. Slots 71 and 72 stay no-ops: the word that follows slot 72's on the stack is a 32-bit 1 with
+garbage in the high bits, and taking it for the wait's mask makes every `>=` wait time out, two seconds a frame,
+and the title's frame rate zero after its first cutscene (xcl issue 218).
 
 So the console list has four more methods than the PC list between `ResourceBarrier` (26) and `SetDescriptorHeaps`
 (console 32), and two fewer between `ClearUnorderedAccessViewUint` (console 53) and `ExecuteIndirect` (console 61).
@@ -764,6 +780,12 @@ Queues and fences are wrapped the same way.
   object implements but the proxy does not model is logged once and refused.
 - **The refused tail.** A slot past the public chain, up to the end of the proxy's own table (128 queue and
   64 fence slots, every one a thunk), logs its first four argument words once and returns `E_NOTIMPL`.
+- **Fence slot 12.** The one served slot past the chain. The retail executable calls it as
+  `(value, descriptor, flags)` and reads the return as a pointer to the fence's 64-bit completed value: it
+  compares that value with `~0` (device removed) and subtracts the value it waits for. The proxy returns a
+  per-fence mirror. A wait on the real fence (`SetEventOnCompletion(completed + 1)`, re-armed after each
+  completion) keeps it current without another call, and slot 12 and the CPU `Signal` (10) refresh it at
+  once. The descriptor's second word is a code pointer, which is not called.
 - **The guard region.** Each table sits at the end of the first page of a 64 KiB reservation, and the rest
   of that reservation is never committed. A slot past the table therefore faults on the vtable read itself,
   inside the reservation, and a vectored handler logs the slot before the fault goes on. A vtable read that
@@ -898,8 +920,10 @@ existing device proxy already follows that rule (`runtime/shims/d3d12_xs_device.
 ### 8.1 Licence
 
 Leonida is GPL-3.0-or-later. SCARAB is GPL-3.0-only and `americas-recomp` is GPL-2.0-only; both
-are cited for ABI facts only. No code, headers, generated stubs, comments or tables were copied
-from either project. The PE and disassembly facts in section 3 were produced locally from the
+are cited for ABI facts only. xcl (`crates/xcl/src/hle/d3d12x/list_x.rs`, GPL-2.0-only) is cited for the shape of
+the console's value-write and wait slots, and VIctory (`crates/victory-gpu/src/list.rs`, GPL-3.0-only) for the way a
+deferred write reaches the guest's memory. No code, headers, generated stubs, comments or tables were copied
+from any of them. The PE and disassembly facts in section 3 were produced locally from the
 shipped `XboxBvhBuilder.dll`; the public slot table was parsed from the installed Windows SDK
 10.0.26100.0. No game data was read, decrypted or executed. See
 [`docs/related_projects.md`](related_projects.md) for the project-level rule.

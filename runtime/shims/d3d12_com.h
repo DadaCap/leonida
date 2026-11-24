@@ -18,6 +18,7 @@
 #include "../src/gfx10_descriptors.h"
 #include "../src/vulkan_backend.h"
 
+#include <atomic>
 #include <filesystem>
 #include <functional>
 #include <memory>
@@ -156,6 +157,9 @@ struct VulkanDeviceInfo {
     bool fragment_shader_barycentric = false;
     bool fragment_shader_interlock = false;
     bool maintenance8 = false;
+    // VK_KHR_maintenance5, enabled where its VK_FORMAT_A8_UNORM_KHR can be sampled and is a colour attachment the GPU
+    // can blend: A8_UNORM render targets are then stored in that format (other A8_UNORM textures stay R8_UNORM).
+    bool a8_render_target = false;
     // The instance enabled VK_EXT_debug_utils: SetMarker/BeginEvent/EndEvent become debug labels. Otherwise they
     // do nothing.
     bool debug_utils = false;
@@ -386,6 +390,25 @@ std::unique_ptr<WindowPresenter> create_window_presenter(ID3D12Device* device, H
 //     exist, because a mesh shader (s16) and a pixel shader (s8) share one push-constant block);
 //   - compute: rt::rootsig::pack_stage(Stage::Compute), the measured console layout (from s4, one dword per table).
 // A layout that refuses the signature is marked unusable; binding the signature there invalidates the list.
+// Where the title's windows lie when they were taken from the arena's own host mapping (reserve_title_window): a
+// title address there names the arena VA at the same distance from the mapping's start. Zero: no such window.
+struct TitleWindow {
+    std::atomic<std::uint64_t> base{0}, size{0};
+};
+inline TitleWindow g_title_window;
+// Set before the device is made: host memory the arena imports whole, of which it hands out the first layer_bytes.
+struct ArenaImport {
+    void* base = nullptr;
+    std::uint64_t size = 0, layer_bytes = 0;
+};
+inline ArenaImport g_arena_import;
+inline std::uint64_t arena_va(std::uint64_t va) {
+    const std::uint64_t base = g_title_window.base.load(std::memory_order_relaxed);
+    return base && va - base < g_title_window.size.load(std::memory_order_relaxed) ? va - base : va;
+}
+// `bytes` of the arena's mapping, zeroed and 2 MiB aligned, for the title's windows; null without an arena or room.
+void* reserve_title_window(ID3D12Device* device, std::size_t bytes);
+
 struct RootArgumentLayout {
     struct Parameter {
         rt::rootsig::ParamType type;
@@ -396,6 +419,7 @@ struct RootArgumentLayout {
     std::vector<Parameter> parameters;
     std::uint32_t flags = 0;  // D3D12_ROOT_SIGNATURE_FLAGS from the serialized blob
     bool graphics_ok = true;
+    bool graphics_stage = false;  // graphics: pack_stage()'s console layout (s8, one dword per table)
     bool compute_ok = true;
 };
 

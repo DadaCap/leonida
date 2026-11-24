@@ -834,19 +834,15 @@ public:
         } else if (count_buffer_offset != 0) {
             return check(false);
         }
-        // The record size is checked for every call: D3D12 rejects a signature whose stride cannot hold a record
-        // even when no command runs. The argument span is what the signature can walk, max_command_count * stride:
-        // the host refuses a range that ends past the buffer (`240` with stride `20` in a `256`-byte buffer), and
-        // it checks the offset itself when max_command_count is 0, where the required bytes are none.
-        const UINT64 record_size =
-            kind == leonida::IndirectKind::draw ? sizeof(D3D12_DRAW_ARGUMENTS)
-            : kind == leonida::IndirectKind::draw_indexed ? sizeof(D3D12_DRAW_INDEXED_ARGUMENTS)
-            : kind == leonida::IndirectKind::dispatch ? sizeof(D3D12_DISPATCH_ARGUMENTS)
-            : 0;
-        if (!record_size || stride < record_size || stride % 4 != 0) return check(false);
-        if (argument_buffer_offset > arg_desc.Width ||
-            UINT64(max_command_count) > (arg_desc.Width - argument_buffer_offset) / stride)
-            return check(false);
+        if (kind == leonida::IndirectKind::dispatch_mesh) {
+            // Not replayed yet (#3777 replays it as vkCmdDrawMeshTasksIndirectEXT): nothing is recorded, and the
+            // first such call says so. The list stays valid.
+            static std::atomic<bool> logged{false};
+            if (!logged.exchange(true, std::memory_order_relaxed))
+                std::fprintf(stderr, "[rt] d3d12: ExecuteIndirect with a DISPATCH_MESH signature is not replayed yet; "
+                                     "nothing was recorded\n");
+            return;
+        }
         leonida::ExecuteIndirect cmd{};
         cmd.kind = kind;
         cmd.stride = stride;
@@ -1240,11 +1236,12 @@ private:
             return;
         const RootArgumentLayout::Parameter* p = parameter(state, index, type);
         if (!p) return;
+        va = arena_va(va);
         const std::uint32_t first = first_dword(state, *p);
         write(state, first, std::uint32_t(va));
         // In the compute layout a descriptor table is one dword, the 32-bit VA of its first descriptor (the heaps
         // live below 4 GiB); a root view keeps both halves. The graphics layout gives every address two dwords.
-        if (!(is_compute(state) && type == rt::rootsig::ParamType::Table)) write(state, first + 1, std::uint32_t(va >> 32));
+        if (!((is_compute(state) || state.layout->graphics_stage) && type == rt::rootsig::ParamType::Table)) write(state, first + 1, std::uint32_t(va >> 32));
     }
 
     D3D12_COMMAND_LIST_TYPE type_;
@@ -1379,13 +1376,13 @@ private:
     void set_vertex_buffers(UINT start, UINT count, const D3D12_VERTEX_BUFFER_VIEW* views) {
         if (count) draw_views_stale_ = true;
         for (UINT i = 0; i < count; ++i)
-            vertex_buffers_[start + i] = views ? leonida::VertexBufferView{views[i].BufferLocation, views[i].SizeInBytes,
+            vertex_buffers_[start + i] = views ? leonida::VertexBufferView{arena_va(views[i].BufferLocation), views[i].SizeInBytes,
                                                                           views[i].StrideInBytes}
                                                : leonida::VertexBufferView{};
     }
 
     void set_index_buffer(const D3D12_INDEX_BUFFER_VIEW* view) {
-        index_ = view ? leonida::IndexBufferView{view->BufferLocation, view->SizeInBytes, u(view->Format)}
+        index_ = view ? leonida::IndexBufferView{arena_va(view->BufferLocation), view->SizeInBytes, u(view->Format)}
                       : leonida::IndexBufferView{};
     }
 
@@ -1644,7 +1641,11 @@ public:
             recorded.push_back(&list->commands());
             graphics.push_back(list);
         }
-        last_result_ = queue_.execute(recorded, [&graphics] { return pin_lists(graphics); });
+        // The console's value writes (console list slots 69 and 70): the queue proxy staged them for this
+        // submission, and they wait for it to complete on the GPU.
+        std::vector<leonida::ValueWrite> value_writes = rt::d3d12_xs::take_staged_value_writes();
+        last_result_ =
+            queue_.execute(recorded, [&graphics] { return pin_lists(graphics); }, std::move(value_writes));
         d3d12_trace::record(method, last_result_ == leonida::ReplayResult::success ? "ok" : "failed");
         if (last_result_ != leonida::ReplayResult::success)
             std::fprintf(stderr, "[rt] d3d12: ExecuteCommandLists failed: %s; nothing was submitted\n",

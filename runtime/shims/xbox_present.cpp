@@ -1,7 +1,6 @@
 #include "xbox_present.h"
 
 #include "d3d12_trace.h"
-#include "d3d12_xs_device.h"
 
 #include "../src/vulkan_present.h"
 
@@ -29,10 +28,11 @@ void log_once(bool& done, const char* text) {
 
 }  // namespace
 
-XboxPresentation::XboxPresentation(std::unique_ptr<WindowPresenter> presenter, leonida::FrameClock* clock)
+XboxPresentation::XboxPresentation(std::unique_ptr<WindowPresenter> presenter, leonida::FrameClock* clock,
+                                   std::shared_ptr<leonida::FrameTokenSource> tokens)
     : presenter_(std::move(presenter)),
       own_clock_(clock ? nullptr : std::make_unique<leonida::SteadyFrameClock>()),
-      pacer_(clock ? *clock : *own_clock_) {
+      pacer_(clock ? *clock : *own_clock_, std::move(tokens)) {
     // A present waiting for a swapchain image gives up once SuspendX has been called.
     presenter_->set_abort([this] { return pacer_.suspended(); });
     // LEONIDA_SDR_EOTF=gamma22 (or 2.2, any case) decodes SDR with a pure power of 2.2 instead of piecewise sRGB; "srgb" or
@@ -313,41 +313,6 @@ HRESULT XboxPresentation::SuspendX(UINT) {
 HRESULT XboxPresentation::ResumeX() {
     pacer_.resume();
     return S_OK;
-}
-
-bool attach_xbox_presentation(void* device_proxy, XboxPresentation* presentation) {
-    if (!presentation) return rt::d3d12_xs::set_presentation_handler(device_proxy, nullptr);
-    rt::d3d12_xs::PresentationHandler handler{};
-    handler.context = presentation;
-    handler.set_frame_interval = [](void* ctx, IUnknown* output, UINT interval_us, UINT latency, UINT flags) {
-        return static_cast<XboxPresentation*>(ctx)->SetFrameIntervalX(output, interval_us, latency, flags);
-    };
-    handler.schedule_frame_event = [](void* ctx, UINT event, UINT offset_us, UINT flags) {
-        return static_cast<XboxPresentation*>(ctx)->ScheduleFrameEventX(event, offset_us, flags);
-    };
-    handler.wait_frame_event = [](void* ctx, UINT event, DWORD timeout_ms, UINT flags, std::uint64_t* token) {
-        return static_cast<XboxPresentation*>(ctx)->WaitFrameEventX(event, timeout_ms, flags, token);
-    };
-    handler.get_frame_statistics = [](void* ctx, std::uint64_t token, UINT type_mask, UINT* count, void* out) {
-        return static_cast<XboxPresentation*>(ctx)->GetFrameStatisticsX(
-            token, type_mask, count, static_cast<leonida::FrameStatistic*>(out));
-    };
-    handler.present_x = [](void* ctx, UINT plane_count, const void* planes, const void* params) {
-        return static_cast<XboxPresentation*>(ctx)->PresentX(
-            plane_count, static_cast<const XboxPresentPlaneParameters*>(planes),
-            static_cast<const XboxPresentParameters*>(params));
-    };
-    handler.suspend_x = [](void* ctx, UINT flags) {
-        return static_cast<XboxPresentation*>(ctx)->SuspendX(flags);
-    };
-    handler.resume_x = [](void* ctx) {
-        return static_cast<XboxPresentation*>(ctx)->ResumeX();
-    };
-    return rt::d3d12_xs::set_presentation_handler(device_proxy, &handler);
-}
-
-bool detach_xbox_presentation(void* device_proxy) {
-    return rt::d3d12_xs::set_presentation_handler(device_proxy, nullptr);
 }
 
 }  // namespace rt::d3d12

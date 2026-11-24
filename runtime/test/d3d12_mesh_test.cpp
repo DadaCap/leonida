@@ -12,6 +12,8 @@
 //     bottom-left quadrant (yellow). Each pixel is read back and compared.
 //   - A vertex draw with the mesh PSO, and DispatchMesh with the VS one, fail at execution (ReplayResult::
 //     invalid_draw); a mesh grid beyond D3D12's limits fails at Close; an empty grid records nothing.
+//   - A DISPATCH_MESH command signature is created only with the extension; ExecuteIndirect with it records nothing
+//     yet, so its list closes.
 // The shaders are GLSL written to the translator's contract (test/glsl/ms_draw.mesh, ps_draw.frag, vs_fullscreen.vert).
 // No game data. Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation.
 #include "vk_test_device.h"
@@ -181,6 +183,11 @@ int main() {
         stream.add(TargetsSubobject{.inner = one_target()});
         Ref<ID3D12PipelineState> pso;
         EXPECT(create(device.p, stream, pso) == E_NOTIMPL && !pso.p);
+        // A DISPATCH_MESH command signature is refused the same way.
+        const D3D12_INDIRECT_ARGUMENT_DESC mesh_arg{D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH};
+        const D3D12_COMMAND_SIGNATURE_DESC mesh_sig{12, 1, &mesh_arg, 0};
+        Ref<ID3D12CommandSignature> sig;
+        EXPECT(device->CreateCommandSignature(&mesh_sig, nullptr, IID_PPV_ARGS(&sig.p)) == E_NOTIMPL && !sig.p);
         root.reset();
         EXPECT(rt::d3d12_xs::device_proxy_ref_count(device.p) == 1);
     }
@@ -269,6 +276,34 @@ int main() {
         bounds.DepthBoundsTestEnable = TRUE;
         bad.add(DepthStencil1Subobject{.inner = bounds});
         EXPECT(create(device.p, bad, refused) == E_NOTIMPL && !refused.p);
+
+        // A console stream: its numbering has no gap at 23, so its mesh shader is 24 (the PC's AS) and its
+        // RASTERIZER1 26 (the PC's DEPTH_STENCIL2). An AS without an MS is no PC stream, so the layer reads it with the
+        // console's numbering and makes the mesh PSO. The PC reading of the same bytes alone would refuse it.
+        D3D12_RASTERIZER_DESC1 raster1{};
+        raster1.FillMode = D3D12_FILL_MODE_SOLID;
+        raster1.CullMode = D3D12_CULL_MODE_NONE;
+        raster1.DepthClipEnable = TRUE;
+        unsigned console_psos = 0;
+        for (int with_raster1 = 0; with_raster1 < 2; ++with_raster1) {
+            Stream console;
+            console.add(RootSubobject{.inner = root.p});
+            console.add(Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE(24), D3D12_SHADER_BYTECODE>{.inner = ms});
+            console.add(PsSubobject{.inner = ps}).add(TargetsSubobject{.inner = one_target()});
+            if (with_raster1)
+                console.add(Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE(26), D3D12_RASTERIZER_DESC1>{.inner = raster1});
+            Ref<ID3D12PipelineState> console_pso;
+            const HRESULT console_hr = create(device.p, console, console_pso);
+            if (FAILED(console_hr))
+                std::fprintf(stderr, "console stream %d: 0x%08lx\n", with_raster1, static_cast<unsigned long>(console_hr));
+            EXPECT(SUCCEEDED(console_hr) && console_pso.p);
+            ++console_psos;
+        }
+        // An MS and an AS in PC numbering stay the PC's (and refused, the layer builds no AS).
+        bad = mesh_stream;
+        bad.add(Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE(24), D3D12_SHADER_BYTECODE>{.inner = ms});
+        EXPECT(create(device.p, bad, refused) == E_NOTIMPL && !refused.p);
+        std::printf("console-numbered streams: %u mesh PSOs (MS as 24, RASTERIZER1 as 26)\n", console_psos);
 
         const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
         const D3D12_HEAP_PROPERTIES upload_heap{D3D12_HEAP_TYPE_UPLOAD};
@@ -399,6 +434,21 @@ int main() {
         list->RSSetViewports(1, &viewport);
         list6->DispatchMesh(4096, 1025, 1);
         EXPECT(list->Close() == E_INVALIDARG);
+        // A DISPATCH_MESH command signature (D3D12_DISPATCH_MESH_ARGUMENTS, 12 bytes) is created; a stride below its
+        // 12 bytes is refused as the PC runtime refuses it. ExecuteIndirect with it records nothing yet (#3777 replays
+        // it), so the list still closes.
+        {
+            const D3D12_INDIRECT_ARGUMENT_DESC mesh_arg{D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH};
+            const D3D12_COMMAND_SIGNATURE_DESC mesh_sig{12, 1, &mesh_arg, 0};
+            const D3D12_COMMAND_SIGNATURE_DESC short_sig{8, 1, &mesh_arg, 0};
+            Ref<ID3D12CommandSignature> sig, short_one;
+            EXPECT(SUCCEEDED(device->CreateCommandSignature(&mesh_sig, nullptr, IID_PPV_ARGS(&sig.p))) && sig.p);
+            EXPECT(device->CreateCommandSignature(&short_sig, nullptr, IID_PPV_ARGS(&short_one.p)) == E_INVALIDARG);
+            EXPECT(SUCCEEDED(list->Reset(allocator.p, mesh_pso.p)));
+            list->SetGraphicsRootSignature(root.p);
+            list->ExecuteIndirect(sig.p, 1, upload.p, 0, nullptr, 0);
+            EXPECT(list->Close() == S_OK);
+        }
         EXPECT(SUCCEEDED(queue->Signal(fence.p, 2)) && SUCCEEDED(fence->SetEventOnCompletion(2, nullptr)));
 
         // D3D-291: pipeline statistics around mesh draws. Query 0 holds a vertex draw, two mesh draws and another
