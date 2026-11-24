@@ -2593,7 +2593,9 @@ private:
         }
         replay.bindless_set = context_.bindless_current_ ? context_.bindless_current_() : VK_NULL_HANDLE;
         const bool bindless_uploaded = std::exchange(context_.bindless_upload_pending_, false);
-        auto next_tracker = context_.tracker_;
+        // Changed in place, under tracker_mutex_ until this submission is in the queue or taken back.
+        LayoutTracker& next_tracker = context_.tracker_;
+        next_tracker.begin();
         // Bindless images that may already be visible to shaders are initialized on a submission that runs shaders.
         // initialize() zeroes committed storage images and only transitions sparse images.
         bool runs_shaders = false;
@@ -2714,13 +2716,14 @@ private:
             wait_values_.pop_back();
         }
         if (submitted) {
-            context_.tracker_ = std::move(next_tracker);
+            next_tracker.commit();
             slot->predicate = std::move(batch);
             slot->predicated_copy = std::move(copy_batch);
             slot->counted_dispatch = std::move(counted_batch);
             queries.commit();
             slot->segments = std::move(queries.retained);
         } else {
+            next_tracker.rollback();
             discard();
         }
         if (depth24_guard.active) {

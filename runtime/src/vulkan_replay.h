@@ -47,6 +47,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <optional>
 #include <type_traits>
 #include <unordered_map>
 #include <utility>
@@ -626,10 +627,35 @@ public:
         Entry entry{resource.mip_levels, resource.array_layers, two_planes(resource) ? 2u : 1u,
                     separate_ && two_planes(resource), {}};
         entry.layouts.assign(std::size_t(entry.mips) * entry.layers * (entry.two_planes ? 2 : 1), layout);
+        note(id);
         entries_[id] = std::move(entry);
     }
 
-    void forget(ResourceId id) { entries_.erase(id); }
+    void forget(ResourceId id) {
+        note(id);
+        entries_.erase(id);
+    }
+
+    // A submission changes the tracker in place and takes its changes back when it does not reach the queue: begin()
+    // starts noting what each changed image had, rollback() puts that back, commit() keeps the changes. (A copy of the
+    // tracker for every submission cost an allocation per tracked image: with thousands of streamed textures it took
+    // most of the submitting thread.)
+    void begin() {
+        undo_.clear();
+        noting_ = true;
+    }
+    void commit() {
+        undo_.clear();
+        noting_ = false;
+    }
+    void rollback() {
+        noting_ = false;
+        for (auto& [id, before] : undo_) {
+            if (before) entries_[id] = std::move(*before);
+            else entries_.erase(id);
+        }
+        undo_.clear();
+    }
     bool tracked(ResourceId id) const { return entries_.count(id) != 0; }
 
     // Current layout of one D3D12 subresource; UNDEFINED when the resource or index is unknown.
@@ -672,6 +698,7 @@ public:
     void set(ResourceId id, const VkImageSubresourceRange& range, VkImageLayout layout) {
         const auto it = entries_.find(id);
         if (it == entries_.end()) return;
+        note(id);
         Entry& e = it->second;
         visit(e, range, [&](std::size_t index, VkImageAspectFlags, std::uint32_t, std::uint32_t) {
             e.layouts[index] = layout;
@@ -706,8 +733,17 @@ private:
         }
     }
 
+    // Between begin() and commit() or rollback(): keeps what `id` had before its first change (nothing: untracked).
+    void note(ResourceId id) {
+        if (!noting_ || undo_.count(id)) return;
+        const auto it = entries_.find(id);
+        undo_.emplace(id, it == entries_.end() ? std::optional<Entry>{} : std::optional<Entry>{it->second});
+    }
+
     bool separate_;
     std::unordered_map<ResourceId, Entry> entries_;
+    std::unordered_map<ResourceId, std::optional<Entry>> undo_;
+    bool noting_ = false;
 };
 
 // Each physical slot records one non-overlapping interval. Logical queries can share slots.

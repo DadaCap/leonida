@@ -170,6 +170,29 @@ int main() {
         }
     }
 
+    // A submission that does not reach the queue takes its changes back; one that does keeps them.
+    {
+        constexpr ResourceId other = 2;
+        const VkImageSubresourceRange mip1{VK_IMAGE_ASPECT_COLOR_BIT, 1, 1, 0, 1};
+        const VkImageLayout mip0 = tracker.layout(id, 0), was = tracker.layout(id, 1);
+        tracker.begin();
+        tracker.set(id, mip1, transfer_src);
+        tracker.set(id, mip1, transfer_dst);  // the second change of an image keeps what the first one noted
+        tracker.track(other, image, shader_read);
+        tracker.rollback();
+        expect(tracker.layout(id, 1) == was && tracker.layout(id, 0) == mip0, "rollback puts a changed layout back");
+        expect(!tracker.tracked(other), "rollback forgets an image tracked since begin");
+        tracker.begin();
+        tracker.forget(id);
+        tracker.rollback();
+        expect(tracker.tracked(id) && tracker.layout(id, 1) == was, "rollback brings back a forgotten image");
+        tracker.begin();
+        tracker.set(id, mip1, transfer_src);
+        tracker.commit();
+        tracker.rollback();  // nothing noted: no change
+        expect(tracker.layout(id, 1) == transfer_src && tracker.layout(id, 0) == mip0, "commit keeps the change");
+    }
+
     if (failures) return 1;
     std::printf("replay_texture_barrier_test: OK\n");
     return 0;
