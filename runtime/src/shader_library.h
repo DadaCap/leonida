@@ -246,7 +246,7 @@ inline ZlibError inflate_codes(BitReader& in, std::vector<std::uint8_t>& out, co
         if (d < 0 || d >= 30) return ZlibError::data;
         const std::size_t distance = std::size_t(distance_base[d]) + in.bits(distance_extra[d]);
         if (in.failed() || distance > out.size()) return ZlibError::data;
-        if (out.size() + length > limit) return ZlibError::limit;
+        if (out.size() > limit || length > limit - out.size()) return ZlibError::limit;
         const std::size_t from = out.size() - distance;
         for (std::size_t i = 0; i < length; ++i) out.push_back(out[from + i]);
     }
@@ -284,7 +284,7 @@ inline bool zlib_inflate(std::span<const std::uint8_t> in, std::vector<std::uint
                 if (!reader.byte(x)) return fail(ZlibError::data);
             const unsigned length = b[0] | (b[1] << 8), complement = b[2] | (b[3] << 8);
             if (length != (~complement & 0xffff)) return fail(ZlibError::data);
-            if (out.size() + length > limit) return fail(ZlibError::limit);
+            if (out.size() > limit || length > limit - out.size()) return fail(ZlibError::limit);
             for (unsigned i = 0; i < length; ++i) {
                 std::uint8_t x;
                 if (!reader.byte(x)) return fail(ZlibError::data);
@@ -349,7 +349,7 @@ inline bool zlib_inflate(std::span<const std::uint8_t> in, std::vector<std::uint
     }
     // Adler-32, big-endian, after the deflate data's last whole byte.
     const std::size_t at = 2 + reader.position();
-    if (at + 4 > in.size()) return fail(ZlibError::data);
+    if (at > in.size() || in.size() - at < 4) return fail(ZlibError::data);
     std::uint32_t a = 1, b = 0;
     for (const std::uint8_t x : out) {
         a = (a + x) % 65521;
@@ -827,6 +827,9 @@ struct ShaderEntry {
     // subgroup size. Empty for a native translation.
     std::string wave64_exchange;
     bool emulated() const { return wave64_exchange == "workgroup"; }
+    // Mesh shaders: the index's "root_window" is {"sgpr": 16, "dword": 8}, so the module reads its root arguments
+    // from the graphics window (push dword 8 = root dword 0, D3D-448 follow-up). False for one translated before it.
+    bool graphics_root_window = false;
     std::vector<SignatureElement> input_signature;  // vertex shaders: what the input layout must feed
     std::vector<std::uint32_t> inputs;              // pixel shaders: input locations declared
     std::vector<std::uint32_t> outputs;             // pixel/vertex shaders: output locations written
@@ -1032,6 +1035,12 @@ private:
                 e.subgroup_size = u32(g);
             if (const Json* x = meta.find("wave64_exchange"); x && x->kind == Json::Kind::string)
                 e.wave64_exchange = x->string;
+            if (const Json* r = meta.find("root_window"); r && r->kind == Json::Kind::object) {
+                const Json* sgpr = r->find("sgpr");
+                const Json* dword = r->find("dword");
+                e.graphics_root_window = sgpr && dword && sgpr->kind == Json::Kind::number &&
+                                         dword->kind == Json::Kind::number && u32(sgpr) == 16 && u32(dword) == 8;
+            }
             if (const Json* s = meta.find("input_signature"); s && s->kind == Json::Kind::array) {
                 for (const Json& item : s->array) {
                     SignatureElement element;
@@ -1051,9 +1060,20 @@ private:
             if (const Json* fh = meta.find("f16_halves"); fh && fh->kind == Json::Kind::object) {
                 for (const auto& [key, val] : fh->object) {
                     if (key.empty() || val.kind != Json::Kind::array || val.array.size() != 2) continue;
-                    char* end = nullptr;
-                    const unsigned long param = std::strtoul(key.c_str(), &end, 10);
-                    if (!end || *end != '\0') continue;
+                    std::uint64_t param = 0;
+                    bool ok = true;
+                    for (const char c : key) {
+                        if (c < '0' || c > '9') {
+                            ok = false;
+                            break;
+                        }
+                        param = param * 10u + std::uint64_t(c - '0');
+                        if (param > UINT32_MAX) {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if (!ok) continue;
                     e.f16_halves[std::uint32_t(param)] = {u32(&val.array[0]), u32(&val.array[1])};
                 }
             }

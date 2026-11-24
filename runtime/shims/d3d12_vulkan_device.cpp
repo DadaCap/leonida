@@ -44,6 +44,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
+#include <deque>
 #include <bit>
 #include <cctype>
 #include <climits>
@@ -2088,15 +2090,18 @@ public:
         const auto title = reinterpret_cast<std::uint64_t>(address);
         if (const std::uint64_t arena = arena_va(title); arena != title && desc_.Width) {
             // Already in the arena: a range of its buffer, whose VA a shader reaches. The address stays the title's.
-            if (desc_.Width > device_.arena.size - arena) return E_INVALIDARG;
+            const bool paged = arena >= g_paged_window.va.load() && g_paged_window.va.load() &&
+                               arena - g_paged_window.va.load() < g_paged_window.size.load();
+            const VkDeviceSize inside = paged ? arena - g_paged_window.va.load() : arena;
+            if (desc_.Width > (paged ? g_paged_window.size.load() : device_.arena.size) - inside) return E_INVALIDARG;
             va_ = title;
             mapped_ = address;
             leonida::ResourceBinding binding{};
-            binding.buffer = device_.arena.buffer;
-            binding.buffer_offset = arena;
+            binding.buffer = paged ? reinterpret_cast<VkBuffer>(g_paged_window.buffer) : device_.arena.buffer;
+            binding.buffer_offset = inside;
             binding.size = desc_.Width;
-            binding.host = static_cast<const std::uint8_t*>(address);
-            binding.host_readable = true;
+            binding.host = paged ? nullptr : static_cast<const std::uint8_t*>(address);  // its pages come and go
+            binding.host_readable = !paged;
             binding.va = arena;
             device_.context->add_resource(id(), binding);
             static std::atomic<bool> logged{false};
@@ -2309,7 +2314,7 @@ public:
         return S_OK;
     }
 
-    HRESULT create_texture(const Format& format, const std::vector<VkFormat>& castable = {}) {
+    HRESULT create_texture(const Format& format, std::vector<VkFormat> castable = {}) {
         auto& vk = device_.context->vk;
         const bool volume = desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
         const UINT depth = volume ? desc_.DepthOrArraySize : 1;
@@ -2317,6 +2322,14 @@ public:
         if (desc_.MipLevels == 0) desc_.MipLevels = full_mips(desc_.Width, desc_.Height, depth);
         TextureCreateInfo create(desc_, format, device_.color_attachment_usable(format.format));
         VkImageCreateInfo& info = create.info;
+        // The console views an RGBA8 render target in UNORM and in sRGB without a castable list (the title's movie).
+        std::vector<VkFormat> console_casts;
+        if (castable.empty() && !format.uint_backed && g_title_window.base.load(std::memory_order_relaxed) &&
+            (desc_.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) &&
+            (desc_.Format == DXGI_FORMAT_R8G8B8A8_UNORM || desc_.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB)) {
+            console_casts = {VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_SRGB};
+            castable = console_casts;
+        }
         if (!castable.empty()) {
             // D3D12 always allows a view in the resource's own format, whether or not the castable list names
             // it. Vulkan requires every view format to be in the image's format list, so add it when missing.
@@ -2476,6 +2489,7 @@ public:
                     if (r->title_uploaded_) t.dirty.insert(r);  // not uploaded yet: its first view will
     }
     static void refresh_title_textures() {
+        if (rt::xmem::gpu_window_flush) rt::xmem::gpu_window_flush();
         TitleTextures& t = title_textures();
         const std::lock_guard lock(t.mutex);
         // Linear planes are written by the title's CPU with no call that says so: look at a sample of the bytes.
@@ -2516,7 +2530,23 @@ public:
             rt::xg::LinearSubresource linear;
             if (!rt::xg::detile_fn(&title_desc_, title_memory_, i, linear)) {
                 log_once("a title-placed texture's layout or memory cannot be read; format", int(desc_.Format));
-                return;
+                static std::atomic<int> left{400};
+                if (leonida::GpuDebug::wanted() && once && left-- > 0)
+                    std::fprintf(stderr, "[tex] unread %p %llux%ux%u mips %u format %d layout %x sub %u bytes %llx region %d paged %d\n", title_memory_,
+                                 (unsigned long long)desc_.Width, desc_.Height, unsigned(desc_.DepthOrArraySize), unsigned(binding_.mip_levels), int(desc_.Format),
+                                 unsigned(title_desc_.Layout), i, (unsigned long long)title_bytes_, int(rt::xmem::in_gpu_region(title_memory_, 1)),
+                                 int(reinterpret_cast<std::uint64_t>(title_memory_) - g_paged_window.base.load() < g_paged_window.size.load()));
+                continue;
+            }
+            if (leonida::GpuDebug::wanted() && i == 0 && desc_.Width >= 1024) {
+                static std::atomic<int> left{900};
+                std::size_t set = 0, seen = 0, sum = 0, top = 0;
+                for (std::size_t k = 0; k < linear.bytes.size(); k += 997, ++seen) set += linear.bytes[k] != std::byte{0}, sum += std::size_t(linear.bytes[k]), top = std::max(top, std::size_t(linear.bytes[k]));
+                static std::atomic<int> bright{0};
+                if (desc_.Width == 3840 && sum / seen > 60 && ++bright == 20) leonida::gpu_debug().dump_now = true;
+                if (left-- > 0)
+                    std::fprintf(stderr, "[tex] upload %p %llux%u format %d layout %x once %d nonzero %zu of %zu mean %zu max %zu\n", title_memory_, (unsigned long long)desc_.Width,
+                                 desc_.Height, int(desc_.Format), unsigned(title_desc_.Layout), int(once), set, seen, sum / seen, top);
             }
             if (FAILED(cpu_copy(true, i, nullptr, linear.bytes.data(), linear.row_pitch, linear.depth_pitch))) {
                 log_once("a title-placed texture's pixels could not be uploaded; format", int(desc_.Format));
@@ -3808,6 +3838,15 @@ public:
                     std::fprintf(stderr, "[rt] d3d12: %s\n", refusal.c_str());
                     return E_NOTIMPL;
                 }
+                // The graphics bind point lays root arguments out from push dword 8, which a mesh shader reads from
+                // its s16 only when translated with the graphics root window (index "root_window", D3D-448).
+                if (!stage.entry->graphics_root_window) {
+                    std::fprintf(stderr,
+                                 "[rt] d3d12: mesh shader %s was translated before the graphics root window; translate "
+                                 "the shaders again (make_game.py --stages shaders)\n",
+                                 stage.entry->name.c_str());
+                    return E_INVALIDARG;
+                }
             }
             if (stage.entry->uses_code_base) {
                 if (code_stage) {
@@ -3901,6 +3940,12 @@ public:
             if (!(rect_list && &stage == &vs_stage)) stage.words = {};  // a lazy stage reads its words again at build time; an eager one has its module
             subgroup_size_for(*stage.entry, required_sizes[stage_infos.size()], info);
             stage_infos.push_back(info);
+        }
+        if (leonida::GpuDebug::wanted()) {
+            leonida::GpuDebug& debug = leonida::gpu_debug();
+            const std::lock_guard lock(debug.mutex);
+            if (const std::uint64_t base = g_title_window.base.load()) debug.arena = reinterpret_cast<const std::uint8_t*>(base), debug.arena_bytes = g_title_window.size.load();
+            debug.names[id()] = (vs_stage.entry ? vs_stage.entry->name : std::string("-")) + " / " + (ps_stage.entry ? ps_stage.entry->name : std::string("-"));
         }
         if (rect_list) {  // the stage that adds each rectangle's fourth corner, from the vertex shader's outputs
             std::string why;
@@ -4249,6 +4294,10 @@ public:
             if (!graphics_.pipeline) return E_FAIL;
         }
         graphics_.variant = [this](std::uint32_t unbound) { return variant(unbound); };
+        if (lazy_pso()) graphics_.pending = [this](std::uint32_t unbound) {
+            std::lock_guard lock(variants_mutex_);
+            return building_.count(unbound) != 0;
+        };
 
         if (code_stage) {
             VkDeviceSize offset = 0;
@@ -4367,7 +4416,13 @@ public:
         if (lazy_pso()) {
             // Compiled by the first dispatch that uses it (ComputePipeline::build in replay), as graphics PSOs are.
             compute_entry_ = std::make_unique<leonida::ShaderEntry>(*entry);
+            if (leonida::GpuDebug::wanted()) { leonida::GpuDebug& debug = leonida::gpu_debug(); const std::lock_guard lock(debug.mutex); debug.names[id()] = entry->name; }
             pipeline_.build = [this] { return lazy_compute(); };
+            pipeline_.pending = [this] {
+                std::lock_guard lock(variants_mutex_);
+                return compute_posted_;
+            };
+            post_compute(false);
         } else {
             pipeline_.pipeline = compile_compute(module_);
             if (!pipeline_.pipeline) return E_FAIL;
@@ -4452,21 +4507,59 @@ private:
 
     // LEONIDA_LAZY_PSO: the compute pipeline, compiled by the first dispatch (from any queue) and kept until the PSO
     // is released. Its module lives only for the compile.
+    // It starts compiling on a background thread when it is created; a dispatch that comes first waits a little for it
+    // and is left out when that was not enough (the title gives up on a thread that stands still for 30 s).
     VkPipeline lazy_compute() {
-        std::lock_guard lock(variants_mutex_);
-        if (lazy_compute_ || lazy_compute_failed_ || !compute_entry_) return lazy_compute_;
-        const leonida::ShaderLibrary* library = device_.library();
-        const VkShaderModule module = library ? make_module(library->spirv(*compute_entry_)) : VK_NULL_HANDLE;
-        if (module) {
-            lazy_compute_ = compile_compute(module);
-            device_.context->vk.vkDestroyShaderModule(device_.info.device, module, nullptr);
-        }
-        if (!lazy_compute_) {
-            lazy_compute_failed_ = true;
-            std::fprintf(stderr, "[rt] d3d12: compute pipeline %s could not be built at its first dispatch\n",
-                         compute_entry_->name.c_str());
+        std::unique_lock lock(variants_mutex_);
+        if (!compute_entry_ || lazy_compute_ || lazy_compute_failed_) return lazy_compute_;
+        if (!compute_waited_) {
+            compute_waited_ = true;
+            lock.unlock();
+            post_compute(true);
+            lock.lock();
+            if (compile_pool().idle()) built_.wait_for(lock, std::chrono::milliseconds(1000), [&] { return lazy_compute_ || lazy_compute_failed_; });
+            if (!lazy_compute_ && !lazy_compute_failed_)
+                std::fprintf(stderr, "[rt] d3d12: dispatches of %s are left out until it is compiled\n", compute_entry_->name.c_str());
         }
         return lazy_compute_;
+    }
+
+    void post_compute(bool urgent) {
+        {
+            const std::lock_guard lock(variants_mutex_);
+            compute_posted_ = true;
+        }
+        AddRef();
+        compile_pool().post([this] {
+            bool mine = false;
+            {
+                const std::lock_guard lock(variants_mutex_);
+                mine = !compute_running_;
+                compute_running_ = true;
+            }
+            if (mine) {
+                const leonida::ShaderLibrary* library = device_.library();
+                const VkShaderModule module = library ? make_module(library->spirv(*compute_entry_)) : VK_NULL_HANDLE;
+                VkPipeline pipeline = VK_NULL_HANDLE;
+                const auto start = std::chrono::steady_clock::now();
+                if (module) {
+                    pipeline = compile_compute(module);
+                    device_.context->vk.vkDestroyShaderModule(device_.info.device, module, nullptr);
+                }
+                const double took = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+                if (took > 10) std::fprintf(stderr, "[rt] d3d12: compiling %s took %.1f s\n", compute_entry_->name.c_str(), took);
+                if (!pipeline)
+                    std::fprintf(stderr, "[rt] d3d12: compute pipeline %s could not be built\n", compute_entry_->name.c_str());
+                {
+                    const std::lock_guard lock(variants_mutex_);
+                    lazy_compute_ = pipeline;
+                    lazy_compute_failed_ = !pipeline;
+                    compute_posted_ = false;
+                }
+                built_.notify_all();
+            }
+            Release();
+        }, urgent);
     }
 
     // The graphics pipeline with the formats of the `unbound` slots (leonida::GraphicsPipeline::variant) undefined.
@@ -4579,16 +4672,87 @@ private:
     }
 
     // Built on first use and kept until the PSO is released (replay may call this from any queue).
+    // With LEONIDA_LAZY_PSO it is compiled on a background thread and null until then (a world frame needs hundreds of
+    // pipelines, some 10 s each, and the title gives up on a thread that waits 30 s); a quick one is waited for.
     VkPipeline variant(std::uint32_t unbound) {
-        std::lock_guard lock(variants_mutex_);
+        std::unique_lock lock(variants_mutex_);
         if (const auto it = variants_.find(unbound); it != variants_.end()) return it->second;
-        const VkPipeline pipeline = build(unbound);
-        if (!pipeline) {
-            log_once("a pipeline variant for unbound attachment slots could not be built; slots", int(unbound));
-            return VK_NULL_HANDLE;
+        if (!lazy_pso()) return variants_[unbound] = build(unbound);
+        if (building_.insert(unbound).second) {
+            AddRef();
+            compile_pool().post([this, unbound] {
+                const auto start = std::chrono::steady_clock::now();
+                const VkPipeline pipeline = build(unbound);
+                const double took = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+                if (took > 6 && leonida::GpuDebug::wanted()) {
+                    leonida::GpuDebug& debug = leonida::gpu_debug();
+                    const std::lock_guard names(debug.mutex);
+                    std::fprintf(stderr, "[pso] %s took %.1f s\n", debug.names[id()].c_str(), took);
+                }
+                if (!pipeline) log_once("a graphics pipeline could not be built; unbound slots", int(unbound));
+                {
+                    const std::lock_guard built(variants_mutex_);
+                    variants_[unbound] = pipeline;
+                    building_.erase(unbound);
+                }
+                built_.notify_all();
+                Release();
+            });
+            if (compile_pool().idle()) built_.wait_for(lock, std::chrono::milliseconds(8), [&] { return variants_.count(unbound) != 0; });
         }
-        variants_.emplace(unbound, pipeline);
-        return pipeline;
+        const auto it = variants_.find(unbound);
+        return it == variants_.end() ? VK_NULL_HANDLE : it->second;
+    }
+
+    struct CompilePool {
+        std::mutex mutex;
+        std::condition_variable wake;
+        std::deque<std::function<void()>> tasks, later;
+        std::uint64_t warmed = 0;
+        unsigned warming = 0, limit = std::max(1u, std::thread::hardware_concurrency() / 6);  // threads for `later`
+        std::atomic<int> open{0};  // posted and not finished
+        bool idle() const { return open.load() < 3; }
+        CompilePool() {
+            for (unsigned i = 0, n = std::max(4u, std::thread::hardware_concurrency() * 3 / 4); i < n; ++i)
+                std::thread([this] {
+                    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+                    for (;;) {
+                        std::function<void()> task;
+                        bool urgent = false;
+                        {
+                            std::unique_lock lock(mutex);
+                            wake.wait(lock, [&] { return !tasks.empty() || (!later.empty() && warming < limit); });
+                            urgent = !tasks.empty();
+                            auto& from = urgent ? tasks : later;
+                            if (!urgent) ++warming;
+                            task = std::move(from.front());
+                            from.pop_front();
+                        }
+                        task();
+                        if (urgent) {
+                            --open;
+                        } else {
+                            const std::lock_guard lock(mutex);
+                            --warming;
+                            ++warmed;
+                            if (later.empty() && !warming)
+                                std::fprintf(stderr, "[rt] d3d12: %llu compute pipelines compiled ahead\n", (unsigned long long)warmed);
+                        }
+                    }
+                }).detach();
+        }
+        void post(std::function<void()> task, bool urgent = true) {
+            {
+                const std::lock_guard lock(mutex);
+                (urgent ? tasks : later).push_back(std::move(task));
+                if (urgent) ++open;
+            }
+            wake.notify_one();
+        }
+    };
+    static CompilePool& compile_pool() {
+        static auto* pool = new CompilePool;  // its threads outlive the device
+        return *pool;
     }
 
     DeviceState& device_;
@@ -4597,9 +4761,11 @@ private:
     Recipe recipe_;
     std::mutex variants_mutex_;
     std::map<std::uint32_t, VkPipeline> variants_;
+    std::set<std::uint32_t> building_;
+    std::condition_variable built_;
     std::unique_ptr<leonida::ShaderEntry> compute_entry_;  // LEONIDA_LAZY_PSO: what the first dispatch compiles
     VkPipeline lazy_compute_ = VK_NULL_HANDLE;
-    bool lazy_compute_failed_ = false;
+    bool lazy_compute_failed_ = false, compute_posted_ = false, compute_running_ = false, compute_waited_ = false;
     leonida::SubgroupRequest compute_subgroup_{};  // decided at creation, applied by compile_compute
     VkShaderModule module_ = VK_NULL_HANDLE;
     std::vector<VkShaderModule> modules_;
@@ -5422,6 +5588,7 @@ public:
         // standalone device gta6rt --run uses both come through here (found in review: registering only in
         // create_vulkan_device left the retail path without it).
         rt::d3d12_xs::set_placed_at_va_handler(&create_buffer_at_host_address);
+        rt::d3d12_xs::set_raw_buffer_view_handler(&Device::raw_buffer_view);
         rt::d3d12_xs::set_console_descriptor_heap_handler(&rt::d3d12::create_console_descriptor_heap);
         state_.info = info;
         queue_users_.resize(info.command_queues.size(), 0);
@@ -5537,6 +5704,9 @@ public:
                                                                       info.buffer_device_address);
         set_up_value_writes();
         state_.context->mesh_queries = info.mesh_shader_queries;
+        state_.context->configure_indirect_draw(info.features.multiDrawIndirect == VK_TRUE,
+                                                info.draw_indirect_count);
+        state_.context->set_depth_range_unrestricted(info.depth_range_unrestricted);
         if (info.physical && state_.format_properties) {
             state_.context->set_color_attachment_format(
                 [physical = info.physical, get_props = state_.format_properties](VkFormat format) {
@@ -5669,6 +5839,7 @@ public:
                     state_.sparse_buffer_memory_types = requirements.memoryTypeBits;
             }
         }
+        create_paged_window();
     }
 
     // Set 0 of every translated shader that declares bindings: images, samplers and the descriptor hash table
@@ -5907,12 +6078,254 @@ public:
             return false;
         }
         finish_arena(region.base, region.size, region.layer_bytes);
-        state_.context->set_title_memory(arena.buffer, region.layer_bytes, region.size);
+        state_.context->set_title_memory(arena.buffer, region.layer_bytes, region.size,
+                                          reinterpret_cast<std::uint64_t>(region.base));
         g_title_window.size = region.size;
         g_title_window.base = reinterpret_cast<std::uint64_t>(region.base);
         std::fprintf(stderr, "[rt] d3d12: the GPU address arena is the title's %llu MiB region, imported (memory type %u)\n",
                      static_cast<unsigned long long>(region.size >> 20), arena.memory_type);
         return true;
+    }
+
+    // The title's paged window (rt::xmem::gpu_window_start) as a sparse buffer, so that a shader reaches the physical
+    // pages mapped there. Sparse buffers take device memory only (NVIDIA), so each such page has a copy in device
+    // memory, made when it is mapped and again when something other than the title's CPU writes it.
+    // shortcut: what the title's CPU writes to a page while it is mapped on both sides reaches the GPU when the CPU
+    // unmaps it, and what the GPU writes never reaches the CPU; needs real aliasing.
+    struct PagedWindowBinder {
+        struct Slot {
+            VkDeviceMemory memory = VK_NULL_HANDLE;
+            VkDeviceSize offset = 0;
+            unsigned uses = 0;
+        };
+        struct Source {
+            VkDeviceMemory memory = VK_NULL_HANDLE;
+            VkBuffer buffer = VK_NULL_HANDLE;
+        };
+        DeviceState* state = nullptr;
+        PFN_vkGetMemoryHostPointerPropertiesEXT host_properties = nullptr;
+        VkBuffer buffer = VK_NULL_HANDLE;
+        VkQueue queue = VK_NULL_HANDLE;
+        std::uint32_t memory_type = 0;
+        VkFence fence = VK_NULL_HANDLE;
+        VkCommandPool pool = VK_NULL_HANDLE;
+        VkCommandBuffer commands = VK_NULL_HANDLE;
+        std::mutex mutex;
+        std::unordered_map<void*, Source> sources;                   // by section
+        std::unordered_map<std::uintptr_t, Slot> slots;              // by the page's host address in its section
+        std::unordered_map<std::uintptr_t, std::uintptr_t> bound;    // window address -> that host address
+        std::vector<std::pair<VkDeviceMemory, VkDeviceSize>> free;   // 64 KiB pieces
+    };
+    static PagedWindowBinder& paged_binder() {
+        static auto* b = new PagedWindowBinder;
+        return *b;
+    }
+    // A buffer over a section's host memory, to copy its pages from.
+    static VkBuffer page_source(PagedWindowBinder& b, void* section, std::size_t bytes) {
+        const auto known = b.sources.find(section);
+        if (known != b.sources.end()) return known->second.buffer;
+        auto& vk = b.state->context->vk;
+        const VkDevice device = b.state->info.device;
+        PagedWindowBinder::Source source;
+        VkExternalMemoryBufferCreateInfo external{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
+        external.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+        VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, &external};
+        info.size = bytes;
+        info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+        b.state->share(info);
+        VkMemoryHostPointerPropertiesEXT host{VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
+        VkResult made = vk.vkCreateBuffer(device, &info, nullptr, &source.buffer);
+        if (made == VK_SUCCESS)
+            made = b.host_properties(device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, section, &host);
+        VkMemoryRequirements requirements{};
+        if (made == VK_SUCCESS) vk.vkGetBufferMemoryRequirements(device, source.buffer, &requirements);
+        const std::uint32_t types = host.memoryTypeBits & requirements.memoryTypeBits;
+        for (std::uint32_t i = 0; made == VK_SUCCESS && i < b.state->memory.memoryTypeCount && !source.memory; ++i) {
+            if (!(types & (1u << i))) continue;
+            VkImportMemoryHostPointerInfoEXT import{VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT};
+            import.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+            import.pHostPointer = section;
+            VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &import};
+            allocate.allocationSize = bytes;
+            allocate.memoryTypeIndex = i;
+            if (vk.vkAllocateMemory(device, &allocate, nullptr, &source.memory) != VK_SUCCESS) source.memory = VK_NULL_HANDLE;
+        }
+        if (!source.memory || vk.vkBindBufferMemory(device, source.buffer, source.memory, 0) != VK_SUCCESS) {
+            log_once("the title's physical pages could not be imported; VkResult", int(made));
+            if (source.buffer) vk.vkDestroyBuffer(device, source.buffer, nullptr);
+            source.buffer = VK_NULL_HANDLE;
+        }
+        b.sources[section] = source;
+        return source.buffer;
+    }
+    static PagedWindowBinder::Slot* page_slot(PagedWindowBinder& b, std::uintptr_t host) {
+        auto& slot = b.slots[host];
+        if (slot.memory) return &slot;
+        if (b.free.empty()) {
+            constexpr VkDeviceSize chunk = VkDeviceSize{64} << 20;
+            VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
+            flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+            VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &flags};
+            allocate.allocationSize = chunk;
+            allocate.memoryTypeIndex = b.memory_type;
+            VkDeviceMemory memory = VK_NULL_HANDLE;
+            if (b.state->context->vk.vkAllocateMemory(b.state->info.device, &allocate, nullptr, &memory) != VK_SUCCESS) {
+                log_once("no device memory left for the title's paged window; MiB in use", int(b.slots.size() / 16));
+                b.slots.erase(host);
+                return nullptr;
+            }
+            for (VkDeviceSize at = chunk; at;) b.free.emplace_back(memory, at -= 65536);
+        }
+        slot.memory = b.free.back().first;
+        slot.offset = b.free.back().second;
+        b.free.pop_back();
+        return &slot;
+    }
+    static bool finish_paged(PagedWindowBinder& b, VkResult submitted) {
+        auto& vk = b.state->context->vk;
+        if (submitted == VK_SUCCESS) submitted = vk.vkWaitForFences(b.state->info.device, 1, &b.fence, VK_TRUE, 4'000'000'000);
+        if (submitted == VK_SUCCESS) submitted = vk.vkResetFences(b.state->info.device, 1, &b.fence);
+        if (submitted != VK_SUCCESS) log_once("the title's paged window could not be updated; VkResult", int(submitted));
+        return submitted == VK_SUCCESS;
+    }
+    static void bind_paged_window(const rt::xmem::GpuWindowPage* pages, std::size_t count) {
+        auto& b = paged_binder();
+        const std::lock_guard lock(b.mutex);
+        if (!b.state || b.state->context->is_device_lost()) return;
+        auto& vk = b.state->context->vk;
+        std::vector<VkSparseMemoryBind> binds;
+        std::map<VkBuffer, std::vector<VkBufferCopy>> copies;
+        std::size_t copied = 0;
+        for (std::size_t i = 0; i < count; ++i) {
+            const VkDeviceSize at = pages[i].address - g_paged_window.base.load();
+            const std::uintptr_t host = pages[i].section ? reinterpret_cast<std::uintptr_t>(pages[i].section) + pages[i].offset : 0;
+            const auto was = b.bound.find(pages[i].address);
+            if (was == b.bound.end() ? host != 0 : was->second != host) {
+                PagedWindowBinder::Slot* const slot = host ? page_slot(b, host) : nullptr;
+                if (host && !slot) continue;
+                if (slot) ++slot->uses;
+                const VkDeviceMemory memory = slot ? slot->memory : VK_NULL_HANDLE;
+                const VkDeviceSize offset = slot ? slot->offset : 0;
+                if (was != b.bound.end()) {
+                    const auto old = b.slots.find(was->second);
+                    if (old != b.slots.end() && !--old->second.uses) {
+                        b.free.emplace_back(old->second.memory, old->second.offset);
+                        b.slots.erase(old);
+                    }
+                }
+                if (host) b.bound[pages[i].address] = host;
+                else b.bound.erase(pages[i].address);
+                if (!binds.empty() && binds.back().resourceOffset + binds.back().size == at && binds.back().memory == memory &&
+                    (!memory || binds.back().memoryOffset + binds.back().size == offset))
+                    binds.back().size += 65536;
+                else
+                    binds.push_back({at, 65536, memory, offset, 0});
+            }
+            if (!host) continue;
+            const VkBuffer source = page_source(b, pages[i].section, pages[i].section_bytes);
+            if (!source) continue;
+            auto& regions = copies[source];
+            ++copied;
+            if (!regions.empty() && regions.back().srcOffset + regions.back().size == pages[i].offset &&
+                regions.back().dstOffset + regions.back().size == at)
+                regions.back().size += 65536;
+            else
+                regions.push_back({pages[i].offset, at, 65536});
+        }
+        if (!binds.empty()) {
+            const VkSparseBufferMemoryBindInfo bind{b.buffer, std::uint32_t(binds.size()), binds.data()};
+            VkBindSparseInfo info{VK_STRUCTURE_TYPE_BIND_SPARSE_INFO};
+            info.bufferBindCount = 1;
+            info.pBufferBinds = &bind;
+            VkResult done;
+            {
+                const std::lock_guard submit(b.state->context->submit_mutex());
+                done = vk.vkQueueBindSparse(b.queue, 1, &info, b.fence);
+            }
+            if (!finish_paged(b, done)) return;
+        }
+        if (copied) {
+            VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+            begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+            vk.vkResetCommandBuffer(b.commands, 0);
+            vk.vkBeginCommandBuffer(b.commands, &begin);
+            for (const auto& [source, regions] : copies)
+                vk.vkCmdCopyBuffer(b.commands, source, b.buffer, std::uint32_t(regions.size()), regions.data());
+            vk.vkEndCommandBuffer(b.commands);
+            VkSubmitInfo submit_info{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+            submit_info.commandBufferCount = 1;
+            submit_info.pCommandBuffers = &b.commands;
+            VkResult done;
+            {
+                const std::lock_guard submit(b.state->context->submit_mutex());
+                done = vk.vkQueueSubmit(b.queue, 1, &submit_info, b.fence);
+            }
+            finish_paged(b, done);
+        }
+        static std::atomic<std::uint64_t> total{0}, calls{0};
+        total += copied;
+        if (const auto n = ++calls; n == 1 || n % 2000 == 0)
+            std::fprintf(stderr, "[rt] d3d12: paged window: %llu page uploads in %llu calls, %zu pages on the GPU, %zu mapped\n",
+                         (unsigned long long)total.load(), (unsigned long long)n, b.slots.size(), b.bound.size());
+    }
+    static void forget_section(void* section) {
+        auto& b = paged_binder();
+        const std::lock_guard lock(b.mutex);
+        const auto it = b.sources.find(section);
+        if (it == b.sources.end()) return;
+        if (b.state) {  // every copy from it has been waited for
+            if (it->second.buffer) b.state->context->vk.vkDestroyBuffer(b.state->info.device, it->second.buffer, nullptr);
+            if (it->second.memory) b.state->context->vk.vkFreeMemory(b.state->info.device, it->second.memory, nullptr);
+        }
+        b.sources.erase(it);
+    }
+    void create_paged_window() {
+        const std::uintptr_t start = rt::xmem::gpu_window_start.load();
+        const VkDeviceSize bytes = rt::xmem::gpu_window_end.load() - start;
+        if (!bytes || !state_.sparse_buffer_memory_types || !state_.arena.address) return;
+        auto& vk = state_.context->vk;
+        auto& b = paged_binder();
+        const auto device_proc = reinterpret_cast<PFN_vkGetDeviceProcAddr>(
+            state_.info.get_instance_proc(state_.info.instance, "vkGetDeviceProcAddr"));
+        b.host_properties = reinterpret_cast<PFN_vkGetMemoryHostPointerPropertiesEXT>(
+            device_proc(state_.info.device, "vkGetMemoryHostPointerPropertiesEXT"));
+        VkBufferCreateInfo info = state_.sparse_buffer_info(bytes);
+        VkFenceCreateInfo fence{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        VkBuffer buffer = VK_NULL_HANDLE;
+        const VkResult made = b.host_properties ? vk.vkCreateBuffer(state_.info.device, &info, nullptr, &buffer) : VK_ERROR_EXTENSION_NOT_PRESENT;
+        VkMemoryRequirements requirements{};
+        VkDeviceAddress address = 0;
+        if (made == VK_SUCCESS && vk.vkCreateFence(state_.info.device, &fence, nullptr, &b.fence) == VK_SUCCESS) {
+            vk.vkGetBufferMemoryRequirements(state_.info.device, buffer, &requirements);
+            VkBufferDeviceAddressInfo query{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+            query.buffer = buffer;
+            address = vk.vkGetBufferDeviceAddress(state_.info.device, &query);
+        }
+        std::fprintf(stderr, "[rt] d3d12: the title's %llu MiB paged window: VkResult %d, device address 0x%llx (arena 0x%llx), memory types 0x%x, alignment %llu\n",
+                     (unsigned long long)(bytes >> 20), int(made), (unsigned long long)address, (unsigned long long)state_.arena.address,
+                     requirements.memoryTypeBits, (unsigned long long)requirements.alignment);
+        if (!address || address <= state_.arena.address || 65536 % requirements.alignment) return;  // a V# cannot name an address below heap_base
+        const bool own = !state_.info.copy_queues.empty() && state_.info.copy_family != UINT32_MAX;
+        b.queue = own ? state_.info.copy_queues.front() : state_.info.queue;
+        VkCommandPoolCreateInfo pool{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+        pool.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+        pool.queueFamilyIndex = own ? state_.info.copy_family : state_.info.queue_family;
+        VkCommandBufferAllocateInfo commands{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        if (vk.vkCreateCommandPool(state_.info.device, &pool, nullptr, &b.pool) != VK_SUCCESS) return;
+        commands.commandPool = b.pool;
+        commands.commandBufferCount = 1;
+        if (vk.vkAllocateCommandBuffers(state_.info.device, &commands, &b.commands) != VK_SUCCESS) return;
+        while (b.memory_type < 31 && !(requirements.memoryTypeBits & (1u << b.memory_type))) ++b.memory_type;
+        b.state = &state_;
+        b.buffer = buffer;
+        g_paged_window.buffer = reinterpret_cast<std::uint64_t>(buffer);
+        g_paged_window.va = address - state_.arena.address;
+        g_paged_window.size = bytes;
+        g_paged_window.base = start;
+        state_.context->set_paged_window(buffer, address - state_.arena.address, bytes);
+        rt::xmem::gpu_section_gone_fn = &forget_section;
+        rt::xmem::gpu_window_fn = &bind_paged_window;
+        if (rt::xmem::gpu_window_flush) rt::xmem::gpu_window_flush();
     }
 
     bool create_arena() {
@@ -6381,8 +6794,8 @@ public:
         case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED: kind = leonida::IndirectKind::draw_indexed; break;
         case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH: kind = leonida::IndirectKind::dispatch; break;
         case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH:
-            // As DispatchMesh: only a device with mesh shaders (MeshShaderTier 1) takes it.
-            if (!state_.info.mesh_shader) return E_NOTIMPL;
+            if (desc->NumArgumentDescs != 1 || !state_.info.mesh_shader ||
+                !state_.context->vk.vkCmdDrawMeshTasksIndirectEXT) return E_NOTIMPL;
             kind = leonida::IndirectKind::dispatch_mesh;
             break;
         default: return E_NOTIMPL;
@@ -6570,48 +6983,79 @@ public:
             if (container_size != size) return E_INVALIDARG;
         }
         // The repository's root-signature model (runtime/src/root_signature.h): parse the RTS0 blob, then pack
-        // the parameters into the 32 user-data dwords. pack() refuses what it cannot place (more than 32 dwords:
-        // the console spills those to memory, in a layout that is still open), and so does this.
+        // the parameters into the 32 user-data dwords in the console layout. pack_stage() refuses what it cannot
+        // place (past s31: the console spills those to memory, in a layout that is still open), and so does this.
         const rt::rootsig::DecodeResult parsed = rt::rootsig::parse_rts0(bytes, size);
         if (!parsed.ok) {
             std::fprintf(stderr, "[rt] d3d12: root signature not understood: %s\n", parsed.error.c_str());
             return E_INVALIDARG;
         }
-        // Two layouts, one per bind point (RootArgumentLayout): graphics keeps pack(), compute takes the console
-        // layout pack_stage() measured (D3D-448). The signature is refused only when neither can place it.
-        const rt::rootsig::PackResult packed = rt::rootsig::pack(parsed.sig);
+        // One layout per bind point (RootArgumentLayout), both the console's (D3D-448): graphics from s8, where a
+        // vertex, pixel or geometry shader reads SGPR i from push dword i, and compute from s4. A mesh shader reads
+        // the same graphics window from its s16, so its 16-dword window only needs checking.
+        //
+        // A signature past the console's inline graphics window (24 dwords from s8) goes, on the console, to the
+        // argument block behind s[0:1], which is not modelled for graphics yet (ROOT-SIG-SPILL-MODEL does compute).
+        // Such a signature keeps pack()'s layout at the graphics bind point (from s0, two dwords per table), what
+        // the layer used before the console layout: refusing it instead stops the retail title at start-up (#974
+        // review, a 29..32-dword startup signature). The signature is refused only when no layout can place it.
+        const rt::rootsig::StagePackResult graphics = rt::rootsig::pack_stage(parsed.sig, rt::rootsig::Stage::Vertex);
+        const rt::rootsig::StagePackResult mesh = rt::rootsig::pack_stage(parsed.sig, rt::rootsig::Stage::Mesh);
         const rt::rootsig::StagePackResult compute = rt::rootsig::pack_stage(parsed.sig, rt::rootsig::Stage::Compute);
-        if (!packed.ok && !compute.ok) {
-            std::fprintf(stderr, "[rt] d3d12: root signature refused: %s (compute: %s)\n", packed.error.c_str(),
+        const rt::rootsig::PackResult fallback = graphics.ok ? rt::rootsig::PackResult{} : rt::rootsig::pack(parsed.sig);
+        const bool graphics_usable = graphics.ok || fallback.ok;
+        if (!graphics_usable && !compute.ok) {
+            std::fprintf(stderr, "[rt] d3d12: root signature refused: %s (compute: %s)\n", graphics.error.c_str(),
                          compute.error.c_str());
             return E_INVALIDARG;
         }
-        if (!packed.ok)
-            std::fprintf(stderr, "[rt] d3d12: root signature usable for compute only: %s\n", packed.error.c_str());
+        if (!graphics_usable)
+            std::fprintf(stderr, "[rt] d3d12: root signature usable for compute only: %s\n", graphics.error.c_str());
+        else if (!graphics.ok)
+            std::fprintf(stderr,
+                         "[rt] d3d12: root signature past the console's graphics window (%s): graphics keeps the PC "
+                         "layout from s0 until the argument block behind s[0:1] is modelled\n",
+                         graphics.error.c_str());
+        else if (!mesh.ok)
+            std::fprintf(stderr, "[rt] d3d12: root signature too large for a mesh shader's root window: %s\n",
+                         mesh.error.c_str());
         if (!compute.ok)
             std::fprintf(stderr, "[rt] d3d12: root signature usable for graphics only: %s\n", compute.error.c_str());
         RootArgumentLayout layout;
         layout.flags = parsed.sig.flags;
-        layout.graphics_ok = packed.ok;
+        layout.graphics_ok = graphics_usable;
+        layout.graphics_console = graphics.ok;
+        layout.mesh_ok = graphics.ok && mesh.ok;
         layout.compute_ok = compute.ok;
         for (std::size_t i = 0; i < parsed.sig.params.size(); ++i) {
-            std::uint32_t first = UINT32_MAX;
-            for (std::uint32_t d = 0; packed.ok && d < packed.dword_count; ++d)
-                if (packed.provenance[d].param_index == i) {
-                    first = d;
-                    break;
-                }
+            std::uint32_t first = rt::rootsig::kNoSgpr;
+            if (graphics.ok) {
+                first = graphics.first_sgpr[i];
+            } else if (fallback.ok) {
+                for (std::uint32_t d = 0; d < fallback.dword_count; ++d)
+                    if (fallback.provenance[d].param_index == i) {
+                        first = d;
+                        break;
+                    }
+            }
             layout.parameters.push_back({parsed.sig.params[i].type, first, parsed.sig.params[i].num_values,
                                          compute.ok ? compute.first_sgpr[i] : rt::rootsig::kNoSgpr});
         }
         register_static_samplers(parsed.sig);
-        if (g_title_window.base.load(std::memory_order_relaxed)) {
-            const rt::rootsig::StagePackResult vs = rt::rootsig::pack_stage(parsed.sig, rt::rootsig::Stage::Vertex);
-            if (vs.ok) {
-                for (std::size_t i = 0; i < layout.parameters.size(); ++i) layout.parameters[i].user_offset = vs.first_sgpr[i];
-                layout.graphics_ok = layout.graphics_stage = true;
+        const auto after = [&](auto first_of) {
+            std::uint32_t end = 0;
+            for (std::size_t i = 0; i < parsed.sig.params.size(); ++i) {
+                const std::uint32_t first = first_of(i);
+                const std::uint32_t size = parsed.sig.params[i].type == rt::rootsig::ParamType::Constants ? parsed.sig.params[i].num_values
+                                           : parsed.sig.params[i].type == rt::rootsig::ParamType::Table   ? 1u
+                                                                                                         : 2u;
+                if (first < 32) end = (std::max)(end, first + size);
             }
-        }
+            return end;
+        };
+        if (layout.compute_ok) layout.compute_heaps = (std::max)(after([&](std::size_t i) { return compute.first_sgpr[i]; }), 4u);
+        if (layout.graphics_ok && layout.graphics_console)
+            layout.graphics_heaps = (std::max)(after([&](std::size_t i) { return layout.parameters[i].user_offset; }), 8u);
         auto* signature = new RootSignature(
             std::move(layout), leonida::sha256_hex({static_cast<const std::uint8_t*>(blob), size}));
         signature->attach_device(identity());
@@ -6870,7 +7314,9 @@ public:
                                     (r && r->has_view_format_list() &&
                                      r->allows_view_format(vulkan_format(requested, false).format));
                 if (typeless_color || cast_listed ||
-                    (requested != rd.Format && listed && rd.Format == DXGI_FORMAT_R8G8B8A8_UNORM)) {
+                    (requested != rd.Format && listed &&
+                     (rd.Format == DXGI_FORMAT_R8G8B8A8_UNORM ||
+                      (rd.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB && g_title_window.base.load(std::memory_order_relaxed))))) {
                     const bool msaa = rd.SampleDesc.Count > 1;
                     const bool plain_1d = !msaa && desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE1D;
                     const bool array_1d = !msaa && desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE1DARRAY;
@@ -6913,6 +7359,13 @@ public:
                     view = {}; // No typed-resource format casting is advertised by this backend.
                 }
                 if (!view.resource) log_once("unsupported typeless or RGBA8 RTV format/subresource:", int(requested));
+                if (!view.resource && leonida::GpuDebug::wanted()) {
+                    static std::atomic<int> left{30};
+                    if (left-- > 0)
+                        std::fprintf(stderr, "[rtv] refused: resource format %d flags %x %llux%ux%u mips %u, asked %d dim %d mip %u list %d uint_backed %d title %d\n", int(rd.Format), unsigned(rd.Flags),
+                                     (unsigned long long)rd.Width, rd.Height, unsigned(rd.DepthOrArraySize), unsigned(rd.MipLevels), int(asked), desc ? int(desc->ViewDimension) : -1,
+                                     desc ? desc->Texture2D.MipSlice : 0, int(r && r->has_castable_formats()), r ? int(r->uint_backed()) : -1, int(r != nullptr));
+                }
             }
         } else if (resource) {
             stub("ID3D12Device::CreateRenderTargetView(resource from another device)");
@@ -7011,6 +7464,86 @@ public:
         std::memcpy(reinterpret_cast<void*>(destination.ptr), words.data(), sizeof(words));
     }
 
+    // The V# of a buffer shader-resource view over `width` bytes at `base_va`; the slot is already zeros.
+    static void write_buffer_srv(UINT64 width, UINT64 base_va, const D3D12_SHADER_RESOURCE_VIEW_DESC* desc,
+                                 D3D12_CPU_DESCRIPTOR_HANDLE destination) {
+        if (!desc) {
+            log_once("buffer SRV requires a description; width", int(width));
+            return;
+        }
+        if (desc->ViewDimension != D3D12_SRV_DIMENSION_BUFFER) {
+            log_once("shader-resource view dimension not supported for buffer:", desc->ViewDimension);
+            return;
+        }
+        if (!base_va || !desc->Buffer.NumElements || (desc->Buffer.Flags & ~D3D12_BUFFER_SRV_FLAG_RAW)) return;
+        leonida::gfx10::Buffer buffer{};
+        if (desc->Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW) {
+            if (desc->Format != DXGI_FORMAT_R32_TYPELESS || desc->Buffer.StructureByteStride != 0) return;
+            if (desc->Buffer.FirstElement > width / 4) return;
+            const UINT64 byte_off = desc->Buffer.FirstElement * 4;
+            const UINT64 byte_size = UINT64(desc->Buffer.NumElements) * 4;
+            if (byte_size > width - byte_off || byte_size > UINT32_MAX) return;
+            buffer.address = arena_va(base_va + byte_off);
+            buffer.stride = 0;
+            buffer.num_records = std::uint32_t(byte_size);
+            buffer.format = leonida::gfx10::format_from_vulkan(VK_FORMAT_R32_UINT);
+            buffer.oob_select = leonida::gfx10::OobSelect::raw;
+        } else if (desc->Buffer.StructureByteStride != 0) {
+            if (desc->Format != DXGI_FORMAT_UNKNOWN || desc->Buffer.StructureByteStride > 16383) return;
+            const UINT64 stride = desc->Buffer.StructureByteStride;
+            if (desc->Buffer.FirstElement > width / stride) return;
+            const UINT64 byte_off = desc->Buffer.FirstElement * stride;
+            const UINT64 byte_size = UINT64(desc->Buffer.NumElements) * stride;
+            if (byte_size > width - byte_off) return;
+            buffer.address = arena_va(base_va + byte_off);
+            buffer.stride = std::uint32_t(stride);
+            buffer.num_records = desc->Buffer.NumElements;
+            buffer.format = leonida::gfx10::format_from_vulkan(VK_FORMAT_R32_UINT);
+            buffer.oob_select = leonida::gfx10::OobSelect::structured;
+        } else {
+            const Format fmt = vulkan_format(desc->Format, false);
+            if (fmt.format == VK_FORMAT_UNDEFINED || fmt.typeless || !(fmt.aspects & VK_IMAGE_ASPECT_COLOR_BIT)) {
+                log_once("buffer SRV format not supported:", int(desc->Format));
+                return;
+            }
+            const VkFormat named = fmt.rgb96 ? rgb96_named_format(fmt.format) : fmt.format;
+            const std::uint32_t code = leonida::gfx10::format_from_vulkan(named);
+            const leonida::BlockFormat bf = footprint_block(fmt, VK_IMAGE_ASPECT_COLOR_BIT);
+            if (!code || bf.block != 1 || !bf.bytes || bf.bytes > 16383) {
+                log_once("buffer SRV format not supported:", int(desc->Format));
+                return;
+            }
+            const UINT64 stride = bf.bytes;
+            if (desc->Buffer.FirstElement > width / stride) return;
+            const UINT64 byte_off = desc->Buffer.FirstElement * stride;
+            const UINT64 byte_size = UINT64(desc->Buffer.NumElements) * stride;
+            if (byte_size > width - byte_off) return;
+            buffer.address = arena_va(base_va + byte_off);
+            buffer.stride = std::uint32_t(stride);
+            buffer.num_records = desc->Buffer.NumElements;
+            buffer.format = code;
+            const leonida::gfx10::Swizzle channels = leonida::gfx10::format_swizzle(named);
+            for (unsigned i = 0; i < 4; ++i) {
+                const UINT from = D3D12_DECODE_SHADER_4_COMPONENT_MAPPING(i, desc->Shader4ComponentMapping);
+                buffer.swizzle[i] = from < 4 ? channels[from]
+                                    : from == D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_0
+                                        ? leonida::gfx10::select_zero
+                                        : leonida::gfx10::select_one;
+            }
+            buffer.oob_select = leonida::gfx10::OobSelect::structured;
+        }
+        const leonida::gfx10::BufferWords words = leonida::gfx10::encode(buffer);
+        std::memcpy(reinterpret_cast<void*>(destination.ptr), words.data(), sizeof(words));
+    }
+
+    // Console slots 70 and 71: a buffer view from a resource description and an address, with no resource object.
+    static void raw_buffer_view(const D3D12_RESOURCE_DESC& rd, UINT64 va, const D3D12_SHADER_RESOURCE_VIEW_DESC* srv,
+                                const D3D12_UNORDERED_ACCESS_VIEW_DESC* uav, D3D12_CPU_DESCRIPTOR_HANDLE destination) {
+        std::memset(reinterpret_cast<void*>(destination.ptr), 0, kDescriptorSize);
+        if (srv) write_buffer_srv(rd.Width, va, srv, destination);
+        else write_buffer_uav(rd, va, nullptr, uav, destination);
+    }
+
     // A shader-resource view of a texture is a T# in the slot (docs section 3.4): the shader loads those eight
     // dwords through its descriptor table and finds the image by them. A buffer SRV writes a 16-byte GFX10 V# in the
     // first half of the slot (raw, structured, or typed). A slot left as zeros is a null descriptor.
@@ -7032,75 +7565,7 @@ public:
         }
         const_cast<Resource*>(r)->upload_title_pixels(true);
         if (!r->image()) {
-            if (!desc) {
-                log_once("buffer SRV requires a description; width", int(r->desc().Width));
-                return;
-            }
-            if (desc->ViewDimension != D3D12_SRV_DIMENSION_BUFFER) {
-                log_once("shader-resource view dimension not supported for buffer:", desc->ViewDimension);
-                return;
-            }
-            const UINT64 base_va = const_cast<Resource*>(r)->GetGPUVirtualAddress();
-            const UINT64 width = r->desc().Width;
-            if (!base_va || !desc->Buffer.NumElements || (desc->Buffer.Flags & ~D3D12_BUFFER_SRV_FLAG_RAW)) return;
-            leonida::gfx10::Buffer buffer{};
-            if (desc->Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW) {
-                if (desc->Format != DXGI_FORMAT_R32_TYPELESS || desc->Buffer.StructureByteStride != 0) return;
-                if (desc->Buffer.FirstElement > width / 4) return;
-                const UINT64 byte_off = desc->Buffer.FirstElement * 4;
-                const UINT64 byte_size = UINT64(desc->Buffer.NumElements) * 4;
-                if (byte_size > width - byte_off || byte_size > UINT32_MAX) return;
-                buffer.address = arena_va(base_va + byte_off);
-                buffer.stride = 0;
-                buffer.num_records = std::uint32_t(byte_size);
-                buffer.format = leonida::gfx10::format_from_vulkan(VK_FORMAT_R32_UINT);
-                buffer.oob_select = leonida::gfx10::OobSelect::raw;
-            } else if (desc->Buffer.StructureByteStride != 0) {
-                if (desc->Format != DXGI_FORMAT_UNKNOWN || desc->Buffer.StructureByteStride > 16383) return;
-                const UINT64 stride = desc->Buffer.StructureByteStride;
-                if (desc->Buffer.FirstElement > width / stride) return;
-                const UINT64 byte_off = desc->Buffer.FirstElement * stride;
-                const UINT64 byte_size = UINT64(desc->Buffer.NumElements) * stride;
-                if (byte_size > width - byte_off) return;
-                buffer.address = arena_va(base_va + byte_off);
-                buffer.stride = std::uint32_t(stride);
-                buffer.num_records = desc->Buffer.NumElements;
-                buffer.format = leonida::gfx10::format_from_vulkan(VK_FORMAT_R32_UINT);
-                buffer.oob_select = leonida::gfx10::OobSelect::structured;
-            } else {
-                const Format fmt = vulkan_format(desc->Format, false);
-                if (fmt.format == VK_FORMAT_UNDEFINED || fmt.typeless || !(fmt.aspects & VK_IMAGE_ASPECT_COLOR_BIT)) {
-                    log_once("buffer SRV format not supported:", int(desc->Format));
-                    return;
-                }
-                const VkFormat named = fmt.rgb96 ? rgb96_named_format(fmt.format) : fmt.format;
-                const std::uint32_t code = leonida::gfx10::format_from_vulkan(named);
-                const leonida::BlockFormat bf = footprint_block(fmt, VK_IMAGE_ASPECT_COLOR_BIT);
-                if (!code || bf.block != 1 || !bf.bytes || bf.bytes > 16383) {
-                    log_once("buffer SRV format not supported:", int(desc->Format));
-                    return;
-                }
-                const UINT64 stride = bf.bytes;
-                if (desc->Buffer.FirstElement > width / stride) return;
-                const UINT64 byte_off = desc->Buffer.FirstElement * stride;
-                const UINT64 byte_size = UINT64(desc->Buffer.NumElements) * stride;
-                if (byte_size > width - byte_off) return;
-                buffer.address = arena_va(base_va + byte_off);
-                buffer.stride = std::uint32_t(stride);
-                buffer.num_records = desc->Buffer.NumElements;
-                buffer.format = code;
-                const leonida::gfx10::Swizzle channels = leonida::gfx10::format_swizzle(named);
-                for (unsigned i = 0; i < 4; ++i) {
-                    const UINT from = D3D12_DECODE_SHADER_4_COMPONENT_MAPPING(i, desc->Shader4ComponentMapping);
-                    buffer.swizzle[i] = from < 4 ? channels[from]
-                                        : from == D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_0
-                                            ? leonida::gfx10::select_zero
-                                            : leonida::gfx10::select_one;
-                }
-                buffer.oob_select = leonida::gfx10::OobSelect::structured;
-            }
-            const leonida::gfx10::BufferWords words = leonida::gfx10::encode(buffer);
-            std::memcpy(reinterpret_cast<void*>(destination.ptr), words.data(), sizeof(words));
+            write_buffer_srv(r->desc().Width, const_cast<Resource*>(r)->GetGPUVirtualAddress(), desc, destination);
             return;
         }
         TextureView view{};
@@ -7188,10 +7653,9 @@ public:
     // index is checked against NUM_RECORDS, docs/buffer_bounds.md). A slot left as zeros is a null descriptor.
     // A UAV counter (docs section 3.4, "UAV counters") is a second, raw V# of 4 bytes in the slot's upper 16 bytes: the
     // counter resource's address plus CounterOffsetInBytes. Append and consume are atomics a shader does on it.
-    void write_buffer_uav(ID3D12Resource* resource, ID3D12Resource* counter, const D3D12_UNORDERED_ACCESS_VIEW_DESC* desc,
-                          D3D12_CPU_DESCRIPTOR_HANDLE destination) {
+    static void write_buffer_uav(const D3D12_RESOURCE_DESC& rd, UINT64 va, ID3D12Resource* counter,
+                                 const D3D12_UNORDERED_ACCESS_VIEW_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE destination) {
         namespace g = leonida::gfx10;
-        const D3D12_RESOURCE_DESC& rd = Resource::from<Resource>(resource)->desc();
         if (!(rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) {
             log_once("unordered-access view of a buffer created without ALLOW_UNORDERED_ACCESS; flags", int(rd.Flags));
             return;
@@ -7245,7 +7709,6 @@ public:
                 return;
             }
         }
-        const UINT64 va = resource->GetGPUVirtualAddress();
         const UINT64 counter_va = counter ? counter->GetGPUVirtualAddress() : 0;
         if (!va || (counter && !counter_va)) return;
         g::Buffer buffer{};
@@ -7281,7 +7744,7 @@ public:
             if (resource) stub("ID3D12Device::CreateUnorderedAccessView(resource from another device)");
             return;
         }
-        if (!r->image()) return write_buffer_uav(resource, counter, desc, destination);
+        if (!r->image()) return write_buffer_uav(r->desc(), resource->GetGPUVirtualAddress(), counter, desc, destination);
         if (counter) {
             log_once("unordered-access view of a texture with a counter resource; dimension", int(r->desc().Dimension));
             return;
@@ -10197,6 +10660,8 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     VkPhysicalDeviceVulkan12Features enable12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &enable11};
     enable12.timelineSemaphore = VK_TRUE;
     enable12.separateDepthStencilLayouts = VK_TRUE;
+    info.draw_indirect_count = chosen12.drawIndirectCount == VK_TRUE;
+    enable12.drawIndirectCount = info.draw_indirect_count ? VK_TRUE : VK_FALSE;
     info.buffer_device_address = chosen12.bufferDeviceAddress == VK_TRUE;
     enable12.bufferDeviceAddress = info.buffer_device_address ? VK_TRUE : VK_FALSE;
     info.storage_buffer_8bit = chosen12.storageBuffer8BitAccess == VK_TRUE;
@@ -10366,6 +10831,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
         return std::any_of(extensions.begin(), extensions.end(),
                            [&](const auto& e) { return std::strcmp(e.extensionName, name) == 0; });
     };
+    info.depth_range_unrestricted = has_device_extension(VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME);
     VkPhysicalDeviceFragmentShaderBarycentricFeaturesKHR barycentric{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR};
     if (has_device_extension(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME)) {
@@ -10460,6 +10926,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     enable.dualSrcBlend = chosen_features.dualSrcBlend;
     enable.logicOp = chosen_features.logicOp;
     enable.depthClamp = chosen_features.depthClamp;
+    enable.multiDrawIndirect = chosen_features.multiDrawIndirect;
     enable.geometryShader = chosen_features.geometryShader;  // translated geometry shaders (195 in the corpus)
     // What translated shaders declare (the index's `features`): 64-bit integers in most of the corpus (25,803 of
     // 26,503 entries), doubles, 16-bit integers, clip and cull distances in a few vertex shaders, image stores
@@ -10563,6 +11030,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     device_info.pEnabledFeatures = &enable;
     std::vector<const char*> device_extensions;
     v13.add_extensions(device_extensions);
+    if (info.depth_range_unrestricted) device_extensions.push_back(VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME);
     if (info.conservative_rasterization) device_extensions.push_back(VK_EXT_CONSERVATIVE_RASTERIZATION_EXTENSION_NAME);
     if (info.image_view_min_lod) device_extensions.push_back(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
     if (info.vertex_attribute_divisor) device_extensions.push_back(divisor_extension);
@@ -10596,6 +11064,14 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     info.swapchain_colorspace = info.presentation && swapchain_colorspace_enabled;
     if (info.custom_border_color) device_extensions.push_back(custom_border_name);
     if (info.host_pointer_alignment) device_extensions.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+    VkPhysicalDeviceFaultFeaturesEXT fault_features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
+    fault_features.deviceFault = VK_TRUE;
+    if (leonida::GpuDebug::wanted()) {
+        device_extensions.push_back(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+        device_extensions.push_back(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
+        fault_features.pNext = const_cast<void*>(device_info.pNext);
+        device_info.pNext = &fault_features;
+    }
     device_info.enabledExtensionCount = std::uint32_t(device_extensions.size());
     device_info.ppEnabledExtensionNames = device_extensions.empty() ? nullptr : device_extensions.data();
     if (vkCreateDevice(info.physical, &device_info, nullptr, &owned.device) != VK_SUCCESS)
@@ -10623,6 +11099,17 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
         info.copy_queues.push_back(q);
     }
     info.queue = info.command_queues[0];
+    if (leonida::GpuDebug::wanted()) {
+        leonida::GpuDebug& debug = leonida::gpu_debug();
+        debug.device = owned.device;
+        debug.set_checkpoint = reinterpret_cast<PFN_vkCmdSetCheckpointNV>(vkGetDeviceProcAddr(owned.device, "vkCmdSetCheckpointNV"));
+        debug.checkpoint_data = reinterpret_cast<PFN_vkGetQueueCheckpointDataNV>(vkGetDeviceProcAddr(owned.device, "vkGetQueueCheckpointDataNV"));
+        debug.fault_info = reinterpret_cast<PFN_vkGetDeviceFaultInfoEXT>(vkGetDeviceProcAddr(owned.device, "vkGetDeviceFaultInfoEXT"));
+        debug.wait_idle = reinterpret_cast<PFN_vkDeviceWaitIdle>(vkGetDeviceProcAddr(owned.device, "vkDeviceWaitIdle"));
+        debug.queues = info.command_queues;
+        for (const auto* more : {&info.compute_queues, &info.copy_queues}) debug.queues.insert(debug.queues.end(), more->begin(), more->end());
+        std::fprintf(stderr, "[gpu] debug: checkpoints %d, fault info %d\n", debug.set_checkpoint != nullptr, debug.fault_info != nullptr);
+    }
     info.max_push_constants_size = chosen.limits.maxPushConstantsSize;
     info.push_constants_need_fallback = (info.max_push_constants_size < 144);
     std::fprintf(stderr, "[rt] d3d12: Vulkan device: %s (maxPushConstantsSize: %u bytes)\n", chosen.deviceName,

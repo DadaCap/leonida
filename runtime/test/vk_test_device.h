@@ -109,6 +109,8 @@ public:
     // VK_KHR_maintenance5 enabled, where VK_FORMAT_A8_UNORM_KHR can be sampled and blended as a colour attachment, as
     // gta6rt enables it (VulkanDeviceInfo::a8_render_target).
     bool a8_render_target = false;
+    bool request_depth_range_unrestricted = false;
+    bool depth_range_unrestricted = false;  // VK_EXT_depth_range_unrestricted enabled
     // create(true) only: VK_KHR (else EXT) swapchain_maintenance1 and its feature enabled, with the surface half on the
     // instance, so a vsync swapchain can switch to IMMEDIATE or FIFO_RELAXED per present.
     bool swapchain_maintenance1 = false;
@@ -118,6 +120,9 @@ public:
     bool request_debug_utils = false;  // set before create(): enable VK_EXT_debug_utils when the loader has it
     bool request_buffer_device_address = false;  // set before create(): enable bufferDeviceAddress where supported
     bool buffer_device_address = false;  // enabled: buffer() memory and buffers can be addressed (device_address())
+    bool request_multi_draw_indirect = true;  // set false before initialize() to test without multiDrawIndirect
+    bool request_draw_indirect_count = true;  // set false before initialize() to test without drawIndirectCount
+    bool draw_indirect_count = false;         // Vulkan 1.2 drawIndirectCount enabled
     bool conservative_rasterization = false; // VK_EXT_conservative_rasterization enabled where available
     bool request_mesh_shader = false;  // set before create(): enable VK_EXT_mesh_shader (meshShader) where available
     bool mesh_shader = false;          // VK_EXT_mesh_shader and meshShader are enabled
@@ -402,6 +407,8 @@ public:
         enable12.descriptorBindingPartiallyBound = partially_bound;
         sampler_filter_minmax = features12.samplerFilterMinmax == VK_TRUE;
         enable12.samplerFilterMinmax = sampler_filter_minmax;
+        draw_indirect_count = request_draw_indirect_count && features12.drawIndirectCount == VK_TRUE;
+        enable12.drawIndirectCount = draw_indirect_count ? VK_TRUE : VK_FALSE;
         enable12.bufferDeviceAddress = VK_TRUE;
 
         const std::uint32_t graphics_count = std::max(1u, std::min(queue_count_wanted, family_queue_count));
@@ -437,6 +444,7 @@ public:
         enable.shaderSampledImageArrayDynamicIndexing = bindless;
         enable.shaderStorageImageArrayDynamicIndexing = bindless;
         enable.logicOp = features.features.logicOp;  // d3d12_draw_test's logic-op draw, where available
+        enable.multiDrawIndirect = request_multi_draw_indirect ? features.features.multiDrawIndirect : VK_FALSE;
         enable.geometryShader = features.features.geometryShader;  // d3d12_geometry_test, where available
         enable.shaderInt64 = features.features.shaderInt64;  // translated shaders declare Int64 for their addresses
         const char* conditional_extension = VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME;
@@ -597,6 +605,11 @@ public:
         enabled = enable;
         std::vector<const char*> device_extensions;
         v13_.add_extensions(device_extensions);
+        depth_range_unrestricted = request_depth_range_unrestricted &&
+            std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
+                return std::strcmp(e.extensionName, VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME) == 0;
+            });
+        if (depth_range_unrestricted) device_extensions.push_back(VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME);
         conservative_rasterization = std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
             return std::strcmp(e.extensionName, VK_EXT_CONSERVATIVE_RASTERIZATION_EXTENSION_NAME) == 0;
         });

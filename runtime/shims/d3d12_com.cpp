@@ -91,6 +91,8 @@ const char* name(leonida::ReplayResult result) {
     case leonida::ReplayResult::invalid_query: return "invalid query";
     case leonida::ReplayResult::invalid_indirect_arguments: return "invalid indirect argument or count buffer range";
     case leonida::ReplayResult::invalid_draw: return "draw kind does not match the pipeline (mesh or vertex)";
+    case leonida::ReplayResult::unsupported_mesh_indirect_count:
+        return "GPU mesh indirect count could not be prepared (requires buffer device addresses and compute scratch)";
     case leonida::ReplayResult::unsupported: return "unsupported";
     }
     return "?";
@@ -486,6 +488,12 @@ public:
         d3d12_trace::record("ID3D12GraphicsCommandList6::DispatchMesh");
         if (x > 65535 || y > 65535 || z > 65535 || std::uint64_t(x) * y * z > (1u << 22)) return check(false);
         if (!graphics_pipeline_ || !graphics_.layout) return check(false);
+        place_heaps(graphics_, graphics_.layout->graphics_heaps);
+        // A mesh shader reads the root arguments from s16 through a 16-dword window (RootArgumentLayout::mesh_ok).
+        if (!graphics_.layout->mesh_ok) {
+            stub("DispatchMesh(root signature larger than a mesh shader's root window)");
+            return check(false);
+        }
         if (!(viewport_.width > 0) || !(viewport_.height > 0)) return;  // as record_draw: nothing is rasterized
         leonida::Draw draw{graphics_pipeline_, graphics_.data, draw_views(), depth_, {}, 0, viewport_,
                            scissor_, blend_factor_, front_stencil_ref_, back_stencil_ref_, false, x, y, z, 0, 0};
@@ -834,14 +842,39 @@ public:
         } else if (count_buffer_offset != 0) {
             return check(false);
         }
+        // The record size is checked for every call: D3D12 rejects a signature whose stride cannot hold a record
+        // even when no command runs. The argument span is what the signature can walk, max_command_count * stride:
+        // the host refuses a range that ends past the buffer (`240` with stride `20` in a `256`-byte buffer), and
+        // it checks the offset itself when max_command_count is 0, where the required bytes are none.
+        const UINT64 record_size =
+            kind == leonida::IndirectKind::draw ? sizeof(D3D12_DRAW_ARGUMENTS)
+            : kind == leonida::IndirectKind::draw_indexed ? sizeof(D3D12_DRAW_INDEXED_ARGUMENTS)
+            : kind == leonida::IndirectKind::dispatch ? sizeof(D3D12_DISPATCH_ARGUMENTS)
+            : kind == leonida::IndirectKind::dispatch_mesh ? sizeof(D3D12_DISPATCH_MESH_ARGUMENTS)
+            : 0;
+        if (!record_size || stride < record_size || stride % 4 != 0) return check(false);
+        if (argument_buffer_offset > arg_desc.Width ||
+            UINT64(max_command_count) > (arg_desc.Width - argument_buffer_offset) / stride)
+            return check(false);
         if (kind == leonida::IndirectKind::dispatch_mesh) {
-            // Not replayed yet (#3777 replays it as vkCmdDrawMeshTasksIndirectEXT): nothing is recorded, and the
-            // first such call says so. The list stays valid.
-            static std::atomic<bool> logged{false};
-            if (!logged.exchange(true, std::memory_order_relaxed))
-                std::fprintf(stderr, "[rt] d3d12: ExecuteIndirect with a DISPATCH_MESH signature is not replayed yet; "
-                                     "nothing was recorded\n");
-            return;
+            if (type_ != D3D12_COMMAND_LIST_TYPE_DIRECT) return check(false);
+            if (!max_command_count) return;
+            if (!graphics_pipeline_ || !graphics_.layout) return check(false);
+            if (!(viewport_.width > 0) || !(viewport_.height > 0)) return;
+            const auto arguments = resource_id(argument_buffer);
+            const auto count = count_buffer ? resource_id(count_buffer) : 0;
+            if (!arguments || (count_buffer && !count)) return check(false);
+            place_heaps(graphics_, graphics_.layout->graphics_heaps);
+            if (!graphics_.layout->mesh_ok) {  // as DispatchMesh
+                stub("ExecuteIndirect(DISPATCH_MESH, root signature larger than a mesh shader's root window)");
+                return check(false);
+            }
+            leonida::Draw draw{graphics_pipeline_, graphics_.data, draw_views(), depth_, {}, 0, viewport_,
+                               scissor_, blend_factor_, front_stencil_ref_, back_stencil_ref_};
+            draw.mesh = true;
+            draw.mesh_indirect = leonida::MeshIndirectArguments{arguments, argument_buffer_offset, stride,
+                                                                max_command_count, count, count_buffer_offset};
+            return check(list_.draw(std::move(draw)));
         }
         leonida::ExecuteIndirect cmd{};
         cmd.kind = kind;
@@ -853,8 +886,18 @@ public:
         cmd.count_offset = count_buffer ? count_buffer_offset : 0;
         if (kind == leonida::IndirectKind::dispatch && max_command_count) {  // the pipeline and root arguments a Dispatch would record
             if (!compute_pipeline_ || !compute_.layout) return check(false);
+            place_heaps(compute_, compute_.layout->compute_heaps);
             cmd.pipeline = compute_pipeline_;
             cmd.user_data = compute_.data;
+        } else if ((kind == leonida::IndirectKind::draw || kind == leonida::IndirectKind::draw_indexed) &&
+                   max_command_count && graphics_pipeline_ && graphics_.layout && topology_) {
+            note_direct_heap_indexing(graphics_.layout);
+            if (!(viewport_.width > 0) || !(viewport_.height > 0)) return;  // as record_draw: nothing is rasterized
+            place_heaps(graphics_, graphics_.layout->graphics_heaps);
+            cmd.has_draw = true;
+            cmd.draw = leonida::Draw{graphics_pipeline_, graphics_.data, draw_views(), depth_, index_, topology_,
+                                     viewport_, scissor_, blend_factor_, front_stencil_ref_, back_stencil_ref_,
+                                     kind == leonida::IndirectKind::draw_indexed, 0, 0, 0, 0, 0};
         }
         check(list_.execute_indirect(cmd));
     }
@@ -887,11 +930,11 @@ public:
             cmd.build_flags |= VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR;
         if (in.Flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_MINIMIZE_MEMORY)
             cmd.build_flags |= VK_BUILD_ACCELERATION_STRUCTURE_LOW_MEMORY_BIT_KHR;   // XDXR: BOX16 nodes (BLAS)
-        cmd.dst_va = desc->DestAccelerationStructureData;
-        cmd.src_va = desc->SourceAccelerationStructureData;
-        cmd.scratch_va = desc->ScratchAccelerationStructureData;
+        cmd.dst_va = arena_va(desc->DestAccelerationStructureData);
+        cmd.src_va = arena_va(desc->SourceAccelerationStructureData);
+        cmd.scratch_va = arena_va(desc->ScratchAccelerationStructureData);
         if (cmd.is_tlas) {
-            cmd.instances_va = in.InstanceDescs;
+            cmd.instances_va = arena_va(in.InstanceDescs);
             cmd.instance_count = in.NumDescs;
             cmd.instance_pointers = in.DescsLayout == D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS;
         } else {
@@ -902,7 +945,7 @@ public:
                         : (in.pGeometryDescs ? &in.pGeometryDescs[i] : nullptr);
                 if (!gd || gd->Type != D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES) return check(false);
                 leonida::RtTriangleGeometry t{};
-                t.vertex_va = gd->Triangles.VertexBuffer.StartAddress;
+                t.vertex_va = arena_va(gd->Triangles.VertexBuffer.StartAddress);
                 t.vertex_count = gd->Triangles.VertexCount;
                 t.vertex_stride = static_cast<std::uint32_t>(gd->Triangles.VertexBuffer.StrideInBytes);
                 // The vertex formats D3D12 allows for BLAS builds; any other stays VK_FORMAT_UNDEFINED and the
@@ -916,13 +959,13 @@ public:
                 case DXGI_FORMAT_R16G16_SNORM: t.vertex_format = VK_FORMAT_R16G16_SNORM; break;
                 default: t.vertex_format = VK_FORMAT_UNDEFINED; break;
                 }
-                t.index_va = gd->Triangles.IndexBuffer;
+                t.index_va = arena_va(gd->Triangles.IndexBuffer);
                 t.index_count = gd->Triangles.IndexCount;
                 if (gd->Triangles.IndexFormat == DXGI_FORMAT_R16_UINT)
                     t.index_type = 1;
                 else if (gd->Triangles.IndexFormat == DXGI_FORMAT_R32_UINT)
                     t.index_type = 2;
-                t.transform_va = gd->Triangles.Transform3x4;
+                t.transform_va = arena_va(gd->Triangles.Transform3x4);
                 t.opaque = (gd->Flags & D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE) != 0;
                 t.flags = static_cast<std::uint32_t>(gd->Flags);
                 cmd.triangles.push_back(t);
@@ -935,7 +978,7 @@ public:
         // The postbuild values of the structure just built, after it (D3D12 orders them after the build).
         for (UINT i = 0; postbuild && i < postbuild_count; ++i) {
             leonida::AccelerationStructurePostbuild info{};
-            info.dest_va = postbuild[i].DestBuffer;
+            info.dest_va = arena_va(postbuild[i].DestBuffer);
             info.type = static_cast<std::uint32_t>(postbuild[i].InfoType);
             info.sources = {built};
             const bool ok = list_.acceleration_structure_postbuild(std::move(info));
@@ -950,9 +993,9 @@ public:
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE || !desc || !count || !sources) return check(false);
         if (!valid_postbuild_info_type(desc->InfoType)) return check(false);
         leonida::AccelerationStructurePostbuild info{};
-        info.dest_va = desc->DestBuffer;
+        info.dest_va = arena_va(desc->DestBuffer);
         info.type = static_cast<std::uint32_t>(desc->InfoType);
-        info.sources.assign(sources, sources + count);
+        for (UINT i = 0; i < count; ++i) info.sources.push_back(arena_va(sources[i]));
         check(list_.acceleration_structure_postbuild(std::move(info)));
     }
 
@@ -961,7 +1004,7 @@ public:
                                                                D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE mode) override {
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
         if (!valid_copy_mode(mode)) return check(false);
-        check(list_.copy_acceleration_structure({dest, source, static_cast<std::uint32_t>(mode)}));
+        check(list_.copy_acceleration_structure({arena_va(dest), arena_va(source), static_cast<std::uint32_t>(mode)}));
     }
 
     static GraphicsCommandList* from(IUnknown* object) { return Child::from<GraphicsCommandList>(object); }
@@ -1239,9 +1282,11 @@ private:
         va = arena_va(va);
         const std::uint32_t first = first_dword(state, *p);
         write(state, first, std::uint32_t(va));
-        // In the compute layout a descriptor table is one dword, the 32-bit VA of its first descriptor (the heaps
-        // live below 4 GiB); a root view keeps both halves. The graphics layout gives every address two dwords.
-        if (!((is_compute(state) || state.layout->graphics_stage) && type == rt::rootsig::ParamType::Table)) write(state, first + 1, std::uint32_t(va >> 32));
+        // In the console layout of both bind points a descriptor table is one dword, the 32-bit VA of its first
+        // descriptor (the heaps live below 4 GiB); a root view keeps both halves (D3D-448). A graphics signature
+        // past the console window keeps pack()'s layout, where every address takes two dwords.
+        const bool console = is_compute(state) || state.layout->graphics_console;
+        if (!(console && type == rt::rootsig::ParamType::Table)) write(state, first + 1, std::uint32_t(va >> 32));
     }
 
     D3D12_COMMAND_LIST_TYPE type_;
@@ -1386,8 +1431,17 @@ private:
                       : leonida::IndexBufferView{};
     }
 
+    void place_heaps(RootState& state, std::uint32_t at) {
+        if (!state.layout || at == UINT32_MAX) return;
+        if (state.layout->flags & D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED)
+            write(state, at++, std::uint32_t(arena_va(cbv_srv_uav_base_)));
+        if (state.layout->flags & D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED)
+            write(state, at, std::uint32_t(arena_va(sampler_base_)));
+    }
+
     void record_dispatch(UINT x, UINT y, UINT z) {
         if (!compute_pipeline_ || !compute_.layout) return check(false);
+        place_heaps(compute_, compute_.layout->compute_heaps);
         note_direct_heap_indexing(compute_.layout);
         check(list_.dispatch({compute_pipeline_, compute_.data, x, y, z}));
     }
@@ -1408,6 +1462,7 @@ private:
     // A draw needs a graphics pipeline, a graphics root signature and a topology.
     void record_draw(bool indexed, UINT count, UINT instances, UINT first, INT base_vertex, UINT first_instance) {
         if (!graphics_pipeline_ || !graphics_.layout || !topology_) return check(false);
+        place_heaps(graphics_, graphics_.layout->graphics_heaps);
         note_direct_heap_indexing(graphics_.layout);
         // No viewport (never set, or unbound with RSSetViewports(0)) or an empty one: D3D12 rasterizes nothing,
         // and Vulkan forbids a 0x0 viewport, so the draw is not recorded.

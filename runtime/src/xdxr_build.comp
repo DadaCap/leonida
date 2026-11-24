@@ -285,6 +285,14 @@ void build_instance(uint i) {
     store(pc.dst, o + 52u, contrib);
     vec3 lo = vec3(uintBitsToFloat(0x7f800000u)), hi = -lo;
     uint root = INVALID;
+    if (!is_null(pc.src1)) {  // a console title: its own addresses lie src2.x 64 KiB pages from src1; none other is valid
+        uint borrow;
+        uvec2 at;
+        at.x = usubBorrow(blas_va.x, pc.src1.x, borrow);
+        at.y = blas_va.y - pc.src1.y - borrow;
+        if (((at.y << 16) | (at.x >> 16)) < pc.src2.x && at.y < 0x10000u) blas_va = at;
+        else if (((blas_va.y << 16) | (blas_va.x >> 16)) >= pc.src2.x || blas_va.y >= 0x10000u) blas_va = uvec2(0u);
+    }
     if (!is_null(blas_va)) {
         uvec2 blas = add64(blas_va, pc.bias);
         root = load(blas, 48u);

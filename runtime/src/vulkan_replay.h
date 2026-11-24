@@ -1,5 +1,6 @@
 #pragma once
 
+#include "gpu_debug.h"
 #include "resource_tiling.h"
 
 // Replays a closed CommandList (command_list.h) into a Vulkan command buffer.
@@ -223,7 +224,10 @@ inline VkPipelineStageFlags2 vulkan_sync(std::uint32_t sync) {
          VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT},
         {y::render_target, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT},
         {y::compute_shading, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT},
-        {y::copy, VK_PIPELINE_STAGE_2_COPY_BIT},
+        // CLEAR as well: two D3D12 copy-scope commands are recorded as Vulkan clear commands, WriteBufferImmediate
+        // as vkCmdUpdateBuffer and ResolveQueryData's never-written queries as vkCmdFillBuffer, and synchronization2
+        // puts both in the CLEAR stage, not COPY.
+        {y::copy, VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_CLEAR_BIT},
         {y::resolve, VK_PIPELINE_STAGE_2_RESOLVE_BIT},
         {y::execute_indirect, VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT},
         {y::all_shading, pre_raster | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT},
@@ -770,6 +774,8 @@ struct ComputePipeline {
     VkDescriptorSet bindless_set = VK_NULL_HANDLE;  // set 0 of the layout, bound at every dispatch; null: none
     // LEONIDA_LAZY_PSO: `pipeline` stays null and the first dispatch builds it through this (once, thread-safe).
     std::function<VkPipeline()> build;
+    // Whether it is still being compiled (build answers null): the dispatch is left out.
+    std::function<bool()> pending;
 };
 
 // A graphics pipeline as replay needs it: the formats its attachments must have and which vertex-input slots it
@@ -792,6 +798,8 @@ struct GraphicsPipeline {
     // and stencil. Null when it cannot be built.
     static constexpr std::uint32_t unbound_depth = 1u << 8;
     std::function<VkPipeline(std::uint32_t unbound)> variant;
+    // Whether variant(unbound) is being compiled in the background (it answers null): its draws are left out until then.
+    std::function<bool(std::uint32_t unbound)> pending;
     std::uint32_t samples = 1;  // rasterizationSamples; every bound attachment must have this count
 };
 
@@ -818,6 +826,7 @@ enum class ReplayResult {
     invalid_query,
     invalid_indirect_arguments,
     invalid_draw,  // DispatchMesh with a pipeline that has no mesh shader, or a vertex draw with one that has
+    unsupported_mesh_indirect_count,
     unsupported
 };
 inline ReplayResult leonida_unresolved(int line) { static std::atomic<int> n{0}; if (n++ < 12) std::fprintf(stderr, "[rt] replay: unresolved resource at line %d\n", line); return ReplayResult::unresolved_resource; }
@@ -830,6 +839,7 @@ struct ReplayFunctions {
     PFN_vkCmdPipelineBarrier pipeline_barrier = nullptr;
     PFN_vkCmdClearColorImage clear_color_image = nullptr;
     PFN_vkCmdClearDepthStencilImage clear_depth_stencil_image = nullptr;
+    bool depth_range_unrestricted = false;  // Allows out-of-range float depth clear values.
     // Optional; a list that needs a missing one is rejected with ReplayResult::unsupported.
     PFN_vkCmdPipelineBarrier2 pipeline_barrier2 = nullptr;  // enhanced barriers
     VkPipelineStageFlags2 queue_stages = 0;
@@ -876,6 +886,7 @@ struct ReplayFunctions {
     PFN_vkCmdSetBlendConstants set_blend_constants = nullptr;
     PFN_vkCmdDraw draw = nullptr;
     PFN_vkCmdDrawMeshTasksEXT draw_mesh_tasks = nullptr;  // VK_EXT_mesh_shader; null: mesh draws are unsupported
+    PFN_vkCmdDrawMeshTasksIndirectEXT draw_mesh_tasks_indirect = nullptr;
     PFN_vkCmdDrawIndexed draw_indexed = nullptr;
     std::function<const GraphicsPipeline*(std::uintptr_t)> graphics_pipeline;
     // The buffer and offset a console VA range starts in (from ResourceBinding::va), false when none does. `size` is
@@ -920,6 +931,9 @@ struct ReplayFunctions {
     PFN_vkCmdDrawIndirectCount draw_indirect_count = nullptr;
     PFN_vkCmdDrawIndexedIndirectCount draw_indexed_indirect_count = nullptr;
     PFN_vkCmdDispatchIndirect dispatch_indirect = nullptr;
+    // VkPhysicalDeviceFeatures::multiDrawIndirect is enabled. When false, fixed multi-draw ExecuteIndirect falls
+    // back to max_count single-draw calls so drawCount stays 1 (VUID-vkCmdDrawIndirect-drawCount-02718).
+    bool multi_draw_indirect = true;
     // A DISPATCH-only ExecuteIndirect signature with a GPU count buffer needs a compute prepass to clamp
     // the number of commands. The resulting scratch buffer is owned by the queue's timeline-retained batch.
     std::function<bool(VkBuffer, VkDeviceSize, VkBuffer, VkDeviceSize, std::uint32_t, std::uint32_t,
@@ -1066,7 +1080,8 @@ struct Prepared {
     VkDeviceSize fill_scratch_offset = 0;
     QueryPool* queries = nullptr;  // query commands: the heap
     ComputePipeline pipeline;  // dispatches
-    std::uint32_t draw = 0;    // draws: its PreparedDraw in PreparedList::draws
+    static constexpr std::uint32_t no_draw = UINT32_MAX;
+    std::uint32_t draw = no_draw;  // draws & graphics ExecuteIndirect: its PreparedDraw in PreparedList::draws
     VkAccelerationStructureKHR accel_dst = VK_NULL_HANDLE;
     VkDeviceAddress khr_instances = 0;  // staged ARRAY_OF_POINTERS instance list for a KHR TLAS; 0: use the VA directly
     std::uint64_t xdxr_bytes = 0;     // CopyAccelerationStructure: the most bytes the copy may write
@@ -1593,6 +1608,7 @@ inline VkDeviceSize indirect_record_size(IndirectKind kind) {
     case IndirectKind::draw: return sizeof(VkDrawIndirectCommand);
     case IndirectKind::draw_indexed: return sizeof(VkDrawIndexedIndirectCommand);
     case IndirectKind::dispatch: return sizeof(VkDispatchIndirectCommand);
+    case IndirectKind::dispatch_mesh: return 0;  // Mesh dispatches use Draw to capture graphics state.
     }
     return 0;
 }
@@ -1632,6 +1648,7 @@ inline ReplayResult prepare_buffer_uav_clear(const ClearUnorderedAccess& clear, 
         if (offset > UINT64_MAX - p.binding.buffer_offset ||
             bytes > UINT64_MAX - (p.binding.buffer_offset + offset)) return ReplayResult::invalid_clear;
         offset += p.binding.buffer_offset;  // the view is relative to the resource, which starts at buffer_offset
+        if (offset % std::min(e, 4u)) return ReplayResult::unsupported;
         if (e > 4 && bytes % 4) {
             return ReplayResult::unsupported;
         }
@@ -1908,27 +1925,48 @@ inline ReplayResult prepare_texture_copy(const CopyTexture& copy, Prepared& p) {
     return ReplayResult::success;
 }
 
-// RGBA8 CopyTiles accepts arbitrary byte offsets into its linear buffer, while VkBufferImageCopy requires texel
-// alignment. Stage only the occupied texels through aligned transfer scratch; leave partial-tile padding alone.
-inline bool stage_unaligned_tile(const ReplayFunctions& vk, Prepared& p, bool upload) {
+// CopyTiles accepts arbitrary byte offsets into its linear buffer, while VkBufferImageCopy requires texel/block
+// alignment (VUID-vkCmdCopyBufferToImage-dstImage-07975). Stage only the occupied texels/blocks through aligned
+// transfer scratch; leave partial-tile padding alone.
+inline bool stage_unaligned_tile(const ReplayFunctions& vk, Prepared& p, const ResourceBinding& image,
+                                 const BlockFormat& fmt, bool upload) {
     auto& region = p.buffer_image_copies.front();
-    const VkDeviceSize row_bytes = VkDeviceSize(region.imageExtent.width) * 4;
-    const VkDeviceSize pitch = VkDeviceSize(region.bufferRowLength) * 4;
-    const auto rows = region.imageExtent.height;
+    if (!fmt.bytes || !fmt.block || image.rgb96 ||
+        (image.depth24_as_float && region.imageSubresource.aspectMask == VK_IMAGE_ASPECT_DEPTH_BIT))
+        return false;
+    const VkDeviceSize blocks_w = (VkDeviceSize(region.imageExtent.width) + fmt.block - 1) / fmt.block;
+    const VkDeviceSize rows = (VkDeviceSize(region.imageExtent.height) + fmt.block - 1) / fmt.block;
+    const VkDeviceSize depth = region.imageExtent.depth;
+    const VkDeviceSize row_bytes = blocks_w * fmt.bytes;
+    const VkDeviceSize pitch =
+        region.bufferRowLength ? VkDeviceSize(region.bufferRowLength / fmt.block) * fmt.bytes : row_bytes;
+    const VkDeviceSize slice_rows =
+        region.bufferImageHeight ? VkDeviceSize(region.bufferImageHeight / fmt.block) : rows;
+    const VkDeviceSize slice_pitch = slice_rows * pitch;
+    const VkDeviceSize slice_bytes = row_bytes * rows;
+    const VkDeviceSize total_bytes = slice_bytes * depth;
     VkDeviceSize scratch_offset = 0;
-    if (!vk.copy_scratch || !vk.copy_scratch(row_bytes * rows, p.tile_scratch, scratch_offset)) return false;
+    if (!total_bytes || !vk.copy_scratch || !vk.copy_scratch(total_bytes, p.tile_scratch, scratch_offset)) return false;
     const auto app_offset = region.bufferOffset;
     const auto add_copy = [&](VkDeviceSize linear, VkDeviceSize scratch, VkDeviceSize bytes) {
         p.tile_rows.push_back(upload ? VkBufferCopy{linear, scratch, bytes} : VkBufferCopy{scratch, linear, bytes});
     };
-    if (row_bytes == pitch) {
-        add_copy(app_offset, scratch_offset, row_bytes * rows);
+    if (row_bytes == pitch && (depth == 1 || slice_rows == rows)) {
+        add_copy(app_offset, scratch_offset, total_bytes);
+    } else if (row_bytes == pitch) {
+        for (VkDeviceSize z = 0; z < depth; ++z)
+            add_copy(app_offset + z * slice_pitch, scratch_offset + z * slice_bytes, slice_bytes);
     } else {
-        for (std::uint32_t row = 0; row < rows; ++row)
-            add_copy(app_offset + row * pitch, scratch_offset + row * row_bytes, row_bytes);
+        for (VkDeviceSize z = 0; z < depth; ++z) {
+            const VkDeviceSize linear_slice = app_offset + z * slice_pitch;
+            const VkDeviceSize scratch_slice = scratch_offset + z * slice_bytes;
+            for (VkDeviceSize row = 0; row < rows; ++row)
+                add_copy(linear_slice + row * pitch, scratch_slice + row * row_bytes, row_bytes);
+        }
     }
     region.bufferOffset = scratch_offset;
     region.bufferRowLength = 0;
+    region.bufferImageHeight = 0;
     return true;
 }
 
@@ -2141,15 +2179,14 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
     const GraphicsPipeline* pipeline = vk.graphics_pipeline(draw.pipeline);
     if (!pipeline) return leonida_unresolved(__LINE__);
     // A pipeline created lazily (LEONIDA_LAZY_PSO) has no base pipeline until its first draw builds it as variant 0.
-    const VkPipeline base = pipeline->pipeline ? pipeline->pipeline
-                                               : (pipeline->variant ? pipeline->variant(0) : VK_NULL_HANDLE);
-    if (!base) return leonida_unresolved(__LINE__);
+    if (!pipeline->pipeline && !pipeline->variant) return leonida_unresolved(__LINE__);
     if (pipeline->mesh != draw.mesh) return ReplayResult::invalid_draw;
-    if (draw.mesh && !vk.draw_mesh_tasks) return ReplayResult::unsupported;
+    if (draw.mesh_indirect && !vk.draw_mesh_tasks_indirect) return ReplayResult::unsupported;
+    if (draw.mesh && !draw.mesh_indirect && !vk.draw_mesh_tasks) return ReplayResult::unsupported;
     if (pipeline->bindless_set && !vk.bind_descriptor_sets) return ReplayResult::unsupported;
     if (pipeline->color_formats.size() > max_render_targets) return ReplayResult::unsupported;
     p.graphics = pipeline;
-    p.pipeline = base;
+    p.pipeline = pipeline->pipeline;
     p.area = {UINT32_MAX, UINT32_MAX};
     std::uint32_t layers = UINT32_MAX;
     const auto shrink = [&](const ResourceBinding& b, const TargetView& view, const VkImageSubresourceRange& range) {
@@ -2206,9 +2243,9 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
     for (std::size_t slot = 0; slot < p.colors.size(); ++slot)
         if (pipeline->color_formats[slot] != VK_FORMAT_UNDEFINED && !p.colors[slot].id) unbound |= 1u << slot;
     if (pipeline->depth_format != VK_FORMAT_UNDEFINED && !p.depth.id) unbound |= GraphicsPipeline::unbound_depth;
-    if (unbound) {
+    if (unbound || !p.pipeline) {
         p.pipeline = pipeline->variant ? pipeline->variant(unbound) : VK_NULL_HANDLE;
-        if (!p.pipeline) return ReplayResult::unsupported;
+        if (!p.pipeline && !(pipeline->pending && pipeline->pending(unbound))) return ReplayResult::unsupported;
     }
 
     // An unbound vertex-buffer slot reads zeros, as in D3D12: the zero page with stride 0. Per-instance slots with
@@ -2520,7 +2557,6 @@ inline ReplayResult plan_overlapping_statistics_segments(PreparedList& out) {
                 p.statistics_end = current;
                 current = open();
                 p.statistics_begin = current;
-                continue;
             }
             // A draw of the other kind than the open segment's starts a segment in its own pool (D3D-291).
             int draw = -1;
@@ -2853,9 +2889,15 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 // A depth plane footprint of a D24 texture stored as D32: words of 24-bit UNORM, floats in the image.
                 const bool upload = texture_copy->src.footprint;
                 const ResourceBinding& image = upload ? p.binding : p.source;
-                if (result == ReplayResult::success && texture_copy->tile_footprint && !p.buffer_image_copies.empty() &&
-                    p.buffer_image_copies.front().bufferOffset % 4 && !detail::stage_unaligned_tile(vk, p, upload))
-                    return ReplayResult::unsupported;
+                if (result == ReplayResult::success && texture_copy->tile_footprint && !p.buffer_image_copies.empty()) {
+                    const auto& region = p.buffer_image_copies.front();
+                    const BlockFormat fmt = copy_block_format(image, region.imageSubresource.aspectMask);
+                    const std::uint32_t alignment =
+                        (region.imageSubresource.aspectMask & depth_stencil_aspects) || image.rgb96 ? 4 : fmt.bytes;
+                    if (alignment > 1 && region.bufferOffset % alignment &&
+                        !detail::stage_unaligned_tile(vk, p, image, fmt, upload))
+                        return ReplayResult::unsupported;
+                }
                 const bool depth24_footprint = result == ReplayResult::success && image.depth24_as_float &&
                     !p.buffer_image_copies.empty() &&
                     p.buffer_image_copies[0].imageSubresource.aspectMask == VK_IMAGE_ASPECT_DEPTH_BIT;
@@ -3177,8 +3219,9 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                                                      p.source.buffer, p.source.buffer_offset + ind->count_offset,
                                                      ind->stride, ind->max_count, p.counted_dispatch))
                         return ReplayResult::unsupported;
-                } else if ((ind->kind == IndirectKind::draw && !vk.draw_indirect_count) ||
-                           (ind->kind == IndirectKind::draw_indexed && !vk.draw_indexed_indirect_count)) {
+                } else if (ind->max_count &&
+                           ((ind->kind == IndirectKind::draw && !vk.draw_indirect_count) ||
+                            (ind->kind == IndirectKind::draw_indexed && !vk.draw_indexed_indirect_count))) {
                     return ReplayResult::unsupported;
                 }
             } else {
@@ -3194,7 +3237,15 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 if (pipeline->bindless_set && !vk.bind_descriptor_sets) return ReplayResult::unsupported;
                 p.pipeline = *pipeline;
                 if (!p.pipeline.pipeline && pipeline->build) p.pipeline.pipeline = pipeline->build();
-                if (!p.pipeline.pipeline) return leonida_unresolved(__LINE__);
+                if (!p.pipeline.pipeline && !(pipeline->pending && pipeline->pending())) return leonida_unresolved(__LINE__);
+            } else if (ind->has_draw && ind->max_count) {
+                if (out.draw_count == out.draws.size()) out.draws.emplace_back();
+                auto& prepared_draw = out.draws[out.draw_count];
+                prepared_draw.reset();
+                p.draw = std::uint32_t(out.draw_count++);
+                if (const auto r = detail::prepare_draw(ind->draw, resolve, vk, prepared_draw);
+                    r != ReplayResult::success)
+                    return r;
             }
         } else if (const auto* build = std::get_if<BuildAccelerationStructure>(&command)) {
             p.khr_instances = 0;
@@ -3231,9 +3282,10 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                     return ReplayResult::unsupported;
                 p.accel_dst = vk.resolve_acceleration_structure(copy->dst_va);
                 p.accel_src = vk.resolve_acceleration_structure(copy->src_va);
-                if (!p.accel_dst || !p.accel_src) return leonida_unresolved(__LINE__);
+                // A structure this layer never built (a rehydrated one): the copy is left out, not the whole submission.
+                if (!p.accel_dst || !p.accel_src) p.accel_dst = p.accel_src = VK_NULL_HANDLE;
                 // Vulkan forbids overlapping source and destination handles in CLONE/COMPACT copies.
-                if (p.accel_dst == p.accel_src) return ReplayResult::invalid_copy;
+                if (p.accel_dst && p.accel_dst == p.accel_src) return ReplayResult::invalid_copy;
             }
         } else if (const auto* info = std::get_if<AccelerationStructurePostbuild>(&command)) {
             if (vk.xdxr_postbuild) {
@@ -3260,9 +3312,10 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 pb.sources.reserve(info->sources.size());
                 for (const std::uint64_t src_va : info->sources) {
                     const VkAccelerationStructureKHR as = vk.resolve_acceleration_structure(src_va);
-                    if (!as) return leonida_unresolved(__LINE__);
+                    if (!as) break;  // never built here: the command is left out, not the whole submission
                     pb.sources.push_back(as);
                 }
+                if (pb.sources.size() != info->sources.size()) continue;
                 if (!vk.prepare_khr_postbuild(static_cast<std::uint32_t>(pb.sources.size()), pb.query_pool,
                                               pb.first_query) ||
                     !pb.query_pool)
@@ -3284,8 +3337,28 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             if (pipeline->bindless_set && !vk.bind_descriptor_sets) return ReplayResult::unsupported;
             p.pipeline = *pipeline;
             if (!p.pipeline.pipeline && pipeline->build) p.pipeline.pipeline = pipeline->build();
-            if (!p.pipeline.pipeline) return leonida_unresolved(__LINE__);
+            if (!p.pipeline.pipeline && !(pipeline->pending && pipeline->pending())) return leonida_unresolved(__LINE__);
         } else if (const auto* draw = std::get_if<Draw>(&command)) {
+            if (draw->mesh_indirect) {
+                const auto& args = *draw->mesh_indirect;
+                if (!bind(args.buffer) || !p.binding.buffer) return leonida_unresolved(__LINE__);
+                if (!draw->mesh || args.stride < sizeof(VkDrawMeshTasksIndirectCommandEXT) || args.stride % 4 ||
+                    !detail::indirect_range(p.binding, args.offset, VkDeviceSize(args.count) * args.stride))
+                    return ReplayResult::invalid_indirect_arguments;
+                if (args.count_buffer) {
+                    const ResourceBinding* count = resolve(args.count_buffer);
+                    if (!count || !count->buffer) return leonida_unresolved(__LINE__);
+                    if (!detail::indirect_range(*count, args.count_offset, sizeof(std::uint32_t)))
+                        return ReplayResult::invalid_indirect_arguments;
+                    // Clamp the GPU count before executing any draw, including when the count is UINT32_MAX.
+                    if (!vk.prepare_counted_dispatch || !vk.emit_counted_dispatch ||
+                        (statistics_active && !statistics_helpers) ||
+                        !vk.prepare_counted_dispatch(p.binding.buffer, p.binding.buffer_offset + args.offset,
+                                                     count->buffer, count->buffer_offset + args.count_offset,
+                                                     args.stride, args.count, p.counted_dispatch))
+                        return ReplayResult::unsupported_mesh_indirect_count;
+                }
+            }
             if (out.draw_count == out.draws.size()) out.draws.emplace_back();
             auto& prepared_draw = out.draws[out.draw_count];
             prepared_draw.reset();
@@ -3580,6 +3653,91 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
         vk.depth24_run(command_buffer, job);
         if (predicate.buffer) vk.begin_conditional_rendering(command_buffer, &predicate);
     };
+    const auto emit_graphics_pass = [&](const Draw& draw, const detail::PreparedDraw& d, auto&& issue) {
+            if (!d.pipeline) return;  // still compiling (GraphicsPipeline::pending)
+        constexpr VkAccessFlags color_access =
+            VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        constexpr VkAccessFlags depth_access =
+            VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        constexpr VkPipelineStageFlags depth_stages =
+            VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+        std::array<VkRenderingAttachmentInfo, detail::max_render_targets> colors;
+        colors.fill({VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO});
+        for (std::size_t slot = 0; slot < d.colors.size(); ++slot) {
+            const auto& a = d.colors[slot];
+            if (!a.id) continue;  // an unbound slot: no image view, writes are dropped
+            const VkImageLayout layout = image_layout(a.binding, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+            detail::to_attachment(vk, command_buffer, a, layout, color_access,
+                                  VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, tracker, separate);
+            colors[slot].imageView = a.view;
+            colors[slot].imageLayout = layout;
+            colors[slot].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+            colors[slot].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        }
+        VkRenderingAttachmentInfo depth{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+        if (d.depth.id) {
+            const VkImageLayout layout = image_layout(d.depth.binding, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+            detail::to_attachment(vk, command_buffer, d.depth, layout, depth_access, depth_stages, tracker, separate);
+            depth.imageView = d.depth.view;
+            depth.imageLayout = layout;
+            depth.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+            depth.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        }
+        VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO};
+        rendering.renderArea = {{0, 0}, d.area};
+        rendering.layerCount = d.layers;  // array views: SV_RenderTargetArrayIndex picks the layer
+        rendering.colorAttachmentCount = std::uint32_t(d.colors.size());
+        rendering.pColorAttachments = colors.data();
+        const GraphicsPipeline& graphics = *d.graphics;
+        if (d.depth.id && (graphics.depth_aspects & VK_IMAGE_ASPECT_DEPTH_BIT)) rendering.pDepthAttachment = &depth;
+        if (d.depth.id && (graphics.depth_aspects & VK_IMAGE_ASPECT_STENCIL_BIT)) rendering.pStencilAttachment = &depth;
+        vk.begin_rendering(command_buffer, &rendering);
+
+        ShaderUserData data{};
+        std::copy(draw.user_data.begin(), draw.user_data.end(), data.s);
+        data.heap_base = vk.heap_base;
+        data.code_base = graphics.code_base;
+        vk.bind_pipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, d.pipeline);
+        if (graphics.bindless_set) {
+            const VkDescriptorSet set0 = vk.bindless_set ? vk.bindless_set : graphics.bindless_set;
+            vk.bind_descriptor_sets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, graphics.layout, 0, 1, &set0, 0,
+                                    nullptr);
+        }
+        vk.push_constants(command_buffer, graphics.layout, graphics.push_stages, 0, sizeof(data), &data);
+        // Translated vertex shaders write D3D clip coordinates (y up); a negative-height viewport keeps the
+        // image upright, and winding as D3D12 sees it.
+        const Viewport& v = draw.viewport;
+        const VkViewport viewport{v.x, v.y + v.height, v.width, -v.height, v.min_depth, v.max_depth};
+        vk.set_viewport(command_buffer, 0, 1, &viewport);
+        const Rect& s = draw.scissor;
+        const VkRect2D scissor{{std::max(0, s.left), std::max(0, s.top)},
+                               {std::uint32_t(std::max(0, s.right - std::max(0, s.left))),
+                                std::uint32_t(std::max(0, s.bottom - std::max(0, s.top)))}};
+        vk.set_scissor(command_buffer, 0, 1, &scissor);
+        // A mesh pipeline has no input assembly: its topology comes from the shader, and neither the topology
+        // nor primitive restart is dynamic state there (VUID-VkGraphicsPipelineCreateInfo-pDynamicStates-07065).
+        if (!draw.mesh) {
+            const VkPrimitiveTopology topology = draw.topology == topology_quad_list && !draw.indexed
+                ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST : detail::vulkan_topology(draw.topology);
+            vk.set_primitive_topology(command_buffer, topology);
+            const bool restart = draw.indexed && detail::strip_topology(topology) &&
+                                 ((graphics.strip_cut == 1 && d.index_type == VK_INDEX_TYPE_UINT16) ||
+                                  (graphics.strip_cut == 2 && d.index_type == VK_INDEX_TYPE_UINT32));
+            vk.set_primitive_restart_enable(command_buffer, restart ? VK_TRUE : VK_FALSE);
+        }
+        vk.set_stencil_reference(command_buffer, VK_STENCIL_FACE_FRONT_BIT, draw.stencil_front);
+        vk.set_stencil_reference(command_buffer, VK_STENCIL_FACE_BACK_BIT, draw.stencil_back);
+        vk.set_blend_constants(command_buffer, draw.blend_factor.data());
+        for (std::uint32_t slot = 0; slot < d.vertex_buffers.size(); ++slot) {
+            if (!d.vertex_buffers[slot]) continue;
+            vk.bind_vertex_buffers2(command_buffer, slot, 1, &d.vertex_buffers[slot], &d.vertex_offsets[slot],
+                                    &d.vertex_sizes[slot], &d.vertex_strides[slot]);
+        }
+        if (!draw.mesh && draw.indexed)
+            vk.bind_index_buffer(command_buffer, d.index_buffer, d.index_offset, d.index_type);
+        issue();
+        vk.end_rendering(command_buffer);
+    };
 
     for (std::size_t i = 0; i < commands.size(); ++i) {
         const auto& command = commands[i];
@@ -3599,6 +3757,8 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
         // draw's own rendering scope begins.
         if (std::holds_alternative<Draw>(command) || std::holds_alternative<ExecuteIndirect>(command)) {
             end_statistics();
+            if (std::holds_alternative<Draw>(command) && p.counted_dispatch.indirect)
+                vk.emit_counted_dispatch(command_buffer, p.counted_dispatch);
             begin_statistics();
         }
         if (const auto* predication = std::get_if<Predication>(&command)) {
@@ -3632,6 +3792,21 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             },
             command);
 
+        if (GpuDebug& debug = gpu_debug(); debug.set_checkpoint) { debug.heap_base = vk.heap_base;
+            GpuDebug::Marker m;
+            const auto user = [&](const std::array<std::uint32_t, 32>& data) { std::copy(data.begin() + 4, data.begin() + 16, m.user); };
+            if (const auto* c = std::get_if<Dispatch>(&command)) m = {"dispatch", c->pipeline, c->x, c->y, c->z}, user(c->user_data);
+            else if (const auto* w = std::get_if<Draw>(&command)) {
+                m = {w->mesh ? "mesh" : "draw", w->pipeline, w->count, w->instances, w->topology};
+                if (w->views && w->views->render_target_count) m.target = w->views->render_targets[0].resource;
+                user(w->user_data);
+            } else if (const auto* e = std::get_if<ExecuteIndirect>(&command)) m = {"indirect", e->pipeline, e->max_count};
+            else if (std::get_if<CopyTexture>(&command)) m = {"copy texture"};
+            else if (std::get_if<CopyBuffer>(&command)) m = {"copy buffer"};
+            else if (std::get_if<BuildAccelerationStructure>(&command)) m = {"build AS"};
+            else m.kind = nullptr;
+            if (m.kind) debug.mark(command_buffer, m);
+        }
         if (const auto* transition = std::get_if<TransitionBarrier>(&command)) {
             const VulkanAccess from = vulkan_access(transition->before, p.binding.presentable, predicates);
             const VulkanAccess to = vulkan_access(transition->after, p.binding.presentable, predicates);
@@ -3769,10 +3944,13 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             const VulkanAccess state = vulkan_access(d3d12_state::depth_write, false);
             auto pieces = detail::current(tracker, id, range, image_layout(p.binding, state.layout));
             detail::initialize(vk, command_buffer, p.binding, id, pieces, image_layout(p.binding, state.layout), tracker);
-            const float depth = p.binding.depth24 ? depth24_clear_value(depth_clear->depth)  // see depth24.h
-                                : p.binding.format == VK_FORMAT_D16_UNORM
-                                    ? detail::quantize_unorm(depth_clear->depth, 65535.0)  // see quantize_unorm
-                                    : depth_clear->depth;
+            float depth = p.binding.depth24 ? depth24_clear_value(depth_clear->depth)  // see depth24.h
+                          : p.binding.format == VK_FORMAT_D16_UNORM
+                              ? detail::quantize_unorm(depth_clear->depth, 65535.0)  // see quantize_unorm
+                              : depth_clear->depth;
+            // Without the extension both clear commands require a depth in [0, 1], including for float images.
+            if (!vk.depth_range_unrestricted)
+                depth = std::isnan(depth) ? 0.0f : std::clamp(depth, 0.0f, 1.0f);
             const VkClearDepthStencilValue value{depth, depth_clear->stencil};
             if (p.rects.empty()) {
                 detail::round_trip(vk, command_buffer, p.binding, pieces, image_layout(p.binding, transfer_dst.layout),
@@ -4137,48 +4315,69 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                                    VK_PIPELINE_STAGE_TRANSFER_BIT);
             vk.copy_buffer(command_buffer, p.source.buffer, p.binding.buffer, 1, p.buffer_copies.data());
         } else if (const auto* ind = std::get_if<ExecuteIndirect>(&command)) {
+            if (ind->max_count == 0) continue;
             const VkDeviceSize arguments = p.binding.buffer_offset + ind->argument_offset;
-            if (ind->count_buffer && ind->kind != IndirectKind::dispatch) {
-                const VkDeviceSize count = p.source.buffer_offset + ind->count_offset;
-                if (ind->kind == IndirectKind::draw) {
-                    vk.draw_indirect_count(command_buffer, p.binding.buffer, arguments, p.source.buffer,
-                                           count, ind->max_count, ind->stride);
-                } else if (ind->kind == IndirectKind::draw_indexed) {
-                    vk.draw_indexed_indirect_count(command_buffer, p.binding.buffer, arguments,
-                                                   p.source.buffer, count, ind->max_count, ind->stride);
-                }
-            } else {
-                if (ind->kind == IndirectKind::draw) {
-                    vk.draw_indirect(command_buffer, p.binding.buffer, arguments, ind->max_count, ind->stride);
-                } else if (ind->kind == IndirectKind::draw_indexed) {
-                    vk.draw_indexed_indirect(command_buffer, p.binding.buffer, arguments, ind->max_count, ind->stride);
-                } else if (ind->kind == IndirectKind::dispatch) {
-                    if (ind->count_buffer) {
-                        // No D3D12 query must count this internal compute pass as an application dispatch.
-                        end_statistics();
-                        vk.emit_counted_dispatch(command_buffer, p.counted_dispatch);
-                        begin_statistics();
+            const auto emit_indirect_draw = [&] {
+                if (ind->count_buffer) {
+                    const VkDeviceSize count = p.source.buffer_offset + ind->count_offset;
+                    if (ind->kind == IndirectKind::draw) {
+                        vk.draw_indirect_count(command_buffer, p.binding.buffer, arguments, p.source.buffer,
+                                               count, ind->max_count, ind->stride);
+                    } else if (ind->kind == IndirectKind::draw_indexed) {
+                        vk.draw_indexed_indirect_count(command_buffer, p.binding.buffer, arguments,
+                                                       p.source.buffer, count, ind->max_count, ind->stride);
                     }
-                    if (ind->pipeline) {
-                        ShaderUserData data{};
-                        std::copy(ind->user_data.begin(), ind->user_data.end(), data.s);
-                        data.heap_base = vk.heap_base;
-                        data.code_base = p.pipeline.code_base;
-                        vk.bind_pipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline.pipeline);
-                        if (p.pipeline.bindless_set) {
-                            const VkDescriptorSet set0 = vk.bindless_set ? vk.bindless_set : p.pipeline.bindless_set;
-                            vk.bind_descriptor_sets(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline.layout, 0,
-                                                    1, &set0, 0, nullptr);
-                        }
-                        vk.push_constants(command_buffer, p.pipeline.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(data),
-                                          &data);
+                } else if (vk.multi_draw_indirect || ind->max_count <= 1) {
+                    if (ind->kind == IndirectKind::draw) {
+                        vk.draw_indirect(command_buffer, p.binding.buffer, arguments, ind->max_count, ind->stride);
+                    } else if (ind->kind == IndirectKind::draw_indexed) {
+                        vk.draw_indexed_indirect(command_buffer, p.binding.buffer, arguments, ind->max_count,
+                                                 ind->stride);
                     }
+                } else {
                     for (std::uint32_t k = 0; k < ind->max_count; ++k) {
-                        vk.dispatch_indirect(command_buffer,
-                            ind->count_buffer ? p.counted_dispatch.indirect : p.binding.buffer,
-                            (ind->count_buffer ? p.counted_dispatch.offset + VkDeviceSize(k) * 12
-                                               : arguments + VkDeviceSize(k) * ind->stride));
+                        const VkDeviceSize offset = arguments + VkDeviceSize(k) * ind->stride;
+                        if (ind->kind == IndirectKind::draw) {
+                            vk.draw_indirect(command_buffer, p.binding.buffer, offset, 1, ind->stride);
+                        } else if (ind->kind == IndirectKind::draw_indexed) {
+                            vk.draw_indexed_indirect(command_buffer, p.binding.buffer, offset, 1, ind->stride);
+                        }
                     }
+                }
+            };
+            if (ind->kind == IndirectKind::draw || ind->kind == IndirectKind::draw_indexed) {
+                if (ind->has_draw && p.draw != p.no_draw) {
+                    emit_graphics_pass(ind->draw, prepared.draws[p.draw], emit_indirect_draw);
+                } else {
+                    emit_indirect_draw();
+                }
+            } else if (ind->kind == IndirectKind::dispatch) {
+                if (ind->pipeline && !p.pipeline.pipeline) continue;  // still compiling
+                if (ind->count_buffer) {
+                    // No D3D12 query must count this internal compute pass as an application dispatch.
+                    end_statistics();
+                    vk.emit_counted_dispatch(command_buffer, p.counted_dispatch);
+                    begin_statistics();
+                }
+                if (ind->pipeline) {
+                    ShaderUserData data{};
+                    std::copy(ind->user_data.begin(), ind->user_data.end(), data.s);
+                    data.heap_base = vk.heap_base;
+                    data.code_base = p.pipeline.code_base;
+                    vk.bind_pipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline.pipeline);
+                    if (p.pipeline.bindless_set) {
+                        const VkDescriptorSet set0 = vk.bindless_set ? vk.bindless_set : p.pipeline.bindless_set;
+                        vk.bind_descriptor_sets(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline.layout, 0,
+                                                1, &set0, 0, nullptr);
+                    }
+                    vk.push_constants(command_buffer, p.pipeline.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(data),
+                                      &data);
+                }
+                for (std::uint32_t k = 0; k < ind->max_count; ++k) {
+                    vk.dispatch_indirect(command_buffer,
+                        ind->count_buffer ? p.counted_dispatch.indirect : p.binding.buffer,
+                        (ind->count_buffer ? p.counted_dispatch.offset + VkDeviceSize(k) * 12
+                                           : arguments + VkDeviceSize(k) * ind->stride));
                 }
             }
         } else if (const auto* xdxr_build = std::get_if<BuildAccelerationStructure>(&command);
@@ -4187,7 +4386,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
         } else if (const auto* copy = std::get_if<CopyAccelerationStructure>(&command)) {
             if (vk.xdxr_copy) {
                 vk.xdxr_copy(command_buffer, copy->src_va, copy->dst_va, p.xdxr_bytes);
-            } else {
+            } else if (p.accel_dst) {
                 VkCopyAccelerationStructureInfoKHR copy_info{VK_STRUCTURE_TYPE_COPY_ACCELERATION_STRUCTURE_INFO_KHR};
                 copy_info.src = p.accel_src;
                 copy_info.dst = p.accel_dst;
@@ -4280,6 +4479,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             const VkAccelerationStructureBuildRangeInfoKHR* range_ptr = ranges.data();
             vk.build_acceleration_structures(command_buffer, 1, &info, &range_ptr);
         } else if (const auto* dispatch = std::get_if<Dispatch>(&command)) {
+            if (!p.pipeline.pipeline) continue;  // still compiling (ComputePipeline::pending)
             ShaderUserData data{};
             std::copy(dispatch->user_data.begin(), dispatch->user_data.end(), data.s);
             data.heap_base = vk.heap_base;
@@ -4291,120 +4491,51 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                                         &set0, 0, nullptr);
             }
             vk.push_constants(command_buffer, p.pipeline.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(data), &data);
-            vk.dispatch(command_buffer, dispatch->x, dispatch->y, dispatch->z);
+            if (!gpu_debug().skips(dispatch->pipeline)) vk.dispatch(command_buffer, dispatch->x, dispatch->y, dispatch->z);
         } else if (const auto* draw = std::get_if<Draw>(&command)) {
             const detail::PreparedDraw& d = prepared.draws[p.draw];
-            constexpr VkAccessFlags color_access =
-                VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-            constexpr VkAccessFlags depth_access =
-                VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-            constexpr VkPipelineStageFlags depth_stages =
-                VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
-            std::array<VkRenderingAttachmentInfo, detail::max_render_targets> colors;
-            colors.fill({VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO});
-            for (std::size_t slot = 0; slot < d.colors.size(); ++slot) {
-                const auto& a = d.colors[slot];
-                if (!a.id) continue;  // an unbound slot: no image view, writes are dropped
-                const VkImageLayout layout = image_layout(a.binding, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-                detail::to_attachment(vk, command_buffer, a, layout, color_access,
-                                      VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, tracker, separate);
-                colors[slot].imageView = a.view;
-                colors[slot].imageLayout = layout;
-                colors[slot].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-                colors[slot].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-            }
-            VkRenderingAttachmentInfo depth{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
-            if (d.depth.id) {
-                const VkImageLayout layout = image_layout(d.depth.binding, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
-                detail::to_attachment(vk, command_buffer, d.depth, layout, depth_access, depth_stages, tracker,
-                                      separate);
-                depth.imageView = d.depth.view;
-                depth.imageLayout = layout;
-                depth.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-                depth.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-            }
-            VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO};
-            rendering.renderArea = {{0, 0}, d.area};
-            rendering.layerCount = d.layers;  // array views: SV_RenderTargetArrayIndex picks the layer
-            rendering.colorAttachmentCount = std::uint32_t(d.colors.size());
-            rendering.pColorAttachments = colors.data();
-            const GraphicsPipeline& graphics = *d.graphics;
-            if (d.depth.id && (graphics.depth_aspects & VK_IMAGE_ASPECT_DEPTH_BIT)) rendering.pDepthAttachment = &depth;
-            if (d.depth.id && (graphics.depth_aspects & VK_IMAGE_ASPECT_STENCIL_BIT)) rendering.pStencilAttachment = &depth;
-            vk.begin_rendering(command_buffer, &rendering);
-
-            ShaderUserData data{};
-            std::copy(draw->user_data.begin(), draw->user_data.end(), data.s);
-            data.heap_base = vk.heap_base;
-            data.code_base = graphics.code_base;
-            vk.bind_pipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, d.pipeline);
-            if (graphics.bindless_set) {
-                const VkDescriptorSet set0 = vk.bindless_set ? vk.bindless_set : graphics.bindless_set;
-                vk.bind_descriptor_sets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, graphics.layout, 0, 1,
-                                        &set0, 0, nullptr);
-            }
-            vk.push_constants(command_buffer, graphics.layout, graphics.push_stages, 0, sizeof(data), &data);
-            // Translated vertex shaders write D3D clip coordinates (y up); a negative-height viewport keeps the
-            // image upright, and winding as D3D12 sees it.
-            const Viewport& v = draw->viewport;
-            const VkViewport viewport{v.x, v.y + v.height, v.width, -v.height, v.min_depth, v.max_depth};
-            vk.set_viewport(command_buffer, 0, 1, &viewport);
-            const Rect& s = draw->scissor;
-            const VkRect2D scissor{{std::max(0, s.left), std::max(0, s.top)},
-                                   {std::uint32_t(std::max(0, s.right - std::max(0, s.left))),
-                                    std::uint32_t(std::max(0, s.bottom - std::max(0, s.top)))}};
-            vk.set_scissor(command_buffer, 0, 1, &scissor);
-            // A mesh pipeline has no input assembly: its topology comes from the shader, and neither the topology
-            // nor primitive restart is dynamic state there (VUID-VkGraphicsPipelineCreateInfo-pDynamicStates-07065).
-            if (!draw->mesh) {
-                const VkPrimitiveTopology topology = draw->topology == topology_quad_list && !draw->indexed
-                    ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST : detail::vulkan_topology(draw->topology);
-                vk.set_primitive_topology(command_buffer, topology);
-                const bool restart = draw->indexed && detail::strip_topology(topology) &&
-                                     ((graphics.strip_cut == 1 && d.index_type == VK_INDEX_TYPE_UINT16) ||
-                                      (graphics.strip_cut == 2 && d.index_type == VK_INDEX_TYPE_UINT32));
-                vk.set_primitive_restart_enable(command_buffer, restart ? VK_TRUE : VK_FALSE);
-            }
-            vk.set_stencil_reference(command_buffer, VK_STENCIL_FACE_FRONT_BIT, draw->stencil_front);
-            vk.set_stencil_reference(command_buffer, VK_STENCIL_FACE_BACK_BIT, draw->stencil_back);
-            vk.set_blend_constants(command_buffer, draw->blend_factor.data());
-            for (std::uint32_t slot = 0; slot < d.vertex_buffers.size(); ++slot) {
-                if (!d.vertex_buffers[slot]) continue;
-                vk.bind_vertex_buffers2(command_buffer, slot, 1, &d.vertex_buffers[slot], &d.vertex_offsets[slot],
-                                        &d.vertex_sizes[slot], &d.vertex_strides[slot]);
-            }
-            if (draw->mesh) {
-                vk.draw_mesh_tasks(command_buffer, draw->count, draw->instances, draw->first);
-            } else if (draw->topology == topology_quad_list) {
-                if (draw->indexed) {
-                    // Indexed quads still read their vertices from the application's index buffer, one fan per quad.
-                    vk.bind_index_buffer(command_buffer, d.index_buffer, d.index_offset, d.index_type);
-                    for (std::uint32_t quad = 0; quad < draw->count / 4; ++quad)
-                        vk.draw_indexed(command_buffer, 4, draw->instances, draw->first + 4 * quad,
-                                        draw->base_vertex, draw->first_instance);
-                } else {
-                    // Both triangles start at the quad's first vertex for flat inputs. One draw also preserves
-                    // the original instance order, and VertexIndex - BaseVertex still gives 4q + k.
-                    constexpr std::uint32_t indices_per_quad = quad_triangle_indices.size();
-                    const std::uint32_t wanted = draw->count / 4;
-                    const std::uint32_t quads = std::min(wanted, vk.quad_index_count / indices_per_quad);
-                    if (quads < wanted)
-                        std::fprintf(stderr, "[rt] d3d12: a non-indexed quad list of %u quads draws only the first %u\n",
-                                     wanted, quads);
-                    if (quads) {
-                        vk.bind_index_buffer(command_buffer, vk.quad_indices, vk.quad_indices_offset, VK_INDEX_TYPE_UINT32);
-                        vk.draw_indexed(command_buffer, quads * indices_per_quad, draw->instances, 0,
-                                        std::int32_t(draw->first), draw->first_instance);
+            emit_graphics_pass(*draw, d, [&] {
+                if (draw->mesh_indirect) {
+                    const auto& args = *draw->mesh_indirect;
+                    const bool counted = p.counted_dispatch.indirect != VK_NULL_HANDLE;
+                    const VkBuffer buffer = counted ? p.counted_dispatch.indirect : p.binding.buffer;
+                    const VkDeviceSize offset = counted ? p.counted_dispatch.offset : p.binding.buffer_offset + args.offset;
+                    const VkDeviceSize stride = counted ? sizeof(VkDrawMeshTasksIndirectCommandEXT) : args.stride;
+                    // A single record per call also works without Vulkan's multiDrawIndirect feature.
+                    for (std::uint32_t record = 0; record < args.count; ++record)
+                        vk.draw_mesh_tasks_indirect(command_buffer, buffer, offset + record * stride, 1, 0);
+                } else if (draw->mesh) {
+                    vk.draw_mesh_tasks(command_buffer, draw->count, draw->instances, draw->first);
+                } else if (draw->topology == topology_quad_list) {
+                    if (draw->indexed) {
+                        // Indexed quads still read their vertices from the application's index buffer, one fan per quad.
+                        vk.bind_index_buffer(command_buffer, d.index_buffer, d.index_offset, d.index_type);
+                        for (std::uint32_t quad = 0; quad < draw->count / 4; ++quad)
+                            vk.draw_indexed(command_buffer, 4, draw->instances, draw->first + 4 * quad,
+                                            draw->base_vertex, draw->first_instance);
+                    } else {
+                        // Both triangles start at the quad's first vertex for flat inputs. One draw also preserves
+                        // the original instance order, and VertexIndex - BaseVertex still gives 4q + k.
+                        constexpr std::uint32_t indices_per_quad = quad_triangle_indices.size();
+                        const std::uint32_t wanted = draw->count / 4;
+                        const std::uint32_t quads = std::min(wanted, vk.quad_index_count / indices_per_quad);
+                        if (quads < wanted)
+                            std::fprintf(stderr, "[rt] d3d12: a non-indexed quad list of %u quads draws only the first %u\n",
+                                         wanted, quads);
+                        if (quads) {
+                            vk.bind_index_buffer(command_buffer, vk.quad_indices, vk.quad_indices_offset, VK_INDEX_TYPE_UINT32);
+                            vk.draw_indexed(command_buffer, quads * indices_per_quad, draw->instances, 0,
+                                            std::int32_t(draw->first), draw->first_instance);
+                        }
                     }
+                } else if (draw->indexed) {
+                    vk.bind_index_buffer(command_buffer, d.index_buffer, d.index_offset, d.index_type);
+                    vk.draw_indexed(command_buffer, draw->count, draw->instances, draw->first, draw->base_vertex,
+                                    draw->first_instance);
+                } else {
+                    vk.draw(command_buffer, draw->count, draw->instances, draw->first, draw->first_instance);
                 }
-            } else if (draw->indexed) {
-                vk.bind_index_buffer(command_buffer, d.index_buffer, d.index_offset, d.index_type);
-                vk.draw_indexed(command_buffer, draw->count, draw->instances, draw->first, draw->base_vertex,
-                                draw->first_instance);
-            } else {
-                vk.draw(command_buffer, draw->count, draw->instances, draw->first, draw->first_instance);
-            }
-            vk.end_rendering(command_buffer);
+            });
         }
     }
     // Predication does not carry over to the next command list.

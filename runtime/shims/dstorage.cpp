@@ -801,7 +801,8 @@ private:
     HRESULT execute_request(const Entry& e) {
         const HRESULT hr = execute_checked(e);
         if (SUCCEEDED(hr) && !(e.request.Options.AsUINT64 & options::kDestinationPages))
-            rt::xmem::title_memory_written(reinterpret_cast<uintptr_t>(e.request.Destination), e.request.DestinationSize);
+            rt::xmem::title_memory_written(reinterpret_cast<uintptr_t>(e.request.Destination), e.request.DestinationSize),
+            rt::xmem::propagate_fn ? rt::xmem::propagate_fn(reinterpret_cast<uintptr_t>(e.request.Destination), e.request.DestinationSize) : void();
         return hr;
     }
 

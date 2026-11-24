@@ -240,10 +240,14 @@ struct Window {
 struct Section {
     HANDLE handle;
     void* scratch;
-    explicit Section(HANDLE h) : handle(h), scratch(MapViewOfFile(h, FILE_MAP_WRITE, 0, 0, 0)) {}
+    size_t bytes;
+    bool on_gpu = false;  // committed whole, for the D3D12 layer's import
+    Section(HANDLE h, size_t size) : handle(h), scratch(MapViewOfFile(h, FILE_MAP_WRITE, 0, 0, 0)), bytes(size) {}
     Section(const Section&) = delete;
     Section& operator=(const Section&) = delete;
     ~Section() {
+        if (on_gpu)
+            if (const auto gone = rt::xmem::gpu_section_gone_fn.load()) gone(scratch);
         if (scratch) UnmapViewOfFile(scratch);
         CloseHandle(handle);
     }
@@ -278,7 +282,7 @@ bool make_region() {
     tried = true;
     char text[16] = {};
     const DWORD n = GetEnvironmentVariableA("LEONIDA_GPU_REGION_MB", text, sizeof text);
-    const size_t mb = n && n < sizeof text ? std::strtoull(text, nullptr, 10) : 14336;
+    const size_t mb = n && n < sizeof text ? std::strtoull(text, nullptr, 10) : 10752;
     if (mb < 2048) return false;
     const size_t bytes = mb << 20;
     void* const base = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
@@ -302,11 +306,11 @@ bool in_pool(uintptr_t address, uint64_t bytes) {
 std::map<uintptr_t, Window> g_windows;              // base -> window
 std::unordered_map<uint64_t, PhysicalPage> g_pages;  // page number -> backing
 std::vector<uint64_t> g_free_slots;
-// The pool's addresses have memory of their own, so a physical page mapped there lives at the last address it was
-// mapped at; `stored` says its section holds its bytes instead (written before it was mapped, or displaced).
-// shortcut: one page mapped at two pool addresses at once does not alias; needs the pool made of sections.
+// The pool's addresses have memory of their own, so a physical page mapped there has a copy at each of its addresses;
+// `stored` says its section holds its bytes (written before it was mapped, or after its last unmap).
+// shortcut: a write the title or the GPU makes through one address does not reach the others; needs real aliasing.
 struct PoolPage {
-    uintptr_t address = 0;
+    std::vector<uintptr_t> addresses;
     bool stored = false;
 };
 std::unordered_map<uint64_t, PoolPage> g_pool_pages;         // page number -> where its bytes are
@@ -319,6 +323,8 @@ struct MappedPage {
 };
 
 std::unordered_map<uintptr_t, MappedPage> g_mapped;
+std::unordered_multimap<uint64_t, uintptr_t> g_view_of;  // page number -> the addresses g_mapped has it at (g_phys_mutex)
+std::vector<uintptr_t> g_newly_mapped;                   // g_phys_mutex: told of when the map call ends
 SRWLOCK g_fault_lock = SRWLOCK_INIT;
 
 struct FaultLockExclusive {
@@ -482,7 +488,10 @@ void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type,
                                                 nullptr, 0);
     }
     // GPU-visible memory (PAGE_GRAPHICS_* bits, or the placeholder its windows are carved from) comes from the region.
-    if (!address && !replace && (new_placeholder || (protect & 0x7F800))) {
+    // Not the window that names the title's physical pages (cached on the CPU, 6.1 GiB measured): its pages are mapped
+    // elsewhere too, so it has to be real views of them.
+    const bool page_pool = window && !new_placeholder && !(protect & PAGE_WRITECOMBINE);
+    if (!address && !replace && !page_pool && (new_placeholder || (protect & 0x7F800))) {
         const std::lock_guard lock(g_phys_mutex);
         if (make_region()) {
             uintptr_t& next = new_placeholder ? g_pool_next : g_high_next;
@@ -500,6 +509,10 @@ void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type,
         if (result && window) {
             const std::lock_guard lock(g_phys_mutex);
             record_window(result, size, host_prot);
+            if ((protect & 0x7F800) && (protect & PAGE_NOACCESS) && !rt::xmem::gpu_window_end.load()) {
+                rt::xmem::gpu_window_start = reinterpret_cast<uintptr_t>(result);
+                rt::xmem::gpu_window_end = reinterpret_cast<uintptr_t>(result) + size;
+            }
         }
         return result;
     }
@@ -515,6 +528,43 @@ void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type,
     return VirtualAlloc(address, size, host_type, host_prot);
 }
 
+std::map<uintptr_t, std::pair<std::shared_ptr<Section>, uint64_t>> g_gpu_changes;  // g_phys_mutex
+bool in_gpu_window(uintptr_t address) {
+    return address >= rt::xmem::gpu_window_start.load(std::memory_order_relaxed) &&
+           address < rt::xmem::gpu_window_end.load(std::memory_order_relaxed);
+}
+// With g_phys_mutex held.
+void flush_gpu_changes() {
+    const rt::xmem::GpuWindowFn fn = rt::xmem::gpu_window_fn.load(std::memory_order_acquire);
+    if (!fn || g_gpu_changes.empty()) return;
+    std::vector<rt::xmem::GpuWindowPage> pages;
+    pages.reserve(g_gpu_changes.size());
+    for (auto& [address, at] : g_gpu_changes) {
+        Section* const section = at.first.get();
+        if (section && !section->on_gpu)
+            section->on_gpu = VirtualAlloc(section->scratch, section->bytes, MEM_COMMIT, PAGE_READWRITE) != nullptr;
+        if (section && section->on_gpu) pages.push_back({address, section->scratch, section->bytes, static_cast<size_t>(at.second)});
+        else pages.push_back({address});
+    }
+    fn(pages.data(), pages.size());
+    g_gpu_changes.clear();
+}
+// With g_phys_mutex held: the page's bytes changed, so its copy on the GPU has to.
+void touch_gpu_page(uint64_t page, const std::shared_ptr<Section>& section, uint64_t offset) {
+    for (auto [v, end] = g_view_of.equal_range(page); v != end; ++v)
+        if (in_gpu_window(v->second)) {
+            g_gpu_changes[v->second] = {section, offset};
+            break;
+        }
+}
+struct GpuFlush {
+    ~GpuFlush() {  // the GPU's side waits for the next submission (gpu_window_flush)
+        for (const uintptr_t address : g_newly_mapped) rt::xmem::title_memory_written(address, kPhysicalPageSize);
+        g_newly_mapped.clear();
+    }
+};
+const bool g_gpu_window_flush_set = (rt::xmem::gpu_window_flush = [] { const std::lock_guard lock(g_phys_mutex); flush_gpu_changes(); }, true);
+
 // With g_phys_mutex held. Unmaps the page at `address` if one is mapped there; the address becomes a placeholder again.
 bool unmap_page(uintptr_t address) {
     const FaultLockExclusive lock;
@@ -524,6 +574,13 @@ bool unmap_page(uintptr_t address) {
                                        MEM_PRESERVE_PLACEHOLDER)) {
         return false;
     }
+    if (in_gpu_window(address)) g_gpu_changes[address] = {};
+    else touch_gpu_page(it->second.page, it->second.section, it->second.offset);  // the CPU is done with it
+    for (auto [v, end] = g_view_of.equal_range(it->second.page); v != end; ++v)
+        if (v->second == address) {
+            g_view_of.erase(v);
+            break;
+        }
     g_mapped.erase(it);
     return true;
 }
@@ -546,6 +603,9 @@ bool map_page(uintptr_t address, uint64_t page, DWORD protect) {
                                                    protect, nullptr, 0);
     if (!view) return false;
     g_mapped[address] = MappedPage{page, it->second.section, it->second.offset};
+    if (in_gpu_window(address)) g_gpu_changes[address] = {it->second.section, it->second.offset};
+    g_view_of.emplace(page, address);
+    g_newly_mapped.push_back(address);
     return true;
 }
 
@@ -557,34 +617,36 @@ void* section_bytes(uint64_t page) {
     return VirtualAlloc(backing, kPhysicalPageSize, MEM_COMMIT, PAGE_READWRITE) ? backing : nullptr;
 }
 
-// With g_phys_mutex held. Maps `page` (0: unmap) at a pool address: the bytes follow the page.
+// With g_phys_mutex held. Maps `page` (0: unmap) at a pool address: its bytes are copied there.
 void map_pool_page(uintptr_t address, uint64_t page) {
     const auto at = g_pool_page_at.find(address);
     if (at != g_pool_page_at.end()) {
         if (at->second == page) return;
         const auto old = g_pool_pages.find(at->second);
-        if (old != g_pool_pages.end() && old->second.address == address) {
-            if (void* const bytes = section_bytes(at->second)) {
-                std::memcpy(bytes, reinterpret_cast<const void*>(address), kPhysicalPageSize);
-                old->second = {0, true};
-            } else {
-                g_pool_pages.erase(old);  // the page was freed
+        if (old != g_pool_pages.end()) {
+            auto& where = old->second.addresses;
+            where.erase(std::remove(where.begin(), where.end(), address), where.end());
+            if (where.empty()) {
+                if (void* const bytes = section_bytes(at->second)) {
+                    std::memcpy(bytes, reinterpret_cast<const void*>(address), kPhysicalPageSize);
+                    old->second.stored = true;
+                } else {
+                    g_pool_pages.erase(old);  // the page was freed
+                }
             }
         }
         g_pool_page_at.erase(at);
     }
     if (!page) return;
     PoolPage& now = g_pool_pages[page];
-    if (now.address) {
-        std::memcpy(reinterpret_cast<void*>(address), reinterpret_cast<const void*>(now.address), kPhysicalPageSize);
-    } else if (now.stored) {
-        if (const void* const bytes = section_bytes(page))
-            std::memcpy(reinterpret_cast<void*>(address), bytes, kPhysicalPageSize);
-    }
-    const bool moved = now.address || now.stored;
-    now = {address, false};
+    const void* from = nullptr;
+    if (!now.addresses.empty()) from = reinterpret_cast<const void*>(now.addresses.front());
+    else if (now.stored) from = section_bytes(page);
+    if (from) std::memcpy(reinterpret_cast<void*>(address), from, kPhysicalPageSize);
+    now.addresses.push_back(address);
+    now.stored = false;
     g_pool_page_at[address] = page;
-    if (moved) rt::xmem::title_memory_written(address, kPhysicalPageSize);
+    if (from) rt::xmem::title_memory_written(address, kPhysicalPageSize);
 }
 
 enum class PageCommit { not_ours, committed_before, committed_now, failed };
@@ -719,7 +781,7 @@ BOOL WINAPI XMemAllocatePhysicalPages(uint64_t attributes, uint64_t* page_count,
         *page_count = 0;
         return FALSE;
     }
-    const auto section = std::make_shared<Section>(handle);
+    const auto section = std::make_shared<Section>(handle, static_cast<size_t>(bytes));
     if (!section->scratch) {
         *page_count = 0;
         return FALSE;
@@ -781,6 +843,7 @@ void* WINAPI XMemMapPhysicalPages(void* address, uint64_t page_count, const uint
         return nullptr;
     }
     const std::lock_guard lock(g_phys_mutex);
+    const GpuFlush flush;
     if (in_pool(start, page_count * kPhysicalPageSize)) {
         for (uint64_t i = 0; i < page_count; ++i)
             map_pool_page(start + i * kPhysicalPageSize, page_array ? page_array[i] : 0);
@@ -818,6 +881,7 @@ BOOL WINAPI XMemMapPhysicalPagesScatter(void* const* addresses, uint32_t page_co
         return FALSE;
     }
     const std::lock_guard lock(g_phys_mutex);
+    const GpuFlush flush;
     for (uint32_t i = 0; i < page_count; ++i) {
         const uintptr_t address = reinterpret_cast<uintptr_t>(addresses[i]);
         if (!aligned_page_address(address)) {
@@ -842,6 +906,63 @@ BOOL WINAPI XMemMapPhysicalPagesScatter(void* const* addresses, uint32_t page_co
     }
     return TRUE;
 }
+
+// rt::xmem::copy_page_mappings_fn (xmem.h), for the console queue's CopyPageMappingsBatchX: each destination page gets
+// a view of the physical page mapped at its source page, so both addresses are one memory, as two XMemMapPhysicalPages
+// calls with the same page make them. Every source page is looked up before any destination page changes, so a source
+// range that overlaps the destination maps what was there before the call.
+bool copy_page_mappings(void* destination, const void* source, uint64_t pages, bool repeat_first) {
+    const uintptr_t to = reinterpret_cast<uintptr_t>(destination);
+    const uintptr_t from = reinterpret_cast<uintptr_t>(source);
+    constexpr uintptr_t kMax = (std::numeric_limits<uintptr_t>::max)();
+    if (!aligned_page_address(to) || !aligned_page_address(from) || pages > kMax / kPhysicalPageSize ||
+        to > kMax - pages * kPhysicalPageSize || (!repeat_first && from > kMax - pages * kPhysicalPageSize)) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return false;
+    }
+    if (!placeholder_api().available()) {
+        SetLastError(ERROR_NOT_SUPPORTED);
+        return false;
+    }
+    const std::lock_guard lock(g_phys_mutex);
+    const GpuFlush flush;
+    if (!source && in_pool(to, pages * kPhysicalPageSize)) {
+        for (uint64_t i = 0; i < pages; ++i) map_pool_page(to + i * kPhysicalPageSize, 0);
+        return true;
+    }
+    if (!source) {
+        for (uint64_t i = 0; i < pages; ++i) {
+            if (!unmap_page(to + i * kPhysicalPageSize)) return false;
+        }
+        return true;
+    }
+    if (in_pool(to, pages * kPhysicalPageSize)) {
+        std::vector<uint64_t> found(static_cast<size_t>(pages), 0);
+        for (uint64_t i = 0; i < pages; ++i) {
+            const uintptr_t at = from + (repeat_first ? 0 : i) * kPhysicalPageSize;
+            if (const auto it = g_pool_page_at.find(at); it != g_pool_page_at.end()) found[static_cast<size_t>(i)] = it->second;
+            else if (const auto view = g_mapped.find(at); view != g_mapped.end()) found[static_cast<size_t>(i)] = view->second.page;
+        }
+        for (uint64_t i = 0; i < pages; ++i) map_pool_page(to + i * kPhysicalPageSize, found[static_cast<size_t>(i)]);
+        return true;
+    }
+    const Window* const window = find_window(to, pages * kPhysicalPageSize);
+    if (!window) {
+        SetLastError(ERROR_INVALID_ADDRESS);
+        return false;
+    }
+    std::vector<uint64_t> found(static_cast<size_t>(pages), 0);
+    for (uint64_t i = 0; i < pages; ++i) {
+        const auto it = g_mapped.find(from + (repeat_first ? 0 : i) * kPhysicalPageSize);
+        if (it != g_mapped.end()) found[static_cast<size_t>(i)] = it->second.page;
+    }
+    const DWORD protect = view_protect(*window);
+    for (uint64_t i = 0; i < pages; ++i) {
+        if (!map_page(to + i * kPhysicalPageSize, found[static_cast<size_t>(i)], protect)) return false;
+    }
+    return true;
+}
+[[maybe_unused]] const bool g_copy_page_mappings_set =(rt::xmem::copy_page_mappings_fn = &copy_page_mappings, true);
 
 UINT WINAPI XMemGetWriteWatch(DWORD flags, void* base_address, SIZE_T region_size, void** addresses, ULONG_PTR* count,
                               ULONG* granularity) {
@@ -1028,22 +1149,51 @@ bool write_title_bytes(const void* address, const void* bytes, std::size_t size)
 
 bool write_physical_pages(const uint64_t* pages, size_t offset, const void* bytes, size_t size) {
     const std::lock_guard lock(g_phys_mutex);
+    const GpuFlush flush;
     pages += offset / kPhysicalPageSize;
     offset %= kPhysicalPageSize;
     for (size_t done = 0; done < size; ++pages, offset = 0) {
         const size_t part = (std::min)(size - done, static_cast<size_t>(kPhysicalPageSize) - offset);
         const auto pool = g_pool_pages.find(*pages);
-        const bool mapped = pool != g_pool_pages.end() && pool->second.address && g_pages.count(*pages);
-        auto* const to = static_cast<uint8_t*>(mapped ? reinterpret_cast<void*>(pool->second.address) : section_bytes(*pages));
-        if (!to) return false;
-        std::memcpy(to + offset, static_cast<const uint8_t*>(bytes) + done, part);
-        if (!mapped) g_pool_pages[*pages].stored = true;
-        else title_memory_written(reinterpret_cast<uintptr_t>(to) + offset, part);
+        const bool mapped = pool != g_pool_pages.end() && !pool->second.addresses.empty() && g_pages.count(*pages);
+        if (mapped) {
+            for (const uintptr_t to : pool->second.addresses) {
+                std::memcpy(reinterpret_cast<void*>(to + offset), static_cast<const uint8_t*>(bytes) + done, part);
+                title_memory_written(to + offset, part);
+            }
+        } else {
+            auto* const to = static_cast<uint8_t*>(section_bytes(*pages));
+            if (!to) return false;
+            std::memcpy(to + offset, static_cast<const uint8_t*>(bytes) + done, part);
+            g_pool_pages[*pages].stored = true;
+            for (auto [v, end] = g_view_of.equal_range(*pages); v != end; ++v) title_memory_written(v->second + offset, part);
+            if (const auto live = g_pages.find(*pages); live != g_pages.end()) touch_gpu_page(*pages, live->second.section, live->second.offset);
+        }
         done += part;
     }
     return true;
 }
-const bool g_physical_write_set = (physical_write_fn = &write_physical_pages, commit_range_fn = &commit_physical_range, true);
+void propagate_write(uintptr_t address, size_t size) {
+    const std::lock_guard lock(g_phys_mutex);
+    const GpuFlush flush;
+    for (uintptr_t end = address + size; address < end;) {
+        const uintptr_t page_at = address & ~uintptr_t{kPhysicalPageSize - 1};
+        const size_t part = (std::min)(end - address, static_cast<size_t>(page_at + kPhysicalPageSize - address));
+        if (const auto at = g_pool_page_at.find(page_at); at != g_pool_page_at.end())
+            for (const uintptr_t other : g_pool_pages[at->second].addresses)
+                if (other != page_at) {
+                    std::memcpy(reinterpret_cast<void*>(other + (address - page_at)), reinterpret_cast<const void*>(address), part);
+                    title_memory_written(other + (address - page_at), part);
+                }
+        if (const auto view = g_mapped.find(page_at); view != g_mapped.end()) {
+            touch_gpu_page(view->second.page, view->second.section, view->second.offset);
+            for (auto [v, end] = g_view_of.equal_range(view->second.page); v != end; ++v)
+                if (v->second != page_at) title_memory_written(v->second + (address - page_at), part);
+        }
+        address += part;
+    }
+}
+const bool g_physical_write_set = (propagate_fn = &propagate_write, physical_write_fn = &write_physical_pages, commit_range_fn = &commit_physical_range, true);
 
 bool commit_physical_pages(const uint64_t* page_array, size_t count) {
     if (count == 0) return true;

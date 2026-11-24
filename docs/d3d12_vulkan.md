@@ -9,9 +9,9 @@ hand-written RDNA2 run through the translator in `d3d12_translated_draw_test`, a
 `d3d12_m2_textured_test`. `D3D12XboxCreateDevice` uses it when `LEONIDA_D3D12=vulkan` is
 set and the host PC device otherwise. Root signatures (packed into the 32 user-data dwords), graphics and compute
 PSOs, draws, dispatches, `ExecuteIndirect`, and presentation through `PresentX` or a DXGI swapchain are implemented
-and have GPU tests; which present path the game uses is still open (question 6). Shader-resource views of buffers,
-pipeline-state streams (`CreatePipelineState`), tessellation and stream-output pipelines are not implemented, and
-mesh shaders are reported as not supported (stream PSOs and mesh shaders: D3D-29, #1712). The device reports
+and have GPU tests; which present path the game uses is still open (question 6). Buffer SRVs and pipeline-state
+streams (`CreatePipelineState`) are implemented. Mesh PSOs, `DispatchMesh`, and indirect mesh dispatches
+are supported with `VK_EXT_mesh_shader`; GPU count buffers have additional requirements (section 4.7). The device reports
 `RaytracingTier` as `NOT_SUPPORTED`, yet `BuildRaytracingAccelerationStructure` builds XDXR BVH4 structures on the
 GPU (section 4.8).** This is the plan for
 replacing the console's `d3d12_xs.dll` with an implementation that records D3D12 commands and replays them on
@@ -837,9 +837,11 @@ The compute path, end to end:
     so descriptor bytes the application writes itself are what shaders load.
   - Upload and readback buffers keep their own memory, and their VA is their device address minus the heap base.
   - Shader programs (FSSM blobs) are copied in as the code base.
-- **`CreateRootSignature`** parses the blob with `parse_rts0` and keeps each parameter's place in two layouts:
-  `pack()` for the graphics bind point and `pack_stage(Stage::Compute)` for the compute one (from s4, one dword per
-  table; section 3.5, D3D-448). A signature neither can place (more than 32 user dwords: the spill layout is open; the
+- **`CreateRootSignature`** parses the blob with `parse_rts0` and keeps each parameter's place in two layouts, both
+  the console's (one dword per table; section 3.5, D3D-448): `pack_stage(Stage::Vertex)` for the graphics bind point
+  (from s8, the graphics root window) and `pack_stage(Stage::Compute)` for the compute one (from s4). It also checks
+  `pack_stage(Stage::Mesh)`: a signature past a mesh shader's 16-dword window is logged, and `DispatchMesh` with it
+  invalidates the list. A signature neither bind point can place (past s31: the spill layout is open; the
   translated shaders have no below-base spill-pointer candidates) is refused with both reasons; one only a single layout places is created with a log line, and binding it at the other bind point
   invalidates the list. Before
   that it answers as the host runtime does (`compare_invalid_arguments`, "root signature:", RTX 5070 / 621.14):
@@ -1757,7 +1759,8 @@ This is the least verifiable part of the layer. D3D12 gives the application a ro
 turns it into the user SGPRs (`s0..s31`) that the shader reads. The translator already copies those 32 dwords from
 push constants into `s0..s31`. The layer must produce them.
 
-The default mapping (implemented by `rt::rootsig::pack` in `runtime/src/root_signature.{h,cpp}`) follows root
+The first mapping the layer used (`rt::rootsig::pack` in `runtime/src/root_signature.{h,cpp}`, kept for the tools and
+tests that compare the two models; the runtime now uses the console layout below at both bind points) follows root
 parameter order:
 
 | Root parameter | User-data dwords |
@@ -1797,12 +1800,27 @@ below 4 GiB). A parameter that does not fit goes, with every later one, to the s
 - **Vertex/pixel/geometry s8 and mesh s16: a hypothesis.** It rests on the census above only; no signature
   confirms these bases, and visibility is not modelled (every parameter takes its place in every stage).
 
-The runtime uses the console layout for the **compute** bind point only. Graphics keeps `pack()`: every stage of a
-pipeline reads `s0..s31` from one push-constant block at offset 0 (`tools/rdna2spirv.py`, `ShaderUserData` in
-`runtime/src/vulkan_replay.h`), so a mesh shader (base s16) and a pixel shader (base s8) in one pipeline would need
-the same root argument at two offsets. That needs per-stage user-data windows in the translator's push-constant
-contract (D3D-448 follow-up). A root signature carries both layouts; one that only one of them can place is
-created, and binding it at the other bind point invalidates the command list (`Close` returns `E_INVALIDARG`).
+The runtime uses the console layout at **both** bind points. Every stage of a pipeline reads one push-constant block
+(`ShaderUserData` in `runtime/src/vulkan_replay.h`), so the graphics bind point lays a signature out once with
+`pack_stage(Stage::Vertex)`: root dword k at push dword 8 + k. A vertex, pixel or geometry shader reads SGPR i from
+push dword i, so it finds the arguments at s8.. as the console puts them. **The graphics root window (D3D-448
+follow-up):** a mesh shader's root arguments start at s16, so the translator loads its s16..s31 from push dwords
+8..23 instead (`user_data_dword` in `tools/rdna2spirv.py`); a mesh and a pixel shader of one pipeline then find each
+argument in the same dword. A mesh shader's s8..s15 are below its base and read 0; s0..s7 stay push dwords 0..7
+for every stage. The index records the window as `"root_window": {"sgpr": 16, "dword": 8}`, and a mesh PSO whose
+mesh shader lacks it (translated before) is refused with a log line asking for the shaders stage again. The mesh
+window holds 16 dwords (s16..s31) where the others hold 24 (s8..s31): a signature that fits the graphics layout but
+not the mesh window is created with a log line, and `DispatchMesh` with it invalidates the list. A signature past
+the graphics window (more than 24 dwords from s8) goes, on the console, to the argument block behind `s[0:1]`, which
+is modelled for compute only (ROOT-SIG-SPILL-MODEL); until it is for graphics, such a signature keeps `pack()`'s
+layout at the graphics bind point (from s0, two dwords per table, `RootArgumentLayout::graphics_console` false) rather
+than being refused: the retail title creates one at start-up (29..32 dwords) and stops if it is refused. Live evidence for
+s8 and one dword per table: on the retail frame loop the VS of a textured draw reads table slots 0 and 2 through s8
+and its PS slot 1, which hold exactly the buffer, constants and texture the title bound (issue #14, comment
+7131556366, native Windows, RTX 5080). What a mesh shader reads in s8..s15 is not measured:
+`user_sgpr_census.py --base ms=16` on a corpus lists any read below s16. A root signature carries both layouts;
+one that only one of them can place is created, and binding it at the other bind point invalidates the command list
+(`Close` returns `E_INVALIDARG`).
 `s0..s3` of a compute dispatch are the driver's block; the layer leaves them zero (109 CS read `s1` as a constant,
 42 `s3`; their meaning is open).
 
@@ -2118,9 +2136,12 @@ Pipeline creation:
   shader, root signature content or state, a changed byte, a truncated blob or a pointer with size 0 give
   `E_INVALIDARG`; a null pointer with a size is ignored; another adapter gives `D3D12_ERROR_ADAPTER_NOT_FOUND` and
   another driver `D3D12_ERROR_DRIVER_VERSION_MISMATCH`. `ID3D12PipelineLibrary` is an in-memory map plus the Vulkan
-  cache. Its arguments answer as the host's (`d3d12_pipeline_library_host_test`, 74 values from 46 calls that need no
-  PSO, each run on the host in a process of its own, since a call it faults on leaves its runtime broken and the next
-  one failing fast; RTX 3060, driver 610.88):
+  cache. `d3d12_pipeline_library_host_test` compares public argument checks with the host. It runs each host
+  call in a separate process because a fault can leave the device unusable. It reports serialized sizes and the
+  result of flipping a trailing byte for each device's own format. `d3d12_pipeline_library_test` checks that the
+  layer rejects a nonzero reserved field in its `LPL1` header. On Windows 11 build 26100 (RTX 5070 Ti,
+  driver 610.74), all 72 public-argument comparisons matched. The previous 74-value run (RTX 3060, driver
+  610.88) included the two results from the trailing-byte case.
   - `CreatePipelineLibrary`: a foreign, truncated or corrupt blob, the other device's blob, or a null pointer with a
     size is `E_INVALIDARG`, and `*ppPipelineLibrary` is left as it was. One of the layer's own blobs from another
     format version is `D3D12_ERROR_DRIVER_VERSION_MISMATCH`, the documented code for a cache from another driver.
@@ -2722,6 +2743,11 @@ The console has two list topologies Vulkan lacks: rectangle list (`IASetPrimitiv
   stores `0x7fff` vs WARP `0x8000` (all on `main` before this change; same 1-ulp class as SRGB, not addressed here).
   `D32_FLOAT` and `D32_FLOAT_S8X24_UINT` match WARP.
   This does not add typed-view reinterpretation of typeless resources.
+- **Depth clears.** Microsoft documents a `[0, 1]` clamp. On Windows 11 build 26100, both WARP and native D3D12 on
+  an RTX 5070 Ti (610.74) preserved finite out-of-range `D32_FLOAT` values and quiet NaN in full and rectangle
+  clears. Replay preserves those values when the Vulkan device has enabled `VK_EXT_depth_range_unrestricted`.
+  With the extension disabled, replay clamps finite values to `[0, 1]` and uses zero for NaN. The UNORM depth
+  format conversions still apply. [D3D12 reference](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12graphicscommandlist-cleardepthstencilview)
 - `D3D12XBOX_RESOURCE_FLAG_FORCE_TEXTURE_COMPATIBILITY` (public release note) and DCC: ignore the flag, let the
   Vulkan driver choose compression, and fail loudly if the game aliases a buffer over a compressed image or reads
   raw DCC metadata.
@@ -2765,7 +2791,11 @@ mapped stages/accesses, and if no single layout serves all uses, use `GENERAL` a
 - Enhanced barriers (`D3D12_BARRIER_SYNC_*`, `D3D12_BARRIER_ACCESS_*`, `D3D12_BARRIER_LAYOUT_*`) map directly to
   `VkPipelineStageFlags2`, `VkAccessFlags2` and `VkImageLayout` (`vulkan_sync`, `vulkan_barrier_access`,
   `vulkan_layout`). Queue-specific layouts map like their generic forms; ray tracing, video and split scopes use
-  `ALL_COMMANDS`; `LayoutBefore = UNDEFINED` or the discard flag becomes `oldLayout = UNDEFINED`.
+  `ALL_COMMANDS`; `LayoutBefore = UNDEFINED` or the discard flag becomes `oldLayout = UNDEFINED`. `SYNC_COPY` is
+  `COPY | CLEAR`, not `COPY` alone: `WriteBufferImmediate` is recorded as `vkCmdUpdateBuffer` and
+  `ResolveQueryData`'s never-written queries as `vkCmdFillBuffer`, which synchronization2 runs in the `CLEAR` stage
+  (D3D-838; `vk_command_replay_test` part K is a read-after-write hazard under synchronization validation without
+  it).
 - `DiscardResource` (D3D-26): each discarded image subresource gets a barrier from `oldLayout = UNDEFINED` to the
   layout the tracker already has for it, so the driver may drop the contents while later commands see no layout
   change. The other cases are no-ops, which "contents undefined" allows: buffers, discards with rectangles (only
@@ -3074,6 +3104,14 @@ queue they came on (one `VkQueue` behind all of them).
   keeps the app's sync interval.
   `GetFrameStatisticsX` keeps the last 64 frames and reports the event, present and display times (not render;
   `PercentScanned` only for a frame shown at once by `ImmediateThresholdPercent`, else 0); `S_FALSE` with count 0 for what it does not have.
+  *Pacing drift reporting (BL-6):* `FramePacer` keeps fixed-capacity ring buffers (`frame_pacing_window = 1024`) of
+  present-to-present frame intervals and origin-to-present latencies (clearing the last-present anchor across
+  `SuspendX`/`ResumeX` so suspended pauses are excluded), computing nearest-rank `p50`/`p95`/`p99` and the mean drift
+  against the active target interval (`FramePacer::pacing_summary()`). On teardown after at least one present,
+  `XboxPresentation` logs a single `[rt] present: pacing summary ...` line on stderr, which `tools/boot_trace.py`
+  surfaces beside the D3D12 call counts. Confirmed on a fake clock by `frame_pacer_test` (known 100-frame distribution,
+  positive and negative drift, ring-buffer wrap-around, suspend/resume exclusion, uncapped mode) and by
+  `tests/test_boot_trace.py`.
 - *`PresentX`*: 0 planes presents a black frame (no token needed). 1 plane blits plane 0's first resource (a
   single-sample 2D colour texture in `PRESENT`) to the swapchain image, limited to `pSrcViewRects[0]` when set
   (bilinear, so the rectangle's outer texels blend with their neighbours). The blit converts between formats; an sRGB
@@ -3440,7 +3478,14 @@ Not implemented yet:
 - `D3D12_COMMAND_SIGNATURE_DESC` describes the argument stride and a list of argument types. Simple draw,
   draw-indexed, dispatch and mesh-dispatch signatures map to `vkCmdDraw*Indirect`, `vkCmdDispatchIndirect` and
   `vkCmdDrawMeshTasksIndirectEXT`; use the `*Count` variants (`VK_KHR_draw_indirect_count`, core 1.2) when the
-  `ExecuteIndirect` call supplies a count buffer.
+  `ExecuteIndirect` call supplies a count buffer for draw or draw-indexed signatures.
+- A single `DISPATCH_MESH` argument is supported on direct lists. Recording captures
+  the graphics PSO, root arguments and render targets as `DispatchMesh` does. Vulkan reads the three group counts
+  from the argument buffer at execution, using the signature's byte stride. With a count buffer, the same GPU helper
+  as compute indirect dispatch prepares compact mesh records and zeroes those beyond the clamped count before
+  rendering. This requires buffer device addresses and keeps the helper dispatch outside pipeline statistics queries.
+  Fixed counts work on mesh-capable devices without that path.
+  Mesh signatures with additional arguments are still unsupported.
 - Signatures that change root constants, vertex/index buffers or descriptors per argument cannot be expressed by
   one Vulkan indirect call. Use a compute expansion pass that writes a Vulkan-shaped indirect buffer, or
   `VK_NV_device_generated_commands` on NVIDIA. Start with the simple signatures; the trace will show which

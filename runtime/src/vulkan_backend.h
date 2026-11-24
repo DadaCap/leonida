@@ -104,9 +104,10 @@ struct VulkanDeviceFunctions {
     X(vkCmdBindVertexBuffers2) X(vkCmdBindIndexBuffer) X(vkCmdSetViewport) X(vkCmdSetScissor)                  \
     X(vkCmdSetPrimitiveTopology) X(vkCmdSetPrimitiveRestartEnable) X(vkCmdSetStencilReference)                          \
     X(vkCmdSetBlendConstants) X(vkCmdDraw)                                                                              \
-    X(vkCmdDrawIndexed) X(vkCreateGraphicsPipelines) X(vkQueueBindSparse) X(vkGetImageSparseMemoryRequirements)   \
+    X(vkCmdDrawIndexed) X(vkCreateGraphicsPipelines) X(vkQueueBindSparse) X(vkCreateFence) X(vkWaitForFences) X(vkResetFences) X(vkGetImageSparseMemoryRequirements)   \
     X(vkCreatePipelineCache) X(vkDestroyPipelineCache)                                                        \
     X(vkCreateEvent) X(vkDestroyEvent) X(vkResetEvent) X(vkCmdSetEvent) X(vkCmdWaitEvents) X(vkCmdDrawMeshTasksEXT) \
+    X(vkCmdDrawMeshTasksIndirectEXT)                                                                         \
     X(vkCreateRenderPass2) X(vkDestroyRenderPass) X(vkCreateFramebuffer) X(vkDestroyFramebuffer)               \
     X(vkCmdBeginRenderPass) X(vkCmdEndRenderPass)
 #define LEONIDA_VK_MEMBER(name) PFN_##name name = nullptr;
@@ -823,6 +824,7 @@ private:
 
             if (res == VK_ERROR_DEVICE_LOST || device_lost_.load(std::memory_order_acquire)) {
                 device_lost_.store(true, std::memory_order_release);
+                gpu_debug().report();
                 std::vector<Entry> drained = std::move(pending_);
                 pending_.clear();
                 dispatch_outside_lock(lock, drained, signal_event_);
@@ -853,6 +855,7 @@ private:
                 for (Entry& e : pending_) ready.push_back(std::move(e));
                 pending_.clear();
                 device_lost_.store(true, std::memory_order_release);
+                gpu_debug().report();
                 dispatch_outside_lock(lock, ready, signal_event_);
                 return;
             }
@@ -964,8 +967,12 @@ public:
         replay_.update_buffer = vk.vkCmdUpdateBuffer;
         replay_.draw_indirect = vk.vkCmdDrawIndirect;
         replay_.draw_indexed_indirect = vk.vkCmdDrawIndexedIndirect;
-        replay_.draw_indirect_count = vk.vkCmdDrawIndirectCount;
-        replay_.draw_indexed_indirect_count = vk.vkCmdDrawIndexedIndirectCount;
+        // Gated on enabled device features via configure_indirect_draw(): vkGetDeviceProcAddr still hands out core
+        // Vulkan 1.2 drawIndirectCount entry points when the feature is off, and multiDrawIndirect defaults to the
+        // drawCount=1 fallback until enabled.
+        replay_.draw_indirect_count = nullptr;
+        replay_.draw_indexed_indirect_count = nullptr;
+        replay_.multi_draw_indirect = false;
         replay_.dispatch_indirect = vk.vkCmdDispatchIndirect;
         if (conditional_rendering) {  // a driver may hand out these pointers even when the extension is off
             replay_.begin_conditional_rendering = vk.vkCmdBeginConditionalRenderingEXT;
@@ -994,6 +1001,7 @@ public:
         replay_.set_blend_constants = vk.vkCmdSetBlendConstants;
         replay_.draw = vk.vkCmdDraw;
         replay_.draw_mesh_tasks = vk.vkCmdDrawMeshTasksEXT;  // null unless VK_EXT_mesh_shader is enabled
+        replay_.draw_mesh_tasks_indirect = vk.vkCmdDrawMeshTasksIndirectEXT;
         replay_.draw_indexed = vk.vkCmdDrawIndexed;
         replay_.graphics_pipeline = [this](std::uintptr_t id) -> const GraphicsPipeline* {
             const auto it = graphics_pipelines_.find(id);
@@ -1007,6 +1015,12 @@ public:
             BufferVaIndex<ResourceId>::Hit hit{};
             if (!buffer_vas_.find(va, hit, size)) {  // prefers an aliasing buffer that holds all of it
                 // The title's own memory in the arena has no resource: a view names it by address alone.
+                if (window_buffer_ && va - window_first_ < window_size_) {
+                    buffer = window_buffer_;
+                    offset = va - window_first_;
+                    size = std::min<std::uint64_t>(size, window_size_ - offset);
+                    return true;
+                }
                 if (va < title_first_ || va >= title_end_) return false;
                 buffer = title_buffer_;
                 offset = va;
@@ -1025,7 +1039,7 @@ public:
         // binding's host pointer is null on DEFAULT and READBACK heaps, whose mapped bytes the GPU can write.
         replay_.host_at = [this](std::uint64_t va, std::uint64_t bytes, const std::uint8_t*& host) {
             BufferVaIndex<ResourceId>::Hit hit{};
-            if (!buffer_vas_.find(va, hit)) return HostReadStatus::absent;
+            if (!buffer_vas_.find(va, hit, bytes)) return HostReadStatus::absent;
             const ResourceBinding* b = resolve(hit.id);
             if (!b) return HostReadStatus::absent;
             if (!b->host) return HostReadStatus::not_cpu_written;
@@ -1056,7 +1070,7 @@ public:
                     const std::uint64_t from = b.update ? base + (b.src_va ? b.src_va : b.dst_va) : 0;
                     if (b.is_tlas) {
                         xdxr_->record_tlas(cb, layout, b.instances_va ? base + b.instances_va : 0, base + b.dst_va,
-                                           base + b.scratch_va, base, from);
+                                           base + b.scratch_va, base, from, title_base_, title_end_);
                     } else {
                         std::vector<XdxrTriangles> geometries;
                         xdxr_inputs(b, &geometries, base);
@@ -1140,6 +1154,14 @@ public:
                                     const VkPhysicalDeviceLimits& limits) {
         std::unique_lock lock(resource_mutex_);
         counted_dispatch_ = std::make_unique<IndirectDispatchCounter>(get, device_, memory, limits);
+    }
+    // Gates graphics ExecuteIndirect replay on the Vulkan features enabled on `device`: without multiDrawIndirect,
+    // fixed multi-draw falls back to drawCount=1 calls; without drawIndirectCount, counted draws are rejected with
+    // ReplayResult::unsupported rather than invoking vkCmdDrawIndirectCount / vkCmdDrawIndexedIndirectCount.
+    void configure_indirect_draw(bool multi_draw_indirect, bool draw_indirect_count) {
+        replay_.multi_draw_indirect = multi_draw_indirect;
+        replay_.draw_indirect_count = draw_indirect_count ? vk.vkCmdDrawIndirectCount : nullptr;
+        replay_.draw_indexed_indirect_count = draw_indirect_count ? vk.vkCmdDrawIndexedIndirectCount : nullptr;
     }
     VkDevice device() const { return device_; }
 
@@ -1281,11 +1303,21 @@ public:
     // The device address of the GPU address arena: console VAs are offsets from it (docs section 3.3).
     // execute() copies replay_ under a shared resource_mutex_, so writers hold it uniquely.
     // The part [first, end) of the arena's buffer that is the title's memory (buffer_at).
-    void set_title_memory(VkBuffer buffer, std::uint64_t first, std::uint64_t end) {
+    // `address`: the title's own address of the arena's start (its instance descs name structures by it).
+    void set_title_memory(VkBuffer buffer, std::uint64_t first, std::uint64_t end, std::uint64_t address) {
         std::unique_lock lock(resource_mutex_);
+        title_base_ = address;
         title_buffer_ = buffer;
         title_first_ = first;
         title_end_ = end;
+    }
+
+    // The title's paged window (a sparse buffer) at arena VA `first`.
+    void set_paged_window(VkBuffer buffer, std::uint64_t first, std::uint64_t size) {
+        std::unique_lock lock(resource_mutex_);
+        window_buffer_ = buffer;
+        window_first_ = first;
+        window_size_ = size;
     }
 
     void set_heap_base(std::uint64_t heap_base) {
@@ -1307,6 +1339,11 @@ public:
         replay_.quad_indices = buffer;
         replay_.quad_indices_offset = offset;
         replay_.quad_index_count = count;
+    }
+
+    void set_depth_range_unrestricted(bool enabled) {
+        std::unique_lock lock(resource_mutex_);
+        replay_.depth_range_unrestricted = enabled;
     }
 
     // Physical-device COLOR_ATTACHMENT format check for reinterpreted UAV clears.
@@ -1574,6 +1611,7 @@ public:
 
     void mark_device_lost() noexcept {
         device_lost_.store(true, std::memory_order_release);
+        gpu_debug().report();
         if (fence_dispatcher_) {
             try {
                 fence_dispatcher_->notify_device_lost();
@@ -1760,7 +1798,9 @@ private:
     QueueHolds<VkSemaphore> holds_;
     std::unordered_map<ResourceId, ResourceBinding> resources_;
     VkBuffer title_buffer_ = VK_NULL_HANDLE;
-    std::uint64_t title_first_ = 0, title_end_ = 0;
+    std::uint64_t title_first_ = 0, title_end_ = 0, title_base_ = 0;
+    VkBuffer window_buffer_ = VK_NULL_HANDLE;
+    std::uint64_t window_first_ = 0, window_size_ = 0;
     BufferVaIndex<ResourceId> buffer_vas_;  // the addressable buffers of resources_, by VA range (buffer_at)
     std::unordered_map<ResourceId, std::shared_ptr<SparseResource>> sparse_resources_;
     std::unordered_map<std::uintptr_t, ComputePipeline> pipelines_;
@@ -1838,7 +1878,8 @@ public:
         if (context_.is_device_lost()) return UINT64_MAX;
         std::uint64_t value = 0;
         const VkResult result = context_.vk.vkGetSemaphoreCounterValue(context_.device(), semaphore_, &value);
-        if (result == VK_ERROR_DEVICE_LOST) {
+        // After a loss NVIDIA's driver answers success and the highest value for every timeline (measured, 621.24).
+        if (result == VK_ERROR_DEVICE_LOST || (result == VK_SUCCESS && value == UINT64_MAX)) {
             context_.mark_device_lost();
             return UINT64_MAX;
         }
@@ -2652,6 +2693,18 @@ private:
         if (context_.vk.vkBeginCommandBuffer(command_buffer, &begin) != VK_SUCCESS) {
             discard();
             return ReplayResult::unsupported;
+        }
+        // D3D12 ends every ExecuteCommandLists with all its work done and its writes visible to the next one on the
+        // queue (implicit state decay relies on it), and a list may then touch the same memory without a barrier:
+        // two submissions copying into one buffer, say. Vulkan orders submissions on a queue only by what their
+        // barriers say, so this one starts with a full memory barrier against everything submitted before it
+        // (synchronization validation: WRITE_AFTER_WRITE between vk_queue_test's back-to-back copies).
+        if (context_.vk.vkCmdPipelineBarrier) {  // a mocked context may leave it out
+            VkMemoryBarrier full{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+            full.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+            full.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+            context_.vk.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                             VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &full, 0, nullptr, 0, nullptr);
         }
         if (!tracker_lock.owns_lock()) tracker_lock.lock();
         if (!transfer_only && context_.bindless_prepare_ && !context_.bindless_prepare_(command_buffer)) {

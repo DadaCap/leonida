@@ -45,6 +45,7 @@
 #include <intrin.h>  // _ReturnAddress: slot 61 serves a console caller differently from a host one
 
 #include <atomic>
+#include <tuple>
 #include <functional>
 #include <cerrno>
 #include <cstddef>
@@ -270,6 +271,7 @@ const char* slot_name(unsigned slot) {
         case 62: return "Xbox CreateComputePipelineState";
         case 67: return "Xbox DeserializeComputePipelineStateX";
         case 70: return "Xbox shader-resource view from raw words";
+        case 71: return "Xbox unordered-access view from raw words";
         case 73: return "Xbox CreateCommandListX -> PC CreateCommandList";
         case 74: return "Xbox (pointer, u32, pointer) stand-in";
         case 75: return "CreateCommandQueue1 -> queue proxy";
@@ -846,6 +848,8 @@ static_assert(kFenceCompletedValueSlot >= kFence1PublicSlots && kFenceCompletedV
               "fence slot 12 is past the public chain and inside the table");
 
 struct FenceMirror;
+// CopyPageMappingsBatchX(count, batches, pool, pool pages, flags), past the public chain (queue_copy_page_mappings).
+constexpr unsigned kQueueCopyPageMappingsBatchX = 31;
 
 struct ChildProxy {
     void** vtable;          // offset 0: the caller's ID3D12CommandQueue* / ID3D12Fence* points here
@@ -1564,6 +1568,82 @@ LONG CALLBACK table_overrun_handler(EXCEPTION_POINTERS* info) {
     return EXCEPTION_CONTINUE_SEARCH;  // diagnostics only: the fault goes on to the title's handlers or the crash
 }
 
+// ---- Queue slot 31: CopyPageMappingsBatchX ----
+//
+// Measured on the retail executable (static): game_scarlett_master.exe+0xf2cc7f calls the queue's slot 31
+// (`call [vtable + 0xf8]`) with EDX the batch count, R8 the batches, R9 the base of its physical-page pool, the pool's
+// size in 64 KiB pages as the fifth argument and 0 as the sixth; the result is not tested. It fills a batch at +0xf2ca74
+// as {UINT64 destination; UINT32 range count; const range* ranges} (24 bytes) and a range as {UINT32 kind, start,
+// count} (12 bytes). The kinds: 0 maps pool pages start, start + 1, ... at the destination; 1 maps pool page `start` at
+// every destination page; 2 leaves the destination unmapped; 3 leaves it as it is. Each range moves the destination on
+// by count pages, whatever its kind. The same call shape is in VIctory's queue (copy_page_mappings, "newer" layout,
+// where every slot from 14 on is two later than in older titles). In a boot the pool size matched the title's own
+// XMemAllocatePhysicalPages count exactly. The console maps GPU page tables; here each range becomes xmem's
+// copy_page_mappings_fn, which maps the physical page behind each pool page at its destination, the aliasing two
+// XMemMapPhysicalPages calls with one page give.
+//
+// Without xmem (tests that compile this proxy alone) the slot is refused as before. A range outside the pool, of an
+// unknown kind, or that xmem refuses is skipped and logged once; the call then returns E_INVALIDARG.
+struct ConsolePageRange {
+    std::uint32_t kind, start, count;
+};
+struct ConsolePageBatch {
+    std::uint64_t destination;
+    std::uint32_t count;
+    const ConsolePageRange* ranges;
+};
+static_assert(sizeof(ConsolePageRange) == 12 && sizeof(ConsolePageBatch) == 24, "the title's page batch layout");
+
+constexpr std::uint64_t kConsolePageSize = 0x10000;
+
+bool copy_console_page_range(const ConsolePageRange& range, std::uint64_t destination, std::uint64_t pool,
+                             std::uint32_t pool_pages) {
+    void* const at = reinterpret_cast<void*>(destination);
+    const void* const from = reinterpret_cast<const void*>(pool + std::uint64_t{range.start} * kConsolePageSize);
+    switch (range.kind) {
+        case 0:
+            return std::uint64_t{range.start} + range.count <= pool_pages &&
+                   rt::xmem::copy_page_mappings_fn(at, from, range.count, false);
+        case 1:
+            return range.start < pool_pages && rt::xmem::copy_page_mappings_fn(at, from, range.count, true);
+        case 2:
+            return rt::xmem::copy_page_mappings_fn(at, nullptr, range.count, false);
+        case 3:
+            return true;
+        default:
+            return false;
+    }
+}
+
+HRESULT queue_copy_page_mappings(std::uint64_t count_word, std::uint64_t batches_word, std::uint64_t pool,
+                                 std::uint64_t pool_pages_word) {
+    const auto count = static_cast<std::uint32_t>(count_word);
+    const auto pool_pages = static_cast<std::uint32_t>(pool_pages_word);
+    const auto* const batches = reinterpret_cast<const ConsolePageBatch*>(batches_word);
+    if (count && !batches) return E_INVALIDARG;
+    static std::atomic<bool> first_call{true}, first_refusal{true};
+    if (first_call.exchange(false, std::memory_order_relaxed))
+        std::fprintf(stderr, "[rt] d3d12_xs: queue slot 31 (CopyPageMappingsBatchX) first call: %u batch(es), pool "
+                     "0x%llx of %u pages\n", count, static_cast<unsigned long long>(pool), pool_pages);
+    bool all = true;
+    for (std::uint32_t b = 0; b < count; ++b) {
+        if (!batches[b].ranges) continue;
+        std::uint64_t at = batches[b].destination;
+        for (std::uint32_t r = 0; r < batches[b].count; ++r) {
+            const ConsolePageRange& range = batches[b].ranges[r];
+            if (!copy_console_page_range(range, at, pool, pool_pages)) {
+                all = false;
+                if (first_refusal.exchange(false, std::memory_order_relaxed))
+                    std::fprintf(stderr, "[rt] d3d12_xs: queue slot 31: range kind %u, pool pages %u+%u at 0x%llx not "
+                                 "mapped (pool of %u pages, error %lu); logged once\n", range.kind, range.start,
+                                 range.count, static_cast<unsigned long long>(at), pool_pages, GetLastError());
+            }
+            at += std::uint64_t{range.count} * kConsolePageSize;
+        }
+    }
+    return all ? S_OK : E_INVALIDARG;
+}
+
 // ---- PresentX (console queue slot 32) ----
 //
 // The retail title presents through command-queue slot 32, past the PC queue's 19 slots: PresentX(plane count,
@@ -1712,6 +1792,12 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
         return fence_completed_value_address(self, a1, a2, a3);
     } else {
         note_child_slot<K>(Slot);
+        if constexpr (K == ChildKind::queue && Slot == kQueueCopyPageMappingsBatchX) {
+            if (rt::xmem::copy_page_mappings_fn) {
+                d3d12_trace::record(child_trace_name<K>(Slot));
+                return hr_to_u64(queue_copy_page_mappings(a1, a2, a3, a4));
+            }
+        }
         if constexpr (K == ChildKind::queue && Slot == kQueueExecuteCommandListsX) {
             d3d12_trace::record(child_trace_name<K>(Slot));
             return queue_execute_command_lists(self, a1, a2);
@@ -2056,42 +2142,74 @@ HRESULT proxy_create_command_queue_xbox(DeviceProxy* self, const std::uint32_t* 
     return proxy_create_command_queue(self, &pc, riid, out);
 }
 
-// Xbox device slot 70: (texture_words, view_desc, destination), no return value. The retail executable's SRV writer
-// makes a view from raw descriptions and a GPU address with no resource object (docs/retail_boot_chain.md, stop 14,
-// measured by call shape only). The PC slot 70 is ID3D12Device8::CreatePlacedResource1, which would take the
-// destination handle for a resource description and write through it. The layout of the raw words is not measured,
-// so nothing reads them: the destination gets the PC's null shader-resource view, which a shader reads as zeros, and
-// the call returns. A view that reaches the GPU address needs that layout.
-void proxy_create_srv_from_raw_x(DeviceProxy* self, std::uint64_t texture_words, std::uint64_t view_desc,
-                                 std::uint64_t destination) {
-    note_slot(70);
-    log_xbox_route_once(70, "CreateShaderResourceView from raw words (null view)", texture_words, view_desc,
-                        destination, 0, 0);
+std::atomic<RawBufferViewHandler> g_raw_buffer_view{nullptr};
+HRESULT proxy_create_placed_resource_x(DeviceProxy* self, void* va, const D3D12_RESOURCE_DESC* xbox_desc, std::uint32_t state, const IID* riid,
+                                       void** out);
+
+// The texture a raw view describes: as slot 133 places one at that address, made on first use.
+// shortcut: never released; upgrade when a title makes raw views of memory it reuses for long.
+ID3D12Resource* texture_at(DeviceProxy* self, std::uint64_t va, const D3D12_RESOURCE_DESC& desc) {
+    if (desc.Dimension < D3D12_RESOURCE_DIMENSION_TEXTURE1D || desc.Dimension > D3D12_RESOURCE_DIMENSION_TEXTURE3D ||
+        !desc.Width || !desc.Height || !desc.DepthOrArraySize)
+        return nullptr;
+    using Key = std::tuple<std::uint64_t, int, std::uint64_t, UINT, UINT, UINT, int, int>;
+    static std::mutex mutex;
+    static auto* const made = new std::map<Key, ID3D12Resource*>;
+    const Key key{va, int(desc.Dimension), desc.Width, desc.Height, desc.DepthOrArraySize, desc.MipLevels, int(desc.Format), int(desc.Layout)};
+    const std::lock_guard lock(mutex);
+    const auto known = made->find(key);
+    if (known != made->end()) return known->second;
+    void* created = nullptr;
+    const HRESULT hr = proxy_create_placed_resource_x(self, reinterpret_cast<void*>(va), &desc, 1, &__uuidof(ID3D12Resource), &created);
+    ID3D12Resource* const resource = SUCCEEDED(hr) ? static_cast<ID3D12Resource*>(created) : nullptr;
+    return (*made)[key] = resource;
+}
+
+// Xbox device slots 70 and 71: (resource description, view description followed by the GPU address, destination), no
+// return value: a shader-resource (70) or unordered-access (71) view with no resource object. The PC slots there are
+// CreatePlacedResource1 and CreateSamplerFeedbackUnorderedAccessView. Measured on the retail title: both descriptions
+// have the PC layout, and the address is the 8 bytes after the view description. A view that is not a buffer's is the
+// null view.
+template <typename View>
+void proxy_create_view_from_raw_x(DeviceProxy* self, unsigned slot, std::uint64_t resource_words, std::uint64_t view_words,
+                                  std::uint64_t destination) {
+    note_slot(slot);
+    log_xbox_route_once(slot, "a view from raw words", resource_words, view_words, destination, 0, 0);
     if (!destination) return;
     const D3D12_CPU_DESCRIPTOR_HANDLE title_handle{destination};
     const D3D12_CPU_DESCRIPTOR_HANDLE real_handle = translate_cpu_handle(self, title_handle);
-    D3D12_RESOURCE_DESC raw_desc{};
-    struct { D3D12_SHADER_RESOURCE_VIEW_DESC view; D3D12_GPU_VIRTUAL_ADDRESS va; } raw_view{};
-    static_assert(sizeof(raw_view) == sizeof(D3D12_SHADER_RESOURCE_VIEW_DESC) + 8);
-    if (texture_words && view_desc) {
-        std::memcpy(&raw_desc, reinterpret_cast<const void*>(texture_words), sizeof(raw_desc));
-        std::memcpy(&raw_view, reinterpret_cast<const void*>(view_desc), sizeof(raw_view));
+    D3D12_RESOURCE_DESC desc{};
+    struct { View view; D3D12_GPU_VIRTUAL_ADDRESS va; } raw{};
+    static_assert(sizeof(raw) == sizeof(View) + 8);
+    if (resource_words && view_words) {
+        std::memcpy(&desc, reinterpret_cast<const void*>(resource_words), sizeof(desc));
+        std::memcpy(&raw, reinterpret_cast<const void*>(view_words), sizeof(raw));
     }
-    if (raw_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && raw_desc.Width && raw_desc.Width <= UINT32_MAX && raw_view.va &&
-        raw_view.view.ViewDimension == D3D12_SRV_DIMENSION_BUFFER && raw_view.view.Format == DXGI_FORMAT_R32_TYPELESS &&
-        (raw_view.view.Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW)) {
-        // The layer writes the same raw V# for a constant-buffer view.
-        const D3D12_CONSTANT_BUFFER_VIEW_DESC raw{raw_view.va, static_cast<UINT>(raw_desc.Width)};
-        self->real->CreateConstantBufferView(&raw, real_handle);
-        write_through(title_handle, real_handle);
-        return;
+    constexpr bool uav = std::is_same_v<View, D3D12_UNORDERED_ACCESS_VIEW_DESC>;
+    const RawBufferViewHandler handler = g_raw_buffer_view.load(std::memory_order_acquire);
+    if (handler && desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && raw.va) {
+        if constexpr (uav) handler(desc, raw.va, nullptr, &raw.view, real_handle);
+        else handler(desc, raw.va, &raw.view, nullptr, real_handle);
+    } else if (ID3D12Resource* const texture = raw.va ? texture_at(self, raw.va, desc) : nullptr) {
+        if constexpr (uav) self->real->CreateUnorderedAccessView(texture, nullptr, &raw.view, real_handle);
+        else self->real->CreateShaderResourceView(texture, &raw.view, real_handle);
+    } else {
+        static std::atomic<bool> logged{false};
+        if (desc.Dimension != D3D12_RESOURCE_DIMENSION_UNKNOWN && !logged.exchange(true, std::memory_order_relaxed))
+            std::fprintf(stderr, "[rt] d3d12_xs: slot %u: a view of a resource of dimension %d is the null view\n", slot,
+                         static_cast<int>(desc.Dimension));
+        View null_view{};
+        null_view.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        if constexpr (uav) {
+            null_view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+            self->real->CreateUnorderedAccessView(nullptr, nullptr, &null_view, real_handle);
+        } else {
+            null_view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            null_view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            null_view.Texture2D.MipLevels = 1;
+            self->real->CreateShaderResourceView(nullptr, &null_view, real_handle);
+        }
     }
-    D3D12_SHADER_RESOURCE_VIEW_DESC null_view{};
-    null_view.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    null_view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-    null_view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    null_view.Texture2D.MipLevels = 1;
-    self->real->CreateShaderResourceView(nullptr, &null_view, real_handle);
     write_through(title_handle, real_handle);
 }
 
@@ -3164,7 +3282,10 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
                                                         static_cast<std::uint32_t>(a3), reinterpret_cast<const IID*>(a5),
                                                         reinterpret_cast<void**>(a6)));
     } else if constexpr (Slot == 70) {
-        proxy_create_srv_from_raw_x(self, a1, a2, a3);
+        proxy_create_view_from_raw_x<D3D12_SHADER_RESOURCE_VIEW_DESC>(self, 70, a1, a2, a3);
+        return 0;
+    } else if constexpr (Slot == 71) {
+        proxy_create_view_from_raw_x<D3D12_UNORDERED_ACCESS_VIEW_DESC>(self, 71, a1, a2, a3);
         return 0;
     } else if constexpr (Slot == 76) {
         return hr_to_u64(proxy_create_resource(
@@ -3516,6 +3637,8 @@ unsigned device_proxy_slot_count(const void* device) {
     return static_cast<const DeviceProxy*>(device)->slot_count;
 }
 
+void set_raw_buffer_view_handler(RawBufferViewHandler handler) { g_raw_buffer_view.store(handler, std::memory_order_release); }
+
 void set_placed_at_va_handler(PlacedAtVaHandler handler) {
     g_placed_at_va.store(handler, std::memory_order_release);
 }
@@ -3543,7 +3666,7 @@ IUnknown* real_object_behind_proxy(const void* object) { return proxy_real_objec
 bool device_slot_overridden(unsigned slot) {
     if (slot <= 2 || slot == 8 || slot == 9 || slot == 14 || (slot >= 17 && slot <= 24) || slot == 25 || slot == 26 || slot == 31 || slot == 32 || slot == 34 || slot == 35 ||
         slot == 36 || slot == 41 || slot == 45 || slot == 46 || slot == 50 || slot == 56 || slot == 61 || slot == 74 || slot == 62 || slot == 67 ||
-        slot == 70 || slot == 75 || slot == 76 || slot == 86 || slot == 101 || slot == 108 || slot == 133 || slot == kCreateCommittedResource3X)
+        slot == 70 || slot == 71 || slot == 75 || slot == 76 || slot == 86 || slot == 101 || slot == 108 || slot == 133 || slot == kCreateCommittedResource3X)
         return true;
     const XboxDeviceSlotRoutes& routes = xbox_device_slot_routes();
     return slot == routes.frame_interval || slot == routes.schedule_event || slot == routes.wait_event ||

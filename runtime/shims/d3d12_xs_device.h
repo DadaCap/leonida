@@ -163,6 +163,10 @@ IUnknown* real_object_behind_proxy(const void* object);
 using PlacedAtVaHandler = HRESULT (*)(ID3D12Device* real, void* va, const D3D12_RESOURCE_DESC& desc,
                                       std::uint32_t layout, REFIID riid, void** out);
 void set_placed_at_va_handler(PlacedAtVaHandler handler);
+// Device slots 70 (srv) and 71 (uav): the view of a buffer at a title address; `destination` is the real handle.
+using RawBufferViewHandler = void (*)(const D3D12_RESOURCE_DESC& desc, UINT64 va, const D3D12_SHADER_RESOURCE_VIEW_DESC* srv,
+                                      const D3D12_UNORDERED_ACCESS_VIEW_DESC* uav, D3D12_CPU_DESCRIPTOR_HANDLE destination);
+void set_raw_buffer_view_handler(RawBufferViewHandler handler);
 
 // Called by slot 133 for a buffer, before the handler, with the buffer's range [va, va + width). gta6rt registers
 // rt::xmem::commit_physical_range: xmem commits physical pages on first touch, so a range the title has mapped but

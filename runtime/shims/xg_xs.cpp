@@ -397,12 +397,21 @@ bool detile_subresource(const void* desc, const void* memory, uint32_t subresour
     std::memcpy(&c.desc, desc, sizeof(c.desc));
     auto texture = texture_of(c.desc);
     if (!texture || texture->planes.empty()) return false;
-    if (!readable(memory, texture->size)) return false;
     c.texture = std::move(*texture);
     c.mips = static_cast<uint32_t>(c.texture.planes[0].layout.mips.size());
     if (!c.mips) return false;
     const ct::Layout& l = c.texture.planes[0].layout;
     const ct::Mip& m = l.mips[subresource % c.mips];
+    // Only this subresource's tiles have to be there: a streamed texture's top mips are often not mapped.
+    if (l.thick || c.texture.planes.size() > 1) {
+        if (!readable(memory, c.texture.size)) return false;
+    } else {
+        const uint64_t start = uint64_t{subresource / c.mips} * l.slice_size + m.offset;
+        const uint64_t tiled = uint64_t{m.pitch} * m.rows * l.desc.element_bytes;
+        const uint64_t from = start & ~(kTile - 1);
+        const uint64_t to = std::min<uint64_t>((start + std::max<uint64_t>(tiled, 1) + kTile - 1) & ~(kTile - 1), c.texture.size);
+        if (from >= to || !readable(static_cast<const uint8_t*>(memory) + from, to - from)) return false;
+    }
     const uint64_t row = uint64_t{m.width} * l.desc.element_bytes, slice = row * m.height;
     const uint64_t depths = l.subresource_depth(subresource % c.mips);
     if (!slice || slice > UINT32_MAX || slice * depths > (uint64_t{1} << 31)) return false;

@@ -88,6 +88,7 @@ struct VulkanDeviceInfo {
     std::vector<VkQueue> compute_queues;
     std::vector<VkQueue> copy_queues;
     bool separate_depth_stencil_layouts = true;
+    bool depth_range_unrestricted = false;  // VK_EXT_depth_range_unrestricted enabled on this device.
     std::uint32_t max_push_constants_size = 0;
     bool push_constants_need_fallback = false;
     // maxBufferSize and maxMemoryAllocationSize, which cap the GPU address arena (src/arena_size.h). 0: read from
@@ -189,6 +190,10 @@ struct VulkanDeviceInfo {
     // writes the layer or viewport declares ShaderLayer / ShaderViewportIndex (the index's `features`).
     bool shader_output_layer = false;
     bool shader_output_viewport_index = false;
+    // Vulkan 1.2 drawIndirectCount is enabled on `device`: graphics ExecuteIndirect with a GPU CountBuffer uses
+    // vkCmdDrawIndirectCount / vkCmdDrawIndexedIndirectCount. Without it, counted graphics draws are refused at
+    // replay rather than calling those commands without the feature enabled.
+    bool draw_indirect_count = false;
     // The translator's output folder for pipeline creation. An empty value uses LEONIDA_SHADERS or the packaged path.
     std::string shader_dir;
     // VK_EXT_custom_border_color (with customBorderColors and customBorderColorWithoutFormat) is enabled on
@@ -385,10 +390,13 @@ std::unique_ptr<WindowPresenter> create_window_presenter(ID3D12Device* device, H
 
 // Where each root parameter's arguments go in the 32 user-data dwords the translated shaders read (docs section
 // 3.5). Built when a Vulkan device creates the root signature. A signature can be bound at either bind point, so it
-// carries both layouts:
-//   - graphics: rt::rootsig::pack() (from s0, two dwords per table; D3D-448 keeps it until per-stage user-data windows
-//     exist, because a mesh shader (s16) and a pixel shader (s8) share one push-constant block);
-//   - compute: rt::rootsig::pack_stage(Stage::Compute), the measured console layout (from s4, one dword per table).
+// carries both layouts, each the console layout rt::rootsig::pack_stage() gives (one dword per table):
+//   - graphics: Stage::Vertex, from s8. A vertex, pixel or geometry shader reads SGPR i from push dword i, so root
+//     dword k is push dword 8 + k for all three. A mesh shader's root arguments start at s16; the translator loads its
+//     s16.. from push dwords 8.. ("root_window" in index.json), so the same block serves both stages of a mesh
+//     pipeline. Its window is 16 dwords: mesh_ok says whether Stage::Mesh places the signature too, and a mesh draw
+//     with one it refuses invalidates the list (D3D-448 follow-up);
+//   - compute: Stage::Compute, from s4 (measured, D3D-448).
 // A layout that refuses the signature is marked unusable; binding the signature there invalidates the list.
 // Where the title's windows lie when they were taken from the arena's own host mapping (reserve_title_window): a
 // title address there names the arena VA at the same distance from the mapping's start. Zero: no such window.
@@ -396,6 +404,12 @@ struct TitleWindow {
     std::atomic<std::uint64_t> base{0}, size{0};
 };
 inline TitleWindow g_title_window;
+// The title's window with no memory of its own (rt::xmem::gpu_window_start): `va` is the arena VA of its sparse buffer.
+struct PagedWindow {
+    std::atomic<std::uint64_t> base{0}, size{0}, va{0};
+    std::uint64_t buffer = 0;  // VkBuffer
+};
+inline PagedWindow g_paged_window;
 // Set before the device is made: host memory the arena imports whole, of which it hands out the first layer_bytes.
 struct ArenaImport {
     void* base = nullptr;
@@ -406,7 +420,11 @@ inline ArenaImport g_arena_import;
 inline std::atomic<void (*)()> g_refresh_title_textures{nullptr};
 inline std::uint64_t arena_va(std::uint64_t va) {
     const std::uint64_t base = g_title_window.base.load(std::memory_order_relaxed);
-    return base && va - base < g_title_window.size.load(std::memory_order_relaxed) ? va - base : va;
+    if (base && va - base < g_title_window.size.load(std::memory_order_relaxed)) return va - base;
+    const std::uint64_t paged = g_paged_window.base.load(std::memory_order_relaxed);
+    if (paged && va - paged < g_paged_window.size.load(std::memory_order_relaxed))
+        return g_paged_window.va.load(std::memory_order_relaxed) + (va - paged);
+    return va;
 }
 // `bytes` of the arena's mapping, zeroed and 2 MiB aligned, for the title's windows; null without an arena or room.
 void* reserve_title_window(ID3D12Device* device, std::size_t bytes);
@@ -414,15 +432,21 @@ void* reserve_title_window(ID3D12Device* device, std::size_t bytes);
 struct RootArgumentLayout {
     struct Parameter {
         rt::rootsig::ParamType type;
-        std::uint32_t user_offset;     // graphics: first dword; unused for a parameter with no dwords
+        std::uint32_t user_offset;     // graphics: first push dword; unused for a parameter with no dwords
         std::uint32_t constant_count;  // constants only
         std::uint32_t compute_offset = rt::rootsig::kNoSgpr;  // compute: first user SGPR
     };
     std::vector<Parameter> parameters;
     std::uint32_t flags = 0;  // D3D12_ROOT_SIGNATURE_FLAGS from the serialized blob
     bool graphics_ok = true;
-    bool graphics_stage = false;  // graphics: pack_stage()'s console layout (s8, one dword per table)
+    // The graphics layout is the console's (pack_stage, one dword per table). False for a signature past its 24-dword
+    // window, which keeps pack()'s layout (from s0, two dwords per table) until the argument block is modelled.
+    bool graphics_console = true;
+    bool mesh_ok = true;  // the graphics layout also fits a mesh shader's 16-dword window
     bool compute_ok = true;
+    // The user-data dwords after the root arguments: the pointer to the bound resource heap, then the one to the sampler
+    // heap, each only with its *_HEAP_DIRECTLY_INDEXED flag (every 1.0.2.1 shader that indexes a heap reads them there).
+    std::uint32_t graphics_heaps = UINT32_MAX, compute_heaps = UINT32_MAX;
 };
 
 // For the command list: the argument layout of a root signature from a Vulkan device, and the id it records for a

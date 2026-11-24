@@ -215,7 +215,7 @@ inline bool skip_int3(EXCEPTION_POINTERS* info) {
         const std::lock_guard lock(m);
         first = seen.insert(at).second;
     }
-    if (first) event("int3_skipped", "\"at\":" + quote(where(reinterpret_cast<uint64_t>(at))));
+    if (first) event("int3_skipped", "\"at\":" + quote(where(reinterpret_cast<uint64_t>(at))) + ",\"stack\":" + stack_from(*info->ContextRecord));
     info->ContextRecord->Rip += 1;
     return true;
 }
