@@ -40,6 +40,12 @@ LATE_SUMMARY = ("import atexit\nimport sys\nimport unittest\n"
 # A test that runs a nested unittest runner: that runner writes its own summary to stderr while the test runs.
 NESTED = ("import sys\nimport unittest\nclass T(unittest.TestCase):\n    def test_a(self):\n"
           "        unittest.TextTestRunner(stream=sys.stderr, verbosity=0).run(unittest.TestSuite())\n")
+# Dies on import the way a crashed interpreter does, printing nothing: a real SIGSEGV on POSIX, and on Windows the
+# exit code python.exe gets from an access violation (0xC0000005), since Windows has no signal to raise for it.
+CRASH = ("import os, signal, sys\n"
+         "if sys.platform == 'win32':\n"
+         "    os._exit(0xC0000005 - (1 << 32))\n"
+         "os.kill(os.getpid(), signal.SIGSEGV)\n")
 
 
 def suite(tmp, files):
@@ -270,6 +276,34 @@ class RunnerTest(unittest.TestCase):
             self.assertIn("==== FAILED: test_b", out)
             self.assertIn("2 files failed", out)
             self.assertTrue(out.rstrip().endswith("test_b, test_f"), out)
+
+    def test_a_failure_header_names_the_exit_code(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            suite(tmp, {"test_f.py": FAIL})
+            code, out = run(tmp, "-j", "2")
+            self.assertEqual(code, 1, out)
+            self.assertIn("==== FAILED: test_f (exit code 1)\n", out)
+            self.assertNotIn("no output", out)                      # it printed its traceback
+
+    def test_a_crash_that_prints_nothing_is_named(self):
+        # The case this is for: a crashed file used to leave a bare "==== FAILED: name" with nothing under it.
+        with tempfile.TemporaryDirectory() as tmp:
+            suite(tmp, {"helper.py": "X = 1\n", "test_p.py": PASS, "test_crash.py": CRASH})
+            code, out = run(tmp, "-j", "2")
+            self.assertEqual(code, 1, out)
+            want = "0xC0000005, access violation" if sys.platform == "win32" else "killed by SIGSEGV (-11)"
+            self.assertIn("==== FAILED: test_crash (", out)
+            self.assertIn(want, out)
+            self.assertIn("(no output: the process ended before printing anything)", out)
+            self.assertIn("2 files, 2 tests, 1 files failed", out)
+
+    def test_describe_exit(self):
+        self.assertEqual(r.describe_exit(1), "exit code 1")
+        self.assertEqual(r.describe_exit(-11), "killed by SIGSEGV (-11)")
+        self.assertEqual(r.describe_exit(-1000), "killed by signal 1000 (-1000)")
+        self.assertEqual(r.describe_exit(3221225477), "exit code 0xC0000005, access violation (the process crashed)")
+        self.assertEqual(r.describe_exit(0xC00000FD), "exit code 0xC00000FD, stack overflow (the process crashed)")
+        self.assertEqual(r.describe_exit(0xC0001234), "exit code 0xC0001234 (the process crashed)")
 
     def test_one_job_runs_discover_and_keeps_its_exit_code(self):
         with tempfile.TemporaryDirectory() as tmp:
