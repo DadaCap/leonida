@@ -4198,11 +4198,15 @@ struct DeviceState {
     std::mutex slot_change_mutex;
     std::vector<leonida::SlotChange> slot_changes;
     std::atomic<bool> slot_records_live{false};
+    // The releases and removals noted: a heap snapshot taken before one is stale (console_heaps_stale).
+    std::atomic<std::uint64_t> slot_gone_changes{0};
     void note_slot_change(leonida::SlotChange::Kind kind, std::uint64_t lo, std::uint64_t bytes) {
         if (!bytes || !slot_records_live.load(std::memory_order_acquire)) return;
         const std::uint64_t hi = lo + bytes < lo ? UINT64_MAX : lo + bytes;
         std::lock_guard lock(slot_change_mutex);
         slot_changes.push_back({kind, lo, hi});
+        if (kind == leonida::SlotChange::target_gone || kind == leonida::SlotChange::source_gone)
+            slot_gone_changes.fetch_add(1, std::memory_order_release);
     }
     // A device range [address, address + bytes) as the V# bases that name it directly: arena offsets in the V#'s 48
     // bits (a buffer below the arena, as sign-extended offsets, vsharp_address). Nothing for a range no V# reaches.
@@ -5018,9 +5022,16 @@ struct DeviceState {
         heap.retry_ms += ms(t2, t3);
     }
 
+    // slot_gone_changes as of the last refresh_console_heaps (what the heaps' copies were checked against, or newer).
+    std::atomic<std::uint64_t> heaps_generation{0};
+    bool console_heaps_stale() const {
+        return heaps_generation.load(std::memory_order_acquire) != slot_gone_changes.load(std::memory_order_acquire);
+    }
+
     // Before every submission, ahead of the slot-133 shadows.
     void refresh_console_heaps() {
         std::lock_guard lock(console_heap_mutex);
+        heaps_generation.store(slot_gone_changes.load(std::memory_order_acquire), std::memory_order_release);
         const bool heap_pass = heap_gpu && console_heap_gpu_enabled();
         if (heap_pass) console_heap_gpu_begin();
         else if (heap_gpu) heap_gpu->drain(context->completed_retire_ticket(), [](int, std::uint32_t, std::uint32_t) {}, [](int) {});
@@ -14778,6 +14789,8 @@ public:
         if (async_texture_refresh()) start_title_filler();
         state_.setup_console_heap_gpu(get_device);  // LEONIDA_CONSOLE_HEAP_GPU: the context's prelude
         state_.context->set_after_execute([this] { state_.geometry_execute_end(); });
+        state_.context->set_snapshot_refresh([this] { return state_.console_heaps_stale(); },
+                                             [this] { state_.refresh_console_heaps(); });
         state_.context->set_before_execute([this] {
             namespace phases = leonida::submit_phases;
             // LEONIDA_REFRESH_PER_FRAME (for runs that only need the title to go on): 1 = the slot-133 shadows, title

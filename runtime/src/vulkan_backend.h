@@ -3568,6 +3568,14 @@ private:
                 demand.reset();
                 const ReplayResult compile_result = check_compiled_pipelines(compiles, prepare_result);
                 if (compile_result != ReplayResult::success) return compile_result;
+                if (context_.snapshot_stale_ && context_.snapshot_stale_()) {
+                    // The refresh can submit (a title texture's fill), which takes the pipeline lock itself. Pipelines
+                    // may go while it is not held, so the results kept by pointer are dropped with it.
+                    pipeline_lock.unlock();
+                    context_.snapshot_refresh_();
+                    pipeline_lock.lock();
+                    continue;
+                }
                 prior_compiles = std::move(compiles);
                 has_prior_compiles = true;
                 continue;
