@@ -46,6 +46,11 @@ problems testers have hit; the steps below link to them.
 
    Without `llvm-mc`, add `--disasm-dir tests/semantic/fixtures/disasm` to both commands. That runs the
    pre-disassembled subset only, so say "subset" in your result.
+
+   Using a prebuilt `runtime-windows` artifact instead of building? Check out the commit that built it and read
+   this page at that commit (see [Without a compiler](#without-a-compiler-a-ci-built-runtime)): an older
+   `run_gpu_tests.py` may not take every option shown here. `python -I scripts\run_gpu_tests.py --help`, run from
+   that checkout, lists the options it does take.
 4. Collect what the record needs:
 
    ```powershell
