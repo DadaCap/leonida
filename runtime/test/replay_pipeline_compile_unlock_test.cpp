@@ -32,6 +32,7 @@ VulkanDeviceFunctions driver{};
 std::atomic<std::uintptr_t> next_handle{10};
 std::mutex record_mutex;
 std::vector<std::pair<VkBuffer, VkBuffer>> recorded_copies;
+std::atomic<bool> a_submitted{false}, freed{false}, freed_early{false};
 
 PFN_vkVoidFunction VKAPI_CALL mock_get_device_proc(VkDevice, const char* name) {
 #define MOCK_DEVICE_FUNCTION(n) \
@@ -68,7 +69,14 @@ void init_mock_driver() {
     driver.vkResetCommandBuffer = +[](VkCommandBuffer, VkCommandBufferResetFlags) { return VK_SUCCESS; };
     driver.vkBeginCommandBuffer = +[](VkCommandBuffer, const VkCommandBufferBeginInfo*) { return VK_SUCCESS; };
     driver.vkEndCommandBuffer = +[](VkCommandBuffer) { return VK_SUCCESS; };
-    driver.vkQueueSubmit = +[](VkQueue, std::uint32_t, const VkSubmitInfo*, VkFence) { return VK_SUCCESS; };
+    driver.vkQueueSubmit = +[](VkQueue queue, std::uint32_t, const VkSubmitInfo*, VkFence) {
+        if (queue == handle<VkQueue>(1)) a_submitted = true;
+        return VK_SUCCESS;
+    };
+    driver.vkFreeMemory = +[](VkDevice, VkDeviceMemory, const VkAllocationCallbacks*) {
+        if (!a_submitted) freed_early = true;
+        freed = true;
+    };
     driver.vkCmdPipelineBarrier = +[](VkCommandBuffer, VkPipelineStageFlags, VkPipelineStageFlags, VkDependencyFlags,
                                       std::uint32_t, const VkMemoryBarrier*, std::uint32_t,
                                       const VkBufferMemoryBarrier*, std::uint32_t, const VkImageMemoryBarrier*) {};
@@ -279,6 +287,71 @@ int test_failed_compute_dispatch_built_once() {
     return 0;
 }
 
+// What is released while an execute compiles is not freed before that execute is submitted, however many submissions
+// of other queues retire meanwhile, and the thread that released it does not wait for the compile. A snapshot that went
+// stale during the compile is taken again, with no lock of the context held.
+int test_release_during_compile(bool with_workers) {
+    a_submitted = freed = freed_early = false;
+    VulkanContext context(mock_get_device_proc, handle<VkDevice>(1), false);
+    if (with_workers) context.set_pipeline_workers(std::make_unique<PipelineWorkers>(2));
+    std::atomic<bool> stale{false};
+    std::atomic<int> refreshes{0};
+    std::atomic<std::uintptr_t> removable{0};
+    context.set_snapshot_refresh([&] { return stale.load(); }, [&] {
+        ++refreshes;
+        stale = false;
+        context.remove_pipeline(removable);  // takes pipeline_mutex_ uniquely: it must not be held here
+    });
+
+    SlowPipeline slow;
+    ComputePipeline slow_pso{};
+    slow_pso.layout = handle<VkPipelineLayout>(5);
+    slow_pso.build_context = &slow;
+    slow_pso.build = [](void* ctx) { return static_cast<SlowPipeline*>(ctx)->build(); };
+    slow_pso.built = [](void* ctx) { return static_cast<SlowPipeline*>(ctx)->find(); };
+    context.add_pipeline(0x100, slow_pso);
+    ComputePipeline fast_pso{};
+    fast_pso.layout = handle<VkPipelineLayout>(5);
+    fast_pso.pipeline = handle<VkPipeline>(0x8001);
+    context.add_pipeline(0x200, fast_pso);
+
+    VulkanQueue queue_a(context, handle<VkQueue>(1), 0, VulkanQueue::QueueKind::compute);
+    VulkanQueue queue_b(context, handle<VkQueue>(2), 0, VulkanQueue::QueueKind::compute);
+    CommandList list_a, list_b;
+    EXPECT(list_a.dispatch({0x100, {}, 1, 1, 1}) && list_a.close());
+    EXPECT(list_b.dispatch({0x200, {}, 1, 1, 1}) && list_b.close());
+    const CommandList* a = &list_a;
+    const CommandList* b = &list_b;
+
+    ReplayResult result_a = ReplayResult::unsupported;
+    std::thread thread_a([&] { result_a = queue_a.execute({&a, 1}); });
+    bool entered;
+    {
+        std::unique_lock lock(slow.mutex);
+        entered = slow.cv.wait_for(lock, std::chrono::seconds(5), [&] { return slow.entered; });
+    }
+    // On this thread: both return while A is still compiling (its build ends only on slow.release()).
+    context.defer_destroy(DeferredDeletionQueue::Kind::device_memory, handle<VkDeviceMemory>(0x900));
+    std::atomic<bool> called{false}, called_early{false};
+    const bool kept = context.defer_past_executes([&] {
+        if (!a_submitted) called_early = true;
+        called = true;
+    });
+    stale = true;
+    bool submitted_b = true;
+    for (int i = 0; i < 4; ++i) submitted_b = submitted_b && queue_b.execute({&b, 1}) == ReplayResult::success;
+    const bool early = freed || called;
+    slow.release();
+    thread_a.join();
+    EXPECT(entered && submitted_b && result_a == ReplayResult::success);
+    EXPECT(kept && !early);
+    EXPECT(refreshes == 1 && slow.builds == 1);
+    EXPECT(queue_b.execute({&b, 1}) == ReplayResult::success);  // drains what A's submission let go
+    EXPECT(freed && called && !freed_early && !called_early);
+    EXPECT(!context.defer_past_executes([] {}));  // none open: the caller releases at once
+    return 0;
+}
+
 }  // namespace
 
 int main() {
@@ -286,6 +359,8 @@ int main() {
     if (test_unlocks_resources_during_compile(true) != 0) return 1;
     if (test_unlocks_resources_during_compile(false) != 0) return 1;
     if (test_failed_compute_dispatch_built_once() != 0) return 1;
+    if (test_release_during_compile(true) != 0) return 1;
+    if (test_release_during_compile(false) != 0) return 1;
     std::printf("replay_pipeline_compile_unlock_test: passed\n");
     return 0;
 }
