@@ -43,9 +43,9 @@ int main() {
     r->step(VK_NULL_HANDLE, gt::Kind::draw, 8);
     r->step(VK_NULL_HANDLE, gt::Kind::other);
     r->end(VK_NULL_HANDLE);
-    check(r->parts.size() == 4 && g_written == 5 && g_last == 4, "each dispatch is a part, a run of draws is one");
+    check(r->parts.size() == 5 && g_written == 6 && g_last == 5, "each dispatch and draw is a part");
     times.submitted(r, 3);
-    g_ticks = {0xfffffff0, 0xfffffffa, 0x5, 0x6, 0x8};  // 10, 11 (past 32 bits), 1, 2 ms
+    g_ticks = {0xfffffff0, 0xfffffffa, 0x5, 0x6, 0x6, 0x8};  // 10, 11 (past 32 bits), 1, 0, 2 ms
     times.collect(2);
     check(gt::log().submissions == 0, "a submission in flight is not read");
     times.collect(3);
@@ -60,14 +60,26 @@ int main() {
           "what it is called");
 
     r = times.begin(VK_NULL_HANDLE);
-    for (unsigned i = 0; i < 5000; ++i) r->step(VK_NULL_HANDLE, gt::Kind::dispatch, 7, 1);
+    for (unsigned i = 0; i < 20000; ++i) r->step(VK_NULL_HANDLE, gt::Kind::dispatch, 7, 1);
     r->end(VK_NULL_HANDLE);
     check(g_last < gt::Recorder::kQueries && r->parts.back().kind == gt::Kind::untimed &&
-              r->untimed + r->parts.size() - 1 == 5000,
+              r->untimed + r->parts.size() - 1 == 20000,
           "past the pool's queries the rest is one part, counted");
     times.submitted(r, 4);
     times.collect(4);
     check(gt::log().unread == 1, "results that are not there are not waited for");
+    gt::Recorder sampled;
+    sampled.parts = {gt::Part{gt::Kind::draw_indirect, 8, {"ms_1"}, 1, 8, true}};
+    sampled.samples = {{0, 8, 12, 3 * 12, true, true, false}};
+    std::vector<std::uint8_t> bytes(gt::Recorder::kSampleBytes);
+    const std::uint32_t count = 3, records[9] = {4, 1, 1, 0, 1, 1, 10, 2, 1};
+    std::memcpy(bytes.data(), &count, 4);
+    std::memcpy(bytes.data() + 16, records, sizeof(records));
+    sampled.mapped = bytes.data();
+    check(sampled.describe(f, VK_NULL_HANDLE, 0) ==
+              "draw-indirect ms_1: max_count 8 stride 12, count buffer 3; 3 records read of 3 drawn, 1 empty, groups 24 in "
+              "all, most 20 (10, 2, 1); no statistics",
+          "a sample says what was drawn");
     std::printf("%d failures\n", g_failures);
     return g_failures ? 1 : 0;
 }

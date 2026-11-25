@@ -1119,6 +1119,7 @@ public:
     // clipping invocations can come from a mesh-primitives query (D3D-MESH-CLIPPING-COUNTER). Set by the device
     // that created the context.
     bool mesh_queries = false;
+    bool pipeline_statistics = false;  // the pipelineStatisticsQuery feature (LEONIDA_GPU_TIMES)
     // conditional_rendering: VK_EXT_conditional_rendering is enabled on `device` (SetPredication).
     // ray_tracing: VK_KHR_acceleration_structure + VK_KHR_ray_query are enabled on `device`.
     // xdxr: acceleration-structure builds write XDXR BVH4 records (xdxr_build.h) instead; needs bufferDeviceAddress.
@@ -3650,16 +3651,31 @@ private:
         if (gpu_times::enabled() && kind_ != QueueKind::copy && context_.timestamp_bits(family_) &&
             context_.timestamp_period() > 0) {
             if (!times_) {
-                const gpu_times::Functions f{context_.vk.vkCreateQueryPool, context_.vk.vkDestroyQueryPool,
+                gpu_times::Functions f{context_.vk.vkCreateQueryPool, context_.vk.vkDestroyQueryPool,
                                              context_.vk.vkCmdResetQueryPool, context_.vk.vkCmdWriteTimestamp,
                                              context_.vk.vkGetQueryPoolResults};
+                f.create_buffer = context_.vk.vkCreateBuffer;
+                f.destroy_buffer = context_.vk.vkDestroyBuffer;
+                f.requirements = context_.vk.vkGetBufferMemoryRequirements;
+                f.allocate = context_.vk.vkAllocateMemory;
+                f.free = context_.vk.vkFreeMemory;
+                f.bind = context_.vk.vkBindBufferMemory;
+                f.map = context_.vk.vkMapMemory;
+                f.copy = context_.vk.vkCmdCopyBuffer;
+                f.barrier = context_.vk.vkCmdPipelineBarrier;
+                f.begin_query = context_.vk.vkCmdBeginQuery;
+                f.end_query = context_.vk.vkCmdEndQuery;
+                f.memory = context_.occlusion_resolve_memory_;
+                f.statistics = context_.pipeline_statistics;
+                f.mesh_queries = context_.mesh_queries;
                 char name[40];
                 std::snprintf(name, sizeof(name), "%s-%llx", kind_ == QueueKind::direct ? "direct" : "compute",
                               static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(queue_) >> 8 & 0xffff));
                 if (f.complete())
                     times_ = std::make_unique<gpu_times::QueueTimes>(context_.device(), f, name,
                                                                      context_.timestamp_bits(family_),
-                                                                     context_.timestamp_period());
+                                                                     context_.timestamp_period(),
+                                                                     kind_ == QueueKind::direct);
             }
             if (times_) {
                 times_->collect(completed());

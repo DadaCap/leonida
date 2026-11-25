@@ -15313,6 +15313,7 @@ public:
                 free(device, block, nullptr);
             });
         state_.context->mesh_queries = info.mesh_shader_queries;
+        state_.context->pipeline_statistics = info.pipeline_statistics_query;
         state_.context->set_cpu_texture_publisher([this]{return state_.publish_mapped_textures();});
         state_.context->set_sample_table_resolver([this](std::uint64_t address, std::uint32_t slots) {
             return state_.materialize_table(address, slots);

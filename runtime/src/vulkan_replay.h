@@ -4688,7 +4688,7 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
                 vk.times->step(command_buffer, gpu_times::Kind::dispatch, d->pipeline,
                                std::uint64_t(d->x) * d->y * d->z);
             else if (raster.state)
-                vk.times->step(command_buffer, gpu_times::Kind::draw, raster.state->pipeline);
+                vk.times->step(command_buffer, gpu_times::Kind::setup);
             else if (const auto* ind = std::get_if<ExecuteIndirect>(&command))
                 vk.times->step(command_buffer, gpu_times::Kind::dispatch_indirect, ind->pipeline, ind->max_count);
             else if (std::holds_alternative<BuildAccelerationStructure>(command))
@@ -5573,6 +5573,15 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
             const GraphicsPipeline& graphics = *d.graphics;
             if (d.depth.id && (graphics.depth_aspects & VK_IMAGE_ASPECT_DEPTH_BIT)) rendering.pDepthAttachment = &depth;
             if (d.depth.id && (graphics.depth_aspects & VK_IMAGE_ASPECT_STENCIL_BIT)) rendering.pStencilAttachment = &depth;
+            if (vk.times) {
+                if (raster.arguments) {
+                    vk.times->step(command_buffer, gpu_times::Kind::draw_indirect, draw->pipeline,
+                                   raster.arguments->max_count, raster.arguments->count_buffer != 0);
+                    vk.times->sample_begin(command_buffer, draw->pipeline, draw->mesh, !prepared.statistics_segment_count);
+                } else {
+                    vk.times->step(command_buffer, gpu_times::Kind::draw, draw->pipeline);
+                }
+            }
             vk.begin_rendering(command_buffer, &rendering);
 
             ShaderUserData data{};
@@ -5724,6 +5733,12 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
                 vk.draw(command_buffer, draw->count, draw->instances, draw->first, draw->first_instance);
             }
             vk.end_rendering(command_buffer);
+            if (vk.times && raster.arguments)
+                vk.times->sample_end(command_buffer, d.indirect_buffer, d.indirect_offset,
+                                     p.indirect_clamp.buffer ? p.indirect_clamp.stride : raster.arguments->stride,
+                                     raster.arguments->max_count,
+                                     raster.arguments->count_buffer ? d.indirect_count_buffer : VK_NULL_HANDLE,
+                                     d.indirect_count_offset);
         }
     }
     // Predication does not carry over to the next command list.
