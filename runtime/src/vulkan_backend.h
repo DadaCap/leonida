@@ -111,7 +111,7 @@ struct VulkanDeviceFunctions {
     X(vkUnmapMemory) X(vkCmdCopyBuffer) X(vkCmdCopyBufferToImage) X(vkCmdCopyImageToBuffer) X(vkCmdCopyImage) X(vkCmdBlitImage)  \
     X(vkCmdResolveImage) X(vkCmdFillBuffer) X(vkCmdUpdateBuffer) X(vkCreateSampler) X(vkDestroySampler)        \
     X(vkCmdBeginConditionalRenderingEXT) X(vkCmdEndConditionalRenderingEXT) X(vkCreateQueryPool)               \
-    X(vkDestroyQueryPool) X(vkCmdResetQueryPool) X(vkCmdBeginQuery) X(vkCmdEndQuery) X(vkCmdWriteTimestamp)    \
+    X(vkDestroyQueryPool) X(vkCmdResetQueryPool) X(vkCmdBeginQuery) X(vkCmdEndQuery) X(vkCmdWriteTimestamp) X(vkGetQueryPoolResults)    \
     X(vkCmdCopyQueryPoolResults) X(vkCmdDrawIndirect) X(vkCmdDrawIndexedIndirect) X(vkCmdDrawIndirectCount)    \
     X(vkCmdDrawIndexedIndirectCount) X(vkCmdDispatchIndirect) X(vkGetBufferDeviceAddress)                      \
     X(vkGetAccelerationStructureBuildSizesKHR) X(vkCreateAccelerationStructureKHR)                             \
@@ -1536,6 +1536,11 @@ public:
     // (timestampValidBits 0). Set by the device before any queue uses it.
     double timestamp_period() const { return timestamp_period_; }
     void set_timestamp_period(double period) { timestamp_period_ = period; }
+    // By queue family; 0 where timestamps cannot be written and reset (LEONIDA_GPU_TIMES).
+    void set_timestamp_bits(std::vector<std::uint32_t> bits) { timestamp_bits_ = std::move(bits); }
+    std::uint32_t timestamp_bits(std::uint32_t family) const {
+        return family < timestamp_bits_.size() ? timestamp_bits_[family] : 0;
+    }
     // True where a timestamp resolve must be ordered explicitly after the timestamps it copies (MoltenVK on Apple
     // GPUs, docs/d3d12_vulkan.md section 4.6). Set by the device before any queue uses it.
     bool order_timestamp_copies() const { return order_timestamp_copies_; }
@@ -2429,6 +2434,7 @@ private:
     std::function<void(bool)> bindless_commit_;
     std::unordered_map<QueryHeapId, QueryPool> query_pools_;  // element pointers stay valid across inserts
     double timestamp_period_ = 0;
+    std::vector<std::uint32_t> timestamp_bits_;
     bool order_timestamp_copies_ = false;
     VkPhysicalDeviceMemoryProperties occlusion_resolve_memory_{};
     label::Completions gpu_labels_;
@@ -2643,6 +2649,7 @@ public:
             // wait on this destroyed semaphore in its next vkQueueSubmit.
             if (context_.bindless_upload_semaphore_ == progress_) context_.bindless_upload_semaphore_ = VK_NULL_HANDLE;
         }
+        times_.reset();  // the queue is idle
         if (pool_) vk.vkDestroyCommandPool(context_.device(), pool_, nullptr);
         if (progress_) {
             if (DeviceFaultDiagnostics* ring = context_.device_fault()) ring->forget(progress_);  // no report reads it
@@ -3633,6 +3640,34 @@ private:
             context_.vk.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                                              VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &full, 0, nullptr, 0, nullptr);
         }
+        struct TimesGuard {
+            gpu_times::QueueTimes* times = nullptr;
+            gpu_times::Recorder* recorder = nullptr;
+            ~TimesGuard() {
+                if (recorder) times->discard(recorder);
+            }
+        } timed;
+        if (gpu_times::enabled() && kind_ != QueueKind::copy && context_.timestamp_bits(family_) &&
+            context_.timestamp_period() > 0) {
+            if (!times_) {
+                const gpu_times::Functions f{context_.vk.vkCreateQueryPool, context_.vk.vkDestroyQueryPool,
+                                             context_.vk.vkCmdResetQueryPool, context_.vk.vkCmdWriteTimestamp,
+                                             context_.vk.vkGetQueryPoolResults};
+                char name[40];
+                std::snprintf(name, sizeof(name), "%s-%llx", kind_ == QueueKind::direct ? "direct" : "compute",
+                              static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(queue_) >> 8 & 0xffff));
+                if (f.complete())
+                    times_ = std::make_unique<gpu_times::QueueTimes>(context_.device(), f, name,
+                                                                     context_.timestamp_bits(family_),
+                                                                     context_.timestamp_period());
+            }
+            if (times_) {
+                times_->collect(completed());
+                timed.times = times_.get();
+                timed.recorder = times_->begin(command_buffer);
+                replay.times = timed.recorder;
+            }
+        }
         if (!tracker_lock.owns_lock()) tracker_lock.lock();
         if (!transfer_only && context_.bindless_prepare_ && !context_.bindless_prepare_(command_buffer)) {
             const bool ended = context_.observe_result(context_.vk.vkEndCommandBuffer(command_buffer),
@@ -3759,6 +3794,7 @@ private:
             readback_stages |= list.readback_src_stages;
         }
         close_labels(command_buffer, replay, open_labels);
+        if (timed.recorder) timed.recorder->end(command_buffer);
         // Only flush GPU writes to the host domain when this batch actually wrote to a readback buffer.
         if (wrote_readback) {
             const VkPipelineStageFlags2 allowed = queue_supported_stages(kind_);
@@ -3800,6 +3836,7 @@ private:
         }
         const bool submitted = ended && submit(command_buffer, VK_NULL_HANDLE, 0,
                                                execute_call ? &diagnostics : nullptr);
+        if (submitted && timed.recorder) times_->submitted(std::exchange(timed.recorder, nullptr), submitted_);
         if (mesh_draws)
             std::fprintf(stderr, "[rt] pso-mesh unix_ms=%lld draws=%u submitted=%d\n",
                          pipeline_profile::unix_ms(), mesh_draws, int(submitted));
@@ -4349,6 +4386,8 @@ private:
         return context_.observe_result(context_.vk.vkWaitSemaphores(context_.device(), &info, kQueuedWaitNs),
                                        "vkWaitSemaphores (queue progress)");
     }
+
+    std::unique_ptr<gpu_times::QueueTimes> times_;  // LEONIDA_GPU_TIMES
 
     CommandSlot* acquire() {
         if (context_.is_device_lost()) return nullptr;

@@ -3,6 +3,7 @@
 #include <cfloat>
 #include <cstdlib>
 
+#include "gpu_times.h"
 #include "resource_tiling.h"
 
 // Replays a closed CommandList (command_list.h) into a Vulkan command buffer.
@@ -1196,6 +1197,7 @@ struct ReplayFunctions {
     PFN_vkCmdBeginQueryIndexedEXT begin_query_indexed = nullptr;
     PFN_vkCmdEndQueryIndexedEXT end_query_indexed = nullptr;
     PFN_vkCmdWriteTimestamp write_timestamp = nullptr;
+    gpu_times::Recorder* times = nullptr;  // LEONIDA_GPU_TIMES, this command buffer's
     PFN_vkCmdCopyQueryPoolResults copy_query_pool_results = nullptr;
     // Set only where a copy of timestamp results is not ordered after the timestamps written before it (MoltenVK on
     // Apple GPUs, docs/d3d12_vulkan.md section 4.6): records what orders them, before each timestamp resolve.
@@ -4681,6 +4683,19 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
         const auto& command = commands[i];
         const auto& p = prepared.commands[i];
         const auto raster = draw_command(command);
+        if (vk.times) {
+            if (const auto* d = std::get_if<Dispatch>(&command))
+                vk.times->step(command_buffer, gpu_times::Kind::dispatch, d->pipeline,
+                               std::uint64_t(d->x) * d->y * d->z);
+            else if (raster.state)
+                vk.times->step(command_buffer, gpu_times::Kind::draw, raster.state->pipeline);
+            else if (const auto* ind = std::get_if<ExecuteIndirect>(&command))
+                vk.times->step(command_buffer, gpu_times::Kind::dispatch_indirect, ind->pipeline, ind->max_count);
+            else if (std::holds_alternative<BuildAccelerationStructure>(command))
+                vk.times->step(command_buffer, gpu_times::Kind::build);
+            else
+                vk.times->step(command_buffer, gpu_times::Kind::other);
+        }
         if (next_query < prepared.queries.size() && prepared.queries[next_query].command == i) {
             if constexpr (Checkpoints)
                 if (std::holds_alternative<ResolveQueries>(command))

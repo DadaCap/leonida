@@ -12983,6 +12983,12 @@ public:
             leonida::fsdraw::note_pipeline(id(), text);
         }
         order_install(graphics_.requested, graphics_.request_context, graphics_.mesh ? 'm' : 'g');
+        if (leonida::gpu_times::enabled()) {
+            leonida::gpu_times::Shaders shaders{};
+            for (std::size_t i = 0; i < std::min(shaders.size(), std::size(stages)); ++i)
+                if (stages[i].entry) shaders[i] = stages[i].entry->name.c_str();
+            leonida::gpu_times::note(id(), shaders);
+        }
         if (device_.info.device_checkpoints) {
             leonida::CheckpointShaders shaders{};
             for (std::size_t i = 0; i < std::size(stages); ++i)
@@ -13133,6 +13139,7 @@ public:
             pipeline_.code_base = code_base_;
         }
         if (!pipeline_.skipped) order_install(pipeline_.requested, pipeline_.request_context, 'c', entry->name);
+        leonida::gpu_times::note(id(), {entry->name.c_str()});
         device_.context->add_pipeline(id(), pipeline_,
                                       device_.info.device_fault_diagnostics ? entry->name.c_str() : nullptr);
         registered_ = true;
@@ -15514,6 +15521,7 @@ public:
             const bool can_resolve = (family.queueFlags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)) != 0;
             state_.timestamp_bits.push_back(can_resolve ? family.timestampValidBits : 0);
         }
+        state_.context->set_timestamp_bits(state_.timestamp_bits);
         if (info.queue_family < family_count) {
             const auto& family = families[info.queue_family];
             if (family.timestampValidBits)

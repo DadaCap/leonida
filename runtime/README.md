@@ -353,6 +353,7 @@ ones marked *diagnostic* only add log lines or exist to compare a run with and w
 | `LEONIDA_TEXTURE_SWEEP_BUDGET_US` | `400` | Microseconds a pass may spend on residency checks and uploads between textures. |
 | `LEONIDA_TITLE_BUFFERS_MB` | `512` | The most memory, in MiB, of buffers made over the title's own memory for vertex and index views that name it. |
 | `LEONIDA_TITLE_BUFFER_COVERAGE` | on | Such a view counts as covered only when a known buffer spans all its bytes. `0` asks for the first byte only. |
+| `LEONIDA_GPU_TIMES` | unset | *Diagnostic.* `1` writes GPU timestamps around every dispatch and run of draws and logs, every 10 s, the 25 pipelines that added most to their queue's time (`src/gpu_times.h`). |
 | `LEONIDA_SHADOW_FULL_WALK` | unset | *Diagnostic.* `1` queries every page of the title-memory shadows at every refresh, as before unchanged generations were skipped. |
 | `LEONIDA_STRICT_REPLAY` | unset | *Diagnostic.* `1` makes a draw or dispatch with an unresolvable resource fail its command list (`src/vulkan_replay.h`); by default it is dropped and logged. |
 | `LEONIDA_VOLUME_MIPS` | on | The XG layout of a 3D texture with mips or a block format is computed (`shims/xg_xs_layout.h`). `0` refuses it. |
