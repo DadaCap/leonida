@@ -1715,19 +1715,28 @@ public:
 
     // A complete CPU-side replacement of these color subresources. Serialize with replay and
     // present while recording the old layouts, finishing prior reads and publishing the copy.
+    // The copy is a transfer on `queue`. It must come after everything submitted before, which its barrier says for
+    // that queue; copy() gets the progress of the others' work to wait for, on the GPU. This used to be a
+    // vkDeviceWaitIdle in the first copy after every submission, with both locks held: a pass of small fills took as
+    // long as the GPU had work (5.7 s again and again, up to 50 s, on the first world frames). A present on another
+    // queue signals no progress, so that one is still waited for here.
     template<class Copy>
-    VkResult write_staged_title_image(ResourceId id, const VkImageSubresourceRange& range, Copy&& copy) {
+    VkResult write_staged_title_image(ResourceId id, const VkImageSubresourceRange& range, VkQueue queue, Copy&& copy) {
         std::lock_guard layout_lock(tracker_mutex_);
         std::lock_guard queue_lock(submit_mutex_);
         LayoutPieces pieces;
         if (!tracker_.pieces(id, range, pieces) || pieces.empty()) return VK_ERROR_UNKNOWN;
-        if (image_work_pending_) {
+        // The queues' own work is waited for on the GPU (copy() gets the pending tickets); only a present on another
+        // queue, outside the timelines, needs the device idle.
+        if (present_queue_ && present_queue_ != queue) {
             const SubmitMutex::SubmitTurn turn(submit_mutex_, false);  // a queue operation: the compile gate (as above)
-            const auto r = wait_submitted_locked(kTitleWriteWaitNs, "vkWaitSemaphores (title staging)");
+            const auto r = observe_result(vk.vkDeviceWaitIdle(device_), "vkDeviceWaitIdle (title staging)");
             if (r != VK_SUCCESS) return r;
             image_work_pending_ = false;
+            present_queue_ = VK_NULL_HANDLE;
         }
-        const auto r = observe_result(copy(replay_, pieces), "title staging upload");
+        const auto r = observe_result(copy(replay_, pieces, retire_tickets_.pending_through(UINT64_MAX)),
+                                      "title staging upload");
         if (r == VK_SUCCESS) {
             for (const auto& p : pieces)
                 if (p.layout == VK_IMAGE_LAYOUT_UNDEFINED) tracker_.set(id, p.range, VK_IMAGE_LAYOUT_GENERAL);
@@ -1736,7 +1745,10 @@ public:
     }
 
     // Present and probe submissions have their own fences, outside the queue retirement timelines.
-    void note_image_work_locked() { image_work_pending_ = true; }
+    void note_image_work_locked(VkQueue present = VK_NULL_HANDLE) {
+        image_work_pending_ = true;
+        if (present) present_queue_ = present;
+    }
 
     // For tests and traces.
     VkImageLayout layout(ResourceId id, std::uint32_t subresource) {
@@ -2368,6 +2380,7 @@ private:
     // driver only (SubmitMutex::CompileTurn).
     alignas(64) SubmitMutex submit_mutex_;
     bool image_work_pending_ = false;  // under submit_mutex_
+    VkQueue present_queue_ = VK_NULL_HANDLE;  // likewise: where a present was submitted since a device idle
     HostTextureStats host_texture_stats_;  // under submit_mutex_
     RetireTickets<VkSemaphore> retire_tickets_;
     std::atomic<std::uint64_t> submitted_ticket_{0};

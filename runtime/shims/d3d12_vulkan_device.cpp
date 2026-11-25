@@ -8625,9 +8625,9 @@ public:
     bool replay_seen() const { return replay_seen_.load(std::memory_order_relaxed); }
     bool staged_title() const { return staged_title_; }
     bool upload_staged_title(const rt::xg_xs::Texture& layout, const std::uint8_t* tiled,
-                             std::vector<std::uint64_t>& columns, bool inspect, bool& nonzero) {
+                             std::vector<std::uint64_t>& columns, bool inspect, bool& nonzero, bool& busy) {
         std::lock_guard lock(device_.title_upload_mutex);
-        return device_.title_upload.write(device_, id(), binding_, layout, tiled, columns, inspect, nonzero);
+        return device_.title_upload.write(device_, id(), binding_, layout, tiled, columns, inspect, nonzero, busy);
     }
     // Map and the destructor notify the registry for a slot-133 placement.
     void mark_title_texture() { title_texture_ = true; }
@@ -15992,7 +15992,7 @@ public:
             const auto out_of_budget = [&] {
                 return (filled && filled + span > fill_budget) || (fill_budget_ns && fill_pass_ns >= fill_budget_ns);
             };
-            if (t.stale && !always && out_of_budget()) {
+            if (t.stale && !always && (out_of_budget() || !upload_room(t))) {
                 ++stats.deferred;
                 return;
             }
@@ -16215,6 +16215,7 @@ private:
                       refusals = 0, written_ranges = 0, unmaps = 0, unreadable = 0, pending_views = 0;
         std::uint64_t fills = 0, fill_bytes = 0, fill_failures = 0;
         std::uint64_t staged_fills = 0, staged_ns = 0;
+        std::uint64_t no_slot = 0;  // fills put off because every upload slot was in flight
         // refresh_title_textures, since the last log line
         std::uint64_t passes = 0, checked = 0, hashed = 0, changed = 0, deferred = 0, filled_bytes = 0,
                       max_pass_bytes = 0, hash_ns = 0, refresh_ns = 0, max_refresh_ns = 0;
@@ -16398,13 +16399,13 @@ private:
         const bool copied = copy_guarded(f.tiled.data(), reinterpret_cast<const std::uint8_t*>(cpu), std::size_t(span),
                                          title_memory_write_combined(cpu));
         std::uint64_t hash = 0, full = 0;
-        bool full_hashed = false, ok = false, nonzero = false;
+        bool full_hashed = false, ok = false, nonzero = false, busy = false;
         std::uint64_t staged_ns = 0;
         if (copied) {
             hash_guarded(f.tiled.data(), f.tiled.size(), hash);
             full_hashed = every_byte && hash_guarded(f.tiled.data(), f.tiled.size(), full, true);
             const auto start = std::chrono::steady_clock::now();
-            ok = r.upload_staged_title(layout, f.tiled.data(), f.columns, false, nonzero);
+            ok = r.upload_staged_title(layout, f.tiled.data(), f.columns, false, nonzero, busy);
             staged_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start)
                             .count();
         }
@@ -16420,8 +16421,12 @@ private:
         }
         title_stats_.staged_ns += staged_ns;
         if (!ok) {
-            log_once("staged title texture upload failed, format", int(r.format()));
-            ++title_stats_.fill_failures;
+            if (busy) {
+                ++title_stats_.no_slot;
+            } else {
+                log_once("staged title texture upload failed, format", int(r.format()));
+                ++title_stats_.fill_failures;
+            }
             t.stale = true;
             return false;
         }
@@ -16796,6 +16801,13 @@ private:
         if (!t.hashed || hash != t.hash || t.stale) fill_title_texture(t, true);
     }
 
+    // False when the fill of `t` would have to wait for an upload slot.
+    bool upload_room(const TitleTexture& t) {
+        if (!t.resource->staged_title()) return true;
+        std::lock_guard lock(state_.title_upload_mutex);
+        return state_.title_upload.room(state_);
+    }
+
     // Snapshot the whole footprint before uploading any subresource. A concurrent unmap defers the fill.
     // Private title staging bypasses the D3D12 submit callbacks. Generic staged copies require an outer fill.
     std::uint64_t fill_title_texture(TitleTexture& t, bool staged) {
@@ -16808,6 +16820,11 @@ private:
                     return 0;
                 }
         const std::uint64_t span = layout.layout.size;
+        if (!upload_room(t)) {  // a later pass: never a wait for the GPU here
+            ++title_stats_.no_slot;
+            t.stale = true;
+            return 0;
+        }
         if (!title_texture_readable(t)) return 0;
         title_tiled_.resize(std::size_t(span));
         if (!copy_guarded(title_tiled_.data(), reinterpret_cast<const std::uint8_t*>(t.cpu), std::size_t(span),
@@ -16837,14 +16854,14 @@ private:
         const bool volume = layout.layout.dimension == rt::xg_xs::kTexture3D;
         const bool trace_pool = leonida::dstorage::trace_enabled() && leonida::title_gpu_views::other_view(t.cpu);
         bool nonzero = false;
-        bool ok = true;
+        bool ok = true, busy = false;
         if (t.resource->staged_title()) {
             const auto start = std::chrono::steady_clock::now();
-            ok = t.resource->upload_staged_title(layout, title_tiled_.data(), title_columns_, trace_pool, nonzero);
+            ok = t.resource->upload_staged_title(layout, title_tiled_.data(), title_columns_, trace_pool, nonzero, busy);
             title_stats_.staged_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now() - start).count();
             if (ok) ++title_stats_.staged_fills;
-            if (!ok) log_once("staged title texture upload failed, format", int(t.resource->format()));
+            if (!ok && !busy) log_once("staged title texture upload failed, format", int(t.resource->format()));
         } else {
             for (std::uint32_t slice = 0; slice < slices && ok; ++slice) {
                 for (std::uint32_t level = 0; level < mips && ok; ++level) {
@@ -16867,7 +16884,7 @@ private:
             }
         }
         if (!ok) {
-            ++title_stats_.fill_failures;
+            ++(busy ? title_stats_.no_slot : title_stats_.fill_failures);
             t.stale = true;
             return 0;
         }
@@ -16961,7 +16978,7 @@ private:
                      "%llu of images made for them (%llu made, %llu over memory not readable yet, %llu retired), %llu "
                      "null views; registry %zu images "
                      "(%zu made, %zu slot 133 of %llu registered, %zu mapped, %zu filled); %llu fills %.1f MiB, %llu "
-                     "failed\n",
+                     "failed, %llu put off for an upload slot\n",
                      when, static_cast<unsigned long long>(s.views), s.asked.size(),
                      static_cast<unsigned long long>(s.of_slot133), static_cast<unsigned long long>(s.of_cache),
                      static_cast<unsigned long long>(s.made), static_cast<unsigned long long>(s.unreadable),
@@ -16969,7 +16986,7 @@ private:
                      static_cast<unsigned long long>(s.null_views), state_.title_textures.size(), owned, slot133,
                      static_cast<unsigned long long>(s.registered), mapped, filled,
                      static_cast<unsigned long long>(s.fills), double(s.fill_bytes) / 1048576.0,
-                     static_cast<unsigned long long>(s.fill_failures));
+                     static_cast<unsigned long long>(s.fill_failures), static_cast<unsigned long long>(s.no_slot));
         const auto host = state_.context->host_texture_stats();
         std::fprintf(stderr, "[rt] d3d12: ordered title host copies %llu, GPU waits %llu; "
                              "slot-70 views awaiting readable memory: %llu\n",

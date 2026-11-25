@@ -3,10 +3,15 @@
 #include "xg_xs_layout.h"
 #include "../src/vulkan_backend.h"
 
+#include <algorithm>
+#include <deque>
+#include <utility>
+#include <vector>
+
 namespace rt::d3d12 {
 
-// A ring of upload buffers and command buffers per device, used under the title-texture registry lock.
-// A whole image (including arrays and compressed mip tails) is detiled into the mapped buffer of the next slot.
+// Upload buffers and command buffers of a device, used under title_upload_mutex.
+// A whole image (including arrays and compressed mip tails) is detiled into the mapped buffer of a free slot.
 // The transfer never re-enters the D3D12 queue's pre-submit callbacks.
 //
 // A write no longer waits for its own transfer: the caller (a title thread creating a slot-70 view) waited for the
@@ -14,7 +19,9 @@ namespace rt::d3d12 {
 // every other submission waited too (speed-26: a title thread 68-88 % inside slot 70). A slot's buffer is reused,
 // resized or freed only after its last transfer completed (the slot's timeline value). The image needs no CPU wait:
 // later submissions on the queue are ordered after the transfer, other queues wait for it on the GPU, and a retired
-// image is destroyed through the deferred queue, after later submissions retire.
+// image is destroyed through the deferred queue, after later submissions retire. With no slot free a write is refused
+// (room(), `busy`) and its caller leaves the texture for a later pass: a slot's transfer sits behind all the GPU work
+// before it, seconds of it at times, and a wait for one holds up the thread that submits.
 class TitleImageUpload {
 public:
     VkDeviceSize capacity() const {
@@ -38,7 +45,8 @@ public:
     template<class Device>
     bool write(Device& d, leonida::ResourceId id, const leonida::ResourceBinding& image,
                const xg_xs::Texture& layout, const std::uint8_t* tiled, std::vector<std::uint64_t>& columns,
-               bool inspect, bool& nonzero) {
+               bool inspect, bool& nonzero, bool& busy) {
+        busy = false;
         const auto block = leonida::copy_block_format(image, VK_IMAGE_ASPECT_COLOR_BIT);
         const auto mips = layout.layout.mips;
         const auto layers = layout.array;
@@ -67,9 +75,14 @@ public:
                 regions_.push_back(copy);
             }
         }
-        Slot& slot = slots_[next_];
+        if (!make_ready(d)) return false;
+        Slot* const free = pick(d, bytes);
+        if (!free) {
+            busy = true;
+            return false;
+        }
+        Slot& slot = *free;
         if (!prepare(d, slot, bytes)) return false;
-        next_ = (next_ + 1) % kSlots;
         for (const auto& copy : regions_) {
             const auto level = copy.imageSubresource.mipLevel;
             const auto& mip = layout.layout.plane[0].mips[level];
@@ -82,8 +95,9 @@ public:
         }
 
         const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, mips, 0, layers};
-        const auto result = d.context->write_staged_title_image(id, range, [&](const leonida::ReplayFunctions& replay,
-                                                                               const leonida::LayoutPieces& pieces) {
+        const auto result = d.context->write_staged_title_image(id, range, d.info.queue, [&](
+            const leonida::ReplayFunctions& replay, const leonida::LayoutPieces& pieces,
+            const std::vector<std::pair<VkSemaphore, std::uint64_t>>& earlier) {
             auto& vk = d.context->vk;
             VkResult r = vk.vkResetCommandBuffer(slot.command, 0);
             if (r != VK_SUCCESS) return r;
@@ -104,13 +118,22 @@ public:
                     VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
                     VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
             if ((r = vk.vkEndCommandBuffer(slot.command)) != VK_SUCCESS) return r;
-            return submit(d, slot);
+            return submit(d, slot, earlier);
         });
         return result == VK_SUCCESS;
     }
 
+    // Whether a write can start now, before its caller reads the texture's bytes for it.
+    template<class Device>
+    bool room(Device& d) {
+        poll(d);
+        return std::any_of(slots_.begin(), slots_.end(), [](const Slot& s) { return !s.value; }) ||
+               (slots_.size() < kSlots && capacity() < kBytes);
+    }
+
 private:
-    static constexpr unsigned kSlots = 4;
+    static constexpr std::size_t kSlots = 32;
+    static constexpr VkDeviceSize kBytes = VkDeviceSize(256) << 20;  // of buffers, but one texture may be larger
     struct Slot {
         VkBuffer buffer{};
         VkDeviceMemory memory{};
@@ -120,7 +143,35 @@ private:
         std::uint64_t value = 0;  // the ready_ value its last transfer signals; 0: none submitted
     };
 
-    // Waits (outside every lock but the registry's) until the slot's last transfer has completed.
+    // The slots whose transfer completed are free.
+    template<class Device>
+    void poll(Device& d) {
+        std::uint64_t reached = 0;
+        if (!ready_ || d.context->vk.vkGetSemaphoreCounterValue(d.info.device, ready_, &reached) != VK_SUCCESS) return;
+        for (Slot& slot : slots_)
+            if (slot.value <= reached) slot.value = 0;
+    }
+
+    // A free slot for `size` bytes: the smallest buffer that holds them, else a new slot, else a free one to be given a
+    // larger buffer (the other free ones give theirs up past kBytes). Null when none is free and no more may be made.
+    template<class Device>
+    Slot* pick(Device& d, VkDeviceSize size) {
+        poll(d);
+        Slot *fit = nullptr, *largest = nullptr;
+        for (Slot& slot : slots_) {
+            if (slot.value) continue;
+            if (slot.capacity >= size && (!fit || slot.capacity < fit->capacity)) fit = &slot;
+            if (!largest || slot.capacity > largest->capacity) largest = &slot;
+        }
+        if (fit) return fit;
+        if (slots_.size() < kSlots && (slots_.empty() || capacity() + size <= kBytes)) return &slots_.emplace_back();
+        if (largest && capacity() - largest->capacity + size > kBytes)
+            for (Slot& slot : slots_)
+                if (!slot.value && &slot != largest) release_buffer(d, slot);
+        return largest;
+    }
+
+    // Waits until the slot's last transfer has completed: only to release it.
     template<class Device>
     bool wait_slot(Device& d, Slot& slot) {
         if (!slot.value || !ready_) return true;
@@ -157,7 +208,7 @@ private:
     }
 
     template<class Device>
-    bool prepare(Device& d, Slot& slot, VkDeviceSize size) {
+    bool make_ready(Device& d) {
         auto& vk = d.context->vk;
         const auto dev = d.info.device;
         if (!pool_) {
@@ -165,13 +216,6 @@ private:
             pool.queueFamilyIndex = d.info.queue_family;
             pool.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
             if (vk.vkCreateCommandPool(dev, &pool, nullptr, &pool_) != VK_SUCCESS) return false;
-        }
-        if (!slot.command) {
-            VkCommandBufferAllocateInfo alloc{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-            alloc.commandPool = pool_;
-            alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-            alloc.commandBufferCount = 1;
-            if (vk.vkAllocateCommandBuffers(dev, &alloc, &slot.command) != VK_SUCCESS) return false;
         }
         if (!ready_) {
             VkSemaphoreTypeCreateInfo timeline{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
@@ -183,8 +227,21 @@ private:
                     if (q && q != d.info.queue && std::find(consumers_.begin(), consumers_.end(), q) == consumers_.end())
                         consumers_.push_back(q);
         }
-        // The slot's buffer and command buffer are rewritten below and in write(): its last transfer must be done.
-        if (!wait_slot(d, slot)) return false;
+        return true;
+    }
+
+    // `slot` is free: its last transfer is done.
+    template<class Device>
+    bool prepare(Device& d, Slot& slot, VkDeviceSize size) {
+        auto& vk = d.context->vk;
+        const auto dev = d.info.device;
+        if (!slot.command) {
+            VkCommandBufferAllocateInfo alloc{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+            alloc.commandPool = pool_;
+            alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+            alloc.commandBufferCount = 1;
+            if (vk.vkAllocateCommandBuffers(dev, &alloc, &slot.command) != VK_SUCCESS) return false;
+        }
         if (size <= slot.capacity) return true;
         release_buffer(d, slot);
         VkBufferCreateInfo buffer{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
@@ -208,13 +265,25 @@ private:
     // Under tracker_mutex_ and submit_mutex_ (write_staged_title_image): submits the transfer and the other queues'
     // GPU-side waits for it, and returns without waiting for it on the CPU.
     template<class Device>
-    VkResult submit(Device& d, Slot& slot) {
+    VkResult submit(Device& d, Slot& slot, const std::vector<std::pair<VkSemaphore, std::uint64_t>>& earlier) {
         auto& vk = d.context->vk;
         ++value_;
+        std::vector<VkSemaphore> after;
+        std::vector<std::uint64_t> after_values;
+        for (const auto& [progress, value] : earlier) {
+            after.push_back(progress);
+            after_values.push_back(value);
+        }
+        const std::vector<VkPipelineStageFlags> after_stages(after.size(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
         VkTimelineSemaphoreSubmitInfo timeline{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+        timeline.waitSemaphoreValueCount = std::uint32_t(after.size());
+        timeline.pWaitSemaphoreValues = after_values.data();
         timeline.signalSemaphoreValueCount = 1;
         timeline.pSignalSemaphoreValues = &value_;
         VkSubmitInfo transfer{VK_STRUCTURE_TYPE_SUBMIT_INFO, &timeline};
+        transfer.waitSemaphoreCount = std::uint32_t(after.size());
+        transfer.pWaitSemaphores = after.data();
+        transfer.pWaitDstStageMask = after_stages.data();
         transfer.commandBufferCount = 1;
         transfer.pCommandBuffers = &slot.command;
         transfer.signalSemaphoreCount = 1;
@@ -243,8 +312,7 @@ private:
         return VK_SUCCESS;
     }
 
-    Slot slots_[kSlots];
-    unsigned next_ = 0;
+    std::deque<Slot> slots_;  // a slot keeps its address
     VkCommandPool pool_{};
     VkSemaphore ready_{};
     std::uint64_t value_ = 0;
