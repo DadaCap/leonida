@@ -1,5 +1,6 @@
 #include <atomic>
 #include "xbox_present.h"
+#include "../src/frame_stats.h"
 
 #include "d3d12_trace.h"
 #include "d3d12_xs_device.h"
@@ -148,7 +149,9 @@ HRESULT XboxPresentation::PresentX(UINT plane_count, const XboxPresentPlaneParam
                                    const XboxPresentParameters* params) {
     // One trace line per present, whatever path the call takes out of present_x: the queue proxy's PresentX slot is
     // past the PC chain, so nothing else records it, and a frame loop's presents could not be counted from a trace.
-    return d3d12_trace::result("XboxPresentation::PresentX", present_x(plane_count, planes, params));
+    const HRESULT presented = present_x(plane_count, planes, params);
+    leonida::frame_stats::show();
+    return d3d12_trace::result("XboxPresentation::PresentX", presented);
 }
 
 // LOCAL DIAGNOSTIC (LEONIDA_LOCAL_DIAGNOSTICS=1): which check refuses PresentX, with its HRESULT.

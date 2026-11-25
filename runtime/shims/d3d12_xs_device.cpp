@@ -24,6 +24,7 @@
 // for a trace that disagrees. The frame-event calls answer from a per-device token counter: there is no vblank source
 // behind the device before a presenter exists, so WaitFrameEventX returns at once with a fresh non-zero token.
 #include "../src/title_va_alias.h"
+#include "../src/frame_stats.h"
 #include "d3d12_xs_device.h"
 #include "xmem.h"
 #ifdef LEONIDA_VULKAN_DEVICE
@@ -1740,6 +1741,7 @@ PresentState* present_state_for(DeviceProxy* device, bool splash_only = false) {
                      interval, static_cast<unsigned long>(set), static_cast<unsigned long>(armed));
     }
     if (splash_only) device->present_state = pending.release();
+    leonida::frame_stats::window.store(target);
     std::fprintf(stderr, "[rt] d3d12_xs: PresentX ready (window %p: %s, client area %ldx%ld)\n",
                  static_cast<void*>(target),
                  titles ? "the title's own window" : hidden ? "the runtime's window, hidden" : "the runtime's window",

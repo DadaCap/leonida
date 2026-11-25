@@ -43,6 +43,7 @@
 #include <vector>
 
 #include "shims.h"
+#include "../src/frame_stats.h"
 #include "startup_trace.h"
 #if defined(LEONIDA_HAVE_XMA2_DECODER)
 #include "leonida_xma2_decoder.h"
@@ -757,6 +758,8 @@ private:
             }
 
             pump_all();
+            ++leonida::frame_stats::xma_pumps;
+            leonida::frame_stats::xma_voices.store(active_count_.load(std::memory_order_relaxed));
 
             std::unique_lock lock(worker_mutex_);
             if (stop.stop_requested()) return;

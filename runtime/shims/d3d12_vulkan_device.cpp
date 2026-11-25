@@ -9,6 +9,7 @@
 #define VK_USE_PLATFORM_WIN32_KHR
 #endif
 #include "../src/vulkan_graphics_shader_modules.h"
+#include "../src/frame_stats.h"
 #include "d3d12_com.h"
 #include "d3d12_compile_exit.h"
 #include "d3d12_pipeline_compile.h"
@@ -9166,6 +9167,8 @@ private:
         if (big_lock.owns_lock()) big_lock.unlock();
         vk.vkDestroyShaderModule(dev, module, nullptr);  // Vulkan lets a module go once the pipeline exists
         const ULONGLONG took = GetTickCount64() - started;
+        ++leonida::frame_stats::builds;
+        leonida::frame_stats::build_ms += std::uint32_t(took);
         if (created != VK_SUCCESS || !built) {
             std::fprintf(stderr, "[rt] d3d12: compute pipeline %s could not be built (VkResult %d); its dispatches are "
                                  "dropped\n", entry->name.c_str(), int(created));
@@ -9470,7 +9473,10 @@ private:
         trace.begin(info, device_.info.pipeline_creation_feedback, trigger, profile_shaders_.c_str(), unbound, bytes, cache_key_);
         const leonida::pipeline_profile::DriverCall profile(r.mesh ? "ms" : "vs", lazy_ ? "lazy" : "eager",
                                                          program, fragment, unbound);
+        const ULONGLONG graphics_started = GetTickCount64();
         const auto result = device_.context->vk.vkCreateGraphicsPipelines(device_.info.device, cache, 1, &info, nullptr, &pipeline);
+        ++leonida::frame_stats::builds;
+        leonida::frame_stats::build_ms += std::uint32_t(GetTickCount64() - graphics_started);
         if (status) *status = result;
         profile.finish(int(result));
         trace.end(trigger, profile_shaders_.c_str(), unbound, bytes, result);

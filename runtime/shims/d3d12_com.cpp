@@ -1,5 +1,6 @@
 #include <cstdlib>
 #include "d3d12_com.h"
+#include "../src/frame_stats.h"
 
 #include "d3d12_stubs.h"  // generated
 #include "d3d12_com_object.h"
@@ -401,6 +402,7 @@ public:
 
     void STDMETHODCALLTYPE Dispatch(UINT x, UINT y, UINT z) override {
         d3d12_trace::record("ID3D12GraphicsCommandList::Dispatch");
+        ++leonida::frame_stats::dispatches;
         if (defer([=](GraphicsCommandList& l) { l.record_dispatch(x, y, z); }, true)) return;
         record_dispatch(x, y, z);
     }
@@ -520,6 +522,7 @@ public:
 
     void STDMETHODCALLTYPE DrawInstanced(UINT vertices, UINT instances, UINT first_vertex, UINT first_instance) override {
         d3d12_trace::record("ID3D12GraphicsCommandList::DrawInstanced");
+        ++leonida::frame_stats::draws;
         if (defer([=](GraphicsCommandList& l) { l.record_draw(false, vertices, instances, first_vertex, 0, first_instance); },
                   true))
             return;
@@ -529,6 +532,7 @@ public:
     void STDMETHODCALLTYPE DrawIndexedInstanced(UINT indices, UINT instances, UINT first_index, INT base_vertex,
                                                 UINT first_instance) override {
         d3d12_trace::record("ID3D12GraphicsCommandList::DrawIndexedInstanced");
+        ++leonida::frame_stats::draws;
         if (defer([=](GraphicsCommandList& l) {
                 l.record_draw(true, indices, instances, first_index, base_vertex, first_instance);
             }, true))
@@ -541,6 +545,7 @@ public:
     // (D3D12_MS_DISPATCH_MAX_THREAD_GROUPS_PER_GRID); a larger grid is a recording error.
     void STDMETHODCALLTYPE DispatchMesh(UINT x, UINT y, UINT z) override {
         d3d12_trace::record("ID3D12GraphicsCommandList6::DispatchMesh");
+        ++leonida::frame_stats::draws;
         if (x > 65535 || y > 65535 || z > 65535 || std::uint64_t(x) * y * z > (1u << 22)) return check(false);
         if (!graphics_pipeline_ || !graphics_.layout) return check(false);
         // A mesh shader reads the root arguments from s16 through a 16-dword window (RootArgumentLayout::mesh_ok).
@@ -969,6 +974,7 @@ public:
     void STDMETHODCALLTYPE ExecuteIndirect(ID3D12CommandSignature* signature, UINT max_command_count,
                                            ID3D12Resource* argument_buffer, UINT64 argument_buffer_offset,
                                            ID3D12Resource* count_buffer, UINT64 count_buffer_offset) override {
+        ++leonida::frame_stats::indirect;
         if (type_ != D3D12_COMMAND_LIST_TYPE_DIRECT && type_ != D3D12_COMMAND_LIST_TYPE_COMPUTE &&
             type_ != D3D12_COMMAND_LIST_TYPE_BUNDLE)
             return check(false);
@@ -2234,6 +2240,7 @@ public:
     }
 
     void STDMETHODCALLTYPE ExecuteCommandLists(UINT count, ID3D12CommandList* const* lists) override {
+        ++leonida::frame_stats::submissions;
         constexpr auto method = "ID3D12CommandQueue::ExecuteCommandLists";
         std::lock_guard lock(mutex_);
         if (count > 0 && !lists) {
