@@ -38,6 +38,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <set>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -470,6 +471,7 @@ public:
         image_memory,  // an ImageMemory::Range*, deleted: its bytes go back to their block
         acceleration_structure,
         framebuffer,
+        call,  // a std::function<void()>*, run and deleted
     };
 
     struct Item {
@@ -566,6 +568,9 @@ public:
                 break;
             case Kind::framebuffer:
                 vk.vkDestroyFramebuffer(device, reinterpret_cast<VkFramebuffer>(item.handle), nullptr);
+                break;
+            case Kind::call:
+                (*std::unique_ptr<std::function<void()>>(reinterpret_cast<std::function<void()>*>(item.handle)))();
                 break;
             }
         }
@@ -1967,20 +1972,53 @@ public:
     // submitted to it, and never makes a queue wait.
     std::uint64_t submitted_retire_ticket() const { return submitted_ticket_.load(std::memory_order_acquire); }
 
+    // An execute from before its descriptor snapshot (before_execute_) until its vkQueueSubmit returned, or it failed.
+    // What it read may name memory no ticket covers yet, so what is released while one is open waits for it: only when
+    // every execute that began before the release is closed does the item get a ticket. Held batches take their
+    // snapshot when they run (execute_now), so they open one only then. Nothing here waits.
+    class ExecuteScope {
+    public:
+        explicit ExecuteScope(VulkanContext& context) : context_(context), epoch_(context.begin_execute()) {}
+        ~ExecuteScope() { context_.end_execute(epoch_); }
+        ExecuteScope(const ExecuteScope&) = delete;
+        ExecuteScope& operator=(const ExecuteScope&) = delete;
+
+    private:
+        VulkanContext& context_;
+        const std::uint64_t epoch_;
+    };
+
+    // `bytes` is what the wait keeps allocated, for the log.
     template<typename VkHandle>
-    void defer_destroy(DeferredDeletionQueue::Kind kind, VkHandle handle) {
+    void defer_destroy(DeferredDeletionQueue::Kind kind, VkHandle handle, std::uint64_t bytes = 0) {
         const auto raw = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(handle));
-        if (!raw) return;
-        std::lock_guard lock(submit_mutex_);
-        const std::uint64_t safe_ticket = submitted_ticket_.load(std::memory_order_acquire) + 1;
-        deletion_queue_.push(safe_ticket, kind, raw);
+        if (raw) defer_destroy(kind, raw, bytes);
     }
 
-    void defer_destroy(DeferredDeletionQueue::Kind kind, std::uint64_t raw_handle) {
+    void defer_destroy(DeferredDeletionQueue::Kind kind, std::uint64_t raw_handle, std::uint64_t bytes = 0) {
         if (!raw_handle && kind != DeferredDeletionQueue::Kind::bindless_slot) return;
+        if (wait_for_executes(kind, raw_handle, bytes)) return;
         std::lock_guard lock(submit_mutex_);
         const std::uint64_t safe_ticket = submitted_ticket_.load(std::memory_order_acquire) + 1;
         deletion_queue_.push(safe_ticket, kind, raw_handle);
+    }
+
+    // Runs `release` once the executes open now are submitted and retired. False, and nothing kept, when none is open:
+    // the caller then releases as it would without executes in preparation.
+    bool defer_past_executes(std::function<void()> release, std::uint64_t bytes = 0) {
+        auto call = std::make_unique<std::function<void()>>(std::move(release));
+        if (!wait_for_executes(DeferredDeletionQueue::Kind::call, reinterpret_cast<std::uintptr_t>(call.get()), bytes))
+            return false;
+        (void)call.release();
+        return true;
+    }
+
+    // A long compile drops the resource lock with the execute's descriptor snapshot already taken: when `stale` says
+    // a backing went meanwhile, `refresh` takes it again. Set before the first execute; `refresh` runs with no lock of
+    // the context held.
+    void set_snapshot_refresh(std::function<bool()> stale, std::function<void()> refresh) {
+        snapshot_stale_ = std::move(stale);
+        snapshot_refresh_ = std::move(refresh);
     }
 
     // Waits (not for the device: for the queues' timelines) until every submission up to `ticket` is done, then
@@ -2037,6 +2075,16 @@ public:
 
     void drain_deleted_resources(std::uint64_t current_ticket) {
         deletion_queue_.drain(current_ticket, device_, vk);
+        if (current_ticket != UINT64_MAX) return;
+        // Teardown: no execute is open, so nothing may be left waiting for one (a release can queue another).
+        for (;;) {
+            {
+                std::lock_guard lock(lifetime_mutex_);
+                if (waiting_releases_.empty()) return;
+                promote_releases_locked(UINT64_MAX);
+            }
+            deletion_queue_.drain(current_ticket, device_, vk);
+        }
     }
 
     // True when the VA names a sparse resource: the sparse pass binds its memory, not the arena's mapping, so the
@@ -2104,6 +2152,40 @@ public:
 private:
     friend class VulkanQueue;
     friend class VulkanPresenter;
+
+    std::uint64_t begin_execute() {
+        std::lock_guard lock(lifetime_mutex_);
+        open_executes_.insert(++execute_epoch_);
+        return execute_epoch_;
+    }
+    void end_execute(std::uint64_t epoch) {
+        std::lock_guard lock(lifetime_mutex_);
+        open_executes_.erase(epoch);
+        promote_releases_locked(open_executes_.empty() ? UINT64_MAX : *open_executes_.begin());
+    }
+    // Releases older than every open execute get the ticket of the latest submission. lifetime_mutex_ held.
+    void promote_releases_locked(std::uint64_t oldest_open) {
+        while (!waiting_releases_.empty() && waiting_releases_.front().epoch < oldest_open) {
+            const WaitingRelease& w = waiting_releases_.front();
+            deletion_queue_.push(submitted_ticket_.load(std::memory_order_acquire), w.kind, w.handle);
+            waiting_bytes_ -= w.bytes;
+            waiting_releases_.pop_front();
+        }
+    }
+    bool wait_for_executes(DeferredDeletionQueue::Kind kind, std::uint64_t handle, std::uint64_t bytes) {
+        std::lock_guard lock(lifetime_mutex_);
+        // With none open, what is queued before a direct push keeps its place: promotion empties the list.
+        if (open_executes_.empty()) return false;
+        waiting_releases_.push_back({execute_epoch_, handle, bytes, kind});
+        waiting_bytes_ += bytes;
+        if (waiting_bytes_ > (256ull << 20) && !waiting_logged_) {
+            waiting_logged_ = true;
+            std::fprintf(stderr, "[rt] vulkan: over 256 MiB released by the title waits for command lists still being "
+                                 "prepared (%zu releases, %zu open executes)\n",
+                         waiting_releases_.size(), open_executes_.size());
+        }
+        return true;
+    }
 
     // buffer_at finds a buffer by VA: one with no image, a VkBuffer, a VA and bytes (what the linear search it replaced
     // accepted). Both are called with resource_mutex_ held uniquely.
@@ -2372,6 +2454,16 @@ private:
     RetireTickets<VkSemaphore> retire_tickets_;
     std::atomic<std::uint64_t> submitted_ticket_{0};
     DeferredDeletionQueue deletion_queue_;
+    struct WaitingRelease {
+        std::uint64_t epoch, handle, bytes;
+        DeferredDeletionQueue::Kind kind;
+    };
+    std::mutex lifetime_mutex_;  // after submit_mutex_; only the deletion queue's own lock is taken under it
+    std::uint64_t execute_epoch_ = 0;
+    std::set<std::uint64_t> open_executes_;
+    std::deque<WaitingRelease> waiting_releases_;  // epochs never go down
+    std::uint64_t waiting_bytes_ = 0;
+    bool waiting_logged_ = false;
     std::unique_ptr<DeviceFaultDiagnostics> device_fault_;
     std::jthread progress_watch_;
     std::unique_ptr<FenceWaitDispatcher> fence_dispatcher_;
@@ -2406,6 +2498,8 @@ private:
     std::map<std::tuple<VkImage, VkImage, VkImageView, VkImageView, VkRenderPass>, VkFramebuffer> resolve_framebuffers_;
     std::function<void()> before_execute_;
     std::function<void()> after_execute_;
+    std::function<bool()> snapshot_stale_;
+    std::function<void()> snapshot_refresh_;
     InputProbe input_probe_;
     TableScanner table_scanner_;
     GeometryProvider geometry_provider_;
@@ -3164,6 +3258,7 @@ private:
             const submit_phases::Scope waited(submit_phases::wait_room);
             if (context_.is_device_lost() || !wait_for_room()) return queue_unsupported(__LINE__);
         }
+        const VulkanContext::ExecuteScope executing(context_);
         if (context_.before_execute_) context_.before_execute_();
         struct AfterExecute {
             VulkanContext& context;
