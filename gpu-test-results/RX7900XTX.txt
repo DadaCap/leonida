@@ -1,3 +1,23 @@
+UPDATE 2026-11-25, re-run on current main. The sections below are the earlier measurement at 21625bca8
+(2026-11-24) and are kept for reference; where they differ, THIS block is current.
+
+Commit:     5fab93967 (main, 2026-11-25, merge of #1630); same container, driver, llvm-mc 19.1.1, system
+            Vulkan headers (VK_HEADER_VERSION 275), CMake + Ninja Release build as below
+run_gpu_tests.py: 277 shaders: 277 translated, 277 pass spirv-val (both modes)
+            native:                 242/268 passed, 24 skipped, 2 failed
+            LEONIDA_W64_EMULATE=1:  242/268 passed, 24 skipped, 2 failed (identical lines in both modes)
+Failed:     cs_imgatomic_ext: "6 of 64 sint words differ; first word 32: got 0x0badf00d, expected 0x00000101"
+            (also fails on the RTX 5060 and Arrow Lake here; open fix #1518).
+            cs_w32_salu64: same eight words as below (the documented RADV Mesa 25.2 bug).
+            cs_imgload_tfe and cs_imgload_d16_tfe PASS now (they failed at 21625bca8); cs_signed_zero_nan and
+            cs_fmt_int_narrow pass; ms_wave_info_s3 passes 4096/4096.
+Device:     the runner reports "AMD Radeon RX 7900 XTX (RADV NAVI31) (subgroup 32..64)" (this container
+            also enumerates the Arrow Lake iGPU and llvmpipe; the harness picked the XTX).
+AI-assisted (Claude Code): rebuilt main at 5fab93967 on this GPU and ran run_gpu_tests.py native and
+under LEONIDA_W64_EMULATE=1; counts and FAIL lines are copied from those runs. The skip lists and per-fixture
+notes further down were NOT re-derived for this commit.
+------------------------------------------------------------------------------
+
 GPU:        AMD Radeon RX 7900 XTX (RADV NAVI31, RDNA3 / gfx1100, PCI 1002:744c, discrete),
             host CPU Intel Core Ultra 7 255H
 Driver:     RADV (Mesa 25.2.8-0ubuntu0.24.04.5), Vulkan 1.4.318

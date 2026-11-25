@@ -1,3 +1,22 @@
+UPDATE 2026-11-25, re-run on current main. The sections below are the earlier measurement at 21625bca8
+(2026-11-24) and are kept for reference; where they differ, THIS block is current.
+
+Commit:     5fab93967 (main, 2026-11-25, merge of #1630); same container, driver, llvm-mc 19.1.1, system
+            Vulkan headers (VK_HEADER_VERSION 275), CMake + Ninja Release build as below
+run_gpu_tests.py: 277 shaders: 276 translated, 276 pass spirv-val (both modes); ps_ij_computed is still not
+            translated ("computed I/J pair under --bary-fallback: no PerVertexKHR inputs")
+            native:                 203/268 passed, 62 skipped, 3 failed
+            LEONIDA_W64_EMULATE=1:  238/268 passed, 27 skipped, 3 failed
+Failed:     cs_fmt_int_narrow: "word 34: expected 0xffffffff, got 0x00000000"; cs_imgatomic_ext: "6 of 64 sint
+            words differ; first word 32: got 0x0badf00d, expected 0x00000101" (open fix #1518);
+            cs_signed_zero_nan: "0x80000000 0x80000000 0x80000000 0x8000 0x1 0x0 0x1 0x7c00". Same three in both
+            modes. The cs_imgload_tfe pair, which failed at 21625bca8, passes now.
+Device:     Intel(R) Graphics (ARL) (subgroup 8..32).
+AI-assisted (Claude Code): rebuilt main at 5fab93967 on this GPU and ran run_gpu_tests.py native and
+under LEONIDA_W64_EMULATE=1; counts and FAIL lines are copied from those runs. The skip lists and per-fixture
+notes further down were NOT re-derived for this commit.
+------------------------------------------------------------------------------
+
 GPU:        Intel(R) Graphics (ARL) (Arrow Lake-H, PCI 8086:7d51, integrated), Core Ultra 7 255H
 Driver:     ANV (Intel open-source Mesa driver, Mesa 25.2.8-0ubuntu0.24.04.5), Vulkan 1.4.318
 Subgroup:   8..32 (minSubgroupSize 8, maxSubgroupSize 32)
