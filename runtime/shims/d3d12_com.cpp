@@ -222,8 +222,11 @@ public:
     const leonida::CommandList& commands() const { return list_; }
     // The descriptor tables this recording binds (console VAs), for the scan before a submission.
     const std::vector<std::pair<std::uint64_t, std::uint32_t>>& tables() const { return tables_; }
-    // The pipeline states and root signatures the recording names (it holds a reference to each until Reset).
+    // The pipeline states and root signatures the recording names (it holds a reference to each until Reset), and
+    // the objects a shim handed it with hold_until_reset.
     const std::vector<IUnknown*>& pinned() const { return held_; }
+    // rt::d3d12::hold_until_reset: an object the recording uses that its caller does not keep (a shim's own scratch).
+    void hold_for_recording(IUnknown* object) { hold(object); }
     bool needs_all_sampled_views() const {
         if (directly_indexed_) return true;
         for (const auto& command : list_.commands()) {
@@ -1677,7 +1680,8 @@ private:
             if (!cbv_srv_uav_heap_)
                 note_once("draw/dispatch uses CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED with no CBV/SRV/UAV heap bound");
             else {
-                remember_table(cbv_srv_uav_base_, cbv_srv_uav_heap_->GetDesc().NumDescriptors);
+                const auto shader_va = console_descriptor_table_va(cbv_srv_uav_base_);
+                remember_table(shader_va, cbv_srv_uav_heap_->GetDesc().NumDescriptors);
                 note_once("CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED heap base tracked on list");
             }
         }
@@ -1781,10 +1785,14 @@ private:
     void write_direct_heaps(const RootState& state, std::uint32_t slot,
                             std::array<std::uint32_t, rt::rootsig::kMaxUserSgprs>& data) const {
         const auto flags = state.layout->flags;
-        if ((flags & D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED) && slot < data.size())
-            data[slot++] = static_cast<std::uint32_t>(cbv_srv_uav_base_);
-        if ((flags & D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED) && slot < data.size())
-            data[slot] = static_cast<std::uint32_t>(sampler_base_);
+        if ((flags & D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED) && slot < data.size()) {
+            const D3D12_GPU_VIRTUAL_ADDRESS va = console_descriptor_table_va(cbv_srv_uav_base_);
+            data[slot++] = static_cast<std::uint32_t>(va);
+        }
+        if ((flags & D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED) && slot < data.size()) {
+            const D3D12_GPU_VIRTUAL_ADDRESS va = console_descriptor_table_va(sampler_base_);
+            data[slot] = static_cast<std::uint32_t>(va);
+        }
     }
 
     std::array<std::uint32_t, rt::rootsig::kMaxUserSgprs> with_direct_heaps(const RootState& state,
@@ -1850,13 +1858,17 @@ private:
             const bool resource = layout.flags & D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED;
             const bool sampler = layout.flags & D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED;
             char resource_at[48] = "none", sampler_at[48] = "none";
-            if (resource)
+            if (resource) {
+                const auto va = console_descriptor_table_va(cbv_srv_uav_base_);
                 std::snprintf(resource_at, sizeof resource_at, "0x%llx at s%u",
-                              static_cast<unsigned long long>(std::uint32_t(cbv_srv_uav_base_)), end);
-            if (sampler && end + (resource ? 1u : 0u) < rt::rootsig::kMaxUserSgprs)
+                              static_cast<unsigned long long>(std::uint32_t(va)), end);
+            }
+            if (sampler && end + (resource ? 1u : 0u) < rt::rootsig::kMaxUserSgprs) {
+                const auto va = console_descriptor_table_va(sampler_base_);
                 std::snprintf(sampler_at, sizeof sampler_at, "0x%llx at s%u",
-                              static_cast<unsigned long long>(std::uint32_t(sampler_base_)),
+                              static_cast<unsigned long long>(std::uint32_t(va)),
                               end + (resource ? 1u : 0u));
+            }
             std::fprintf(stderr,
                          "[rt] d3d12: graphics direct heaps: resource heap %s, sampler heap %s, after %u dwords of "
                          "explicit arguments from s8 (first draw; LEONIDA_GRAPHICS_DIRECT_HEAPS=0 "
@@ -2188,7 +2200,8 @@ public:
 
     // What a held batch (queue_holds.h) keeps alive until it has run: the pipeline states and root signatures its
     // lists name, which the application may release and Reset away as soon as ExecuteCommandLists returns. Resources
-    // are not held (a D3D12 application keeps them until the fence it signals; the docs, section 4.4, list this).
+    // are not held (a D3D12 application keeps them until the fence it signals; the docs, section 4.4, list this),
+    // except a shim's own the recording uses (hold_until_reset), which are pinned with them.
     static std::shared_ptr<void> pin_lists(const std::vector<const GraphicsCommandList*>& lists) {
         auto objects = std::shared_ptr<std::vector<IUnknown*>>(new std::vector<IUnknown*>, [](auto* held) {
             for (IUnknown* object : *held) object->Release();
@@ -2814,6 +2827,13 @@ bool front_back_stencil_ref(ID3D12GraphicsCommandList8* list, UINT& front, UINT&
     if (!l) return false;
     front = l->front_stencil_ref();
     back = l->back_stencil_ref();
+    return true;
+}
+
+bool hold_until_reset(ID3D12GraphicsCommandList* list, IUnknown* object) {
+    GraphicsCommandList* l = GraphicsCommandList::from(list);
+    if (!l || !object) return false;
+    l->hold_for_recording(object);
     return true;
 }
 

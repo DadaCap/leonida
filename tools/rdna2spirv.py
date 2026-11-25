@@ -5576,6 +5576,27 @@ class Gen:
         self.emit(f"{v} = OpLoad %uint {p}")
         return v
 
+    def x_lane_word(self, idx, lane):
+        """The data slot `idx` of lane `lane` (0-63) of this wave, read in an exchange. A lane of a partial last wave
+        that doesn't exist reads as 0 (as a source that isn't running does for ds_swizzle / ds_bpermute on the
+        hardware): the value is selected by the lane's place in the workgroup, not left to the zeroed slot, because
+        RADV (Mesa 26.3.1) turns a store, barrier and load of another lane's slot into a subgroup swizzle that
+        fetches the missing lane's register instead. Full waves read the slot as before."""
+        v = self.x_word(idx)
+        size = (self.cs or self.ms)["size"]
+        threads = size[0] * size[1] * size[2]
+        if threads >= self.x_lanes:
+            return v
+        if self.x_lanes == 64:
+            at = lane
+        else:
+            at = self.tmp()
+            self.emit(f"{at} = OpIAdd %uint %x_wbase {lane}")
+        ok, r = self.tmp(), self.tmp()
+        self.emit(f"{ok} = OpULessThan %bool {at} {self.cu(threads)}")
+        self.emit(f"{r} = OpSelect %uint {ok} {v} {self.cu(0)}")
+        return r
+
     def x_mask_slot(self, it):
         """Index of the wave's first mask word in the slot of round `it`."""
         s, a, b, c = (self.tmp() for _ in range(4))
@@ -5721,11 +5742,11 @@ class Gen:
                     if w == 1:
                         j = self.tmp()
                         self.emit(f"{j} = OpIAdd %uint {data_base} {lane}")
-                        return self.x_word(j)
+                        return self.x_lane_word(j, lane)
                     i, j = self.tmp(), self.tmp()
                     self.emit(f"{i} = OpIAdd %uint {data_base} %x_wbase")
                     self.emit(f"{j} = OpIAdd %uint {i} {lane}")
-                    return self.x_word(j)
+                    return self.x_lane_word(j, lane)
                 return read, None
             if data is None and bits is not None and bits[0] is not None and bits[1] is None:
                 fn = self._ensure_x_pre_fn("vote")
@@ -5770,11 +5791,11 @@ class Gen:
                 if w == 1:
                     j = self.tmp()
                     self.emit(f"{j} = OpIAdd %uint {base} {lane}")
-                    return self.x_word(j)
+                    return self.x_lane_word(j, lane)
                 i, j = self.tmp(), self.tmp()
                 self.emit(f"{i} = OpIAdd %uint {base} %x_wbase")
                 self.emit(f"{j} = OpIAdd %uint {i} {lane}")
-                return self.x_word(j)
+                return self.x_lane_word(j, lane)
             return read, res
         it = self.tmp()
         self.emit(f"{it} = OpLoad %uint %x_it")
@@ -5812,7 +5833,7 @@ class Gen:
             self.emit(f"{i} = OpIAdd %uint {base} %x_wbase")
             j = self.tmp()
             self.emit(f"{j} = OpIAdd %uint {i} {lane}")
-            return self.x_word(j)
+            return self.x_lane_word(j, lane)
         return read, res
 
     def x_memory_order(self, op):

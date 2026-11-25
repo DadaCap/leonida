@@ -14,6 +14,8 @@
 
 #include <windows.h>
 #include <d3d12.h>
+#include <array>
+#include <map>
 #include <memory>
 #include <vector>
 
@@ -30,6 +32,7 @@
 
 #include "../src/root_signature.h"
 #include "../src/subgroup_size.h"
+#include "../src/vulkan_memory_budget.h"
 
 namespace leonida {
 class VulkanPresenter;
@@ -109,6 +112,8 @@ struct VulkanDeviceInfo {
     bool depth_range_unrestricted = false;  // VK_EXT_depth_range_unrestricted enabled on this device.
     std::uint32_t max_push_constants_size = 0;
     bool push_constants_need_fallback = false;
+    // Top location for relocated f16 halves (0: read from device limits; non-zero: override for testing low-limit devices).
+    std::uint32_t f16_half_top_location = 0;
     // maxBufferSize and maxMemoryAllocationSize, which cap the GPU address arena (src/arena_size.h). 0: read from
     // the physical device when the D3D12 device is created; a test sets smaller ones to simulate a device.
     VkDeviceSize max_buffer_size = 0;
@@ -215,6 +220,20 @@ struct VulkanDeviceInfo {
     // VK_EXT_mesh_shader's meshShaderQueries feature is enabled on `device`, so the clipping invocations of a mesh
     // segment come from a mesh-primitives query (D3D-MESH-CLIPPING-COUNTER). Without it they read 0.
     bool mesh_shader_queries = false;
+    // VK_EXT_transform_feedback with its transformFeedback feature is enabled on `device` (D3D-302): an
+    // SO_STATISTICS heap is a real VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT pool, begun and ended indexed on the
+    // stream. StreamOutput PSOs are still refused and SOSetTargets is still not implemented.
+    bool transform_feedback = false;
+    // VK_EXT_transform_feedback's geometryStreams feature is offered by the device. The device-enable chain requests
+    // it when present so the pipeline cache key matches vk_pipeline_check; nothing rasterizes a stream other than 0.
+    bool transform_feedback_geometry_streams = false;
+    // VK_EXT_transform_feedback's transformFeedbackQueries property (D3D-302): the device can begin/end a
+    // VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT query. Without it an SO_STATISTICS heap is made without a pool and
+    // every SO_STATISTICS query resolves zero, even when the transformFeedback feature is enabled.
+    bool transform_feedback_queries = false;
+    // The device's maxTransformFeedbackStreams property: an SO_STATISTICS_STREAMn query runs only for n below it.
+    // Streams from this count up (to the D3D12 maximum of four) run nothing and resolve zero.
+    std::uint32_t max_transform_feedback_streams = 0;
     // The core features enabled on `device`. Graphics PSOs that need independentBlend, fillModeNonSolid,
     // depthBiasClamp or dualSrcBlend are refused unless it is set here.
     VkPhysicalDeviceFeatures features{};
@@ -239,6 +258,9 @@ struct VulkanDeviceInfo {
     bool draw_indirect_count_enabled = false;
     // Both VK_KHR_maintenance5 and robustBufferAccess2 (with core robustBufferAccess) are enabled.
     bool robust_index_view = false;
+    // VK_EXT_memory_budget is enabled on `device`: vulkan_vram_budget reads the GPU memory in use and the budget
+    // from it (the title HUD's VRAM figure). Without it that figure is not available.
+    bool memory_budget = false;
     std::uint32_t max_draw_indirect_count = 1;
 };
 
@@ -284,6 +306,10 @@ leonida::ResourceId uav_image_resource(ID3D12Resource* resource, std::uint64_t a
 VkBuffer vulkan_buffer(ID3D12Resource* resource);
 // What a device from create_vulkan_device* was created with (enabled features included), or null. For tests.
 const VulkanDeviceInfo* vulkan_device_info(ID3D12Device* device);
+// The GPU memory a device from create_vulkan_device* (or its Xbox-ABI proxy) uses and may use, from
+// VK_EXT_memory_budget, read now (src/vulkan_memory_budget.h). Not available without the extension or the device.
+// Any thread: the title HUD calls it from its own, at most once per refresh.
+leonida::VramBudget vulkan_vram_budget(ID3D12Device* device);
 // The device's pipeline workers (src/pipeline_workers.h) and what they have compiled; zeros without any. For tests.
 leonida::PipelineWorkers::Stats pipeline_worker_stats(ID3D12Device* device);
 // True when a slot-133 buffer is a shadow copied from the title's pages, false when they were imported. For tests.
@@ -387,6 +413,38 @@ struct BindlessRoom {
     std::uint32_t samplers = 0;
 };
 BindlessRoom bindless_room(ID3D12Device* device);
+
+// What a T# the title wrote itself into a console descriptor heap came to (bind_title_image).
+enum class TitleImage { known, bound, unknown, refused, not_tsharp };
+
+// Statistics on unbound T# descriptors refused during console descriptor heap binding.
+struct UnboundTsharpReasonStats {
+    std::size_t distinct_slots = 0;
+    std::uint64_t total_refusals = 0;
+};
+
+struct UnboundTsharpStats {
+    std::map<std::string, UnboundTsharpReasonStats> by_reason;
+    std::size_t total_distinct_slots = 0;
+    std::uint64_t total_refusals = 0;
+};
+
+// Returns statistics on unbound T# descriptor refusals across console descriptor heaps.
+UnboundTsharpStats unbound_tsharp_stats();
+// Resets unbound T# refusal statistics (for testing).
+void reset_unbound_tsharp_stats();
+// Records an unbound T# refusal (for testing).
+void note_refused_tsharp_for_test(std::uint64_t heap_va, std::size_t offset,
+                                  const std::array<std::uint32_t, 8>& words, const char* why);
+
+// Simulates console descriptor heap T# binding for a synthetic descriptor against registered resources.
+// Returns TitleImage::bound on success, TitleImage::refused on rule violation (with *why set to the refusal string),
+// or TitleImage::unknown / TitleImage::not_tsharp.
+TitleImage test_bind_title_image(ID3D12Device* device, const std::array<std::uint32_t, 8>& words,
+                                 const char** why = nullptr);
+
+// Returns the internal image address registered for a resource in the device's image table.
+std::uint64_t resource_image_address(ID3D12Resource* resource);
 // Gives each S# a sampler in that set and a key in its hash table, as CreateSampler does, without a heap slot: for
 // the literal S#s a shader builds from immediates (`literal_samplers` in the shader index). An S# that has them
 // already is left as it is. E_INVALIDARG when `device` is not such a device; E_FAIL when one of them could not be
@@ -520,6 +578,9 @@ std::uintptr_t compute_pipeline_id(ID3D12PipelineState* pipeline);
 std::uintptr_t graphics_pipeline_id(ID3D12PipelineState* pipeline);
 // What each stage of a Vulkan device's PSO asked for (src/subgroup_size.h), in creation order; null for another PSO.
 const std::vector<leonida::SubgroupRequest>* pipeline_subgroup_requests(ID3D12PipelineState* pipeline);
+// The linked SPIR-V stage modules for a lazy pipeline (in recipe stages order); false when not a lazy pipeline.
+bool pipeline_stage_words(ID3D12PipelineState* pipeline, std::vector<std::vector<std::uint32_t>>& words,
+                          std::string& why);
 // PSOs of any Vulkan device not yet deleted, counting one whose deletion waits for its running build (tests).
 long live_pipeline_states();
 
@@ -577,6 +638,14 @@ void set_global_realtime_privilege_override_for_test(int state);
 // `list`. The values are kept for the future pipeline path, which is what would apply them. False when `list` is
 // not one of this module's command lists.
 bool front_back_stencil_ref(ID3D12GraphicsCommandList8* list, UINT& front, UINT& back);
+
+// Makes `list` hold a reference to `object` until its next Reset or its release, as it holds the pipeline states it
+// names: for an object only the recording uses, such as a shim's own scratch buffer. A list is Reset once it has
+// been executed (or a held batch, src/queue_holds.h, keeps it pinned until it has run), and a resource released
+// after its submission is destroyed through the device's deferred queue once that submission has retired, so the
+// object outlives every GPU use the recording makes of it. False when `list` is not one of this module's command
+// lists or `object` is null.
+bool hold_until_reset(ID3D12GraphicsCommandList* list, IUnknown* object);
 
 // A copy of the commands `list` has recorded so far, for tests of what a bundle puts into its parent. False when
 // `list` is not one of this module's command lists.

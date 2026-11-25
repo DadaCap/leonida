@@ -344,10 +344,10 @@ What is implemented (all of it testable without the game):
   that reaches past the end of the buffer stops there, as the hardware's bounds check would.
   - Values follow D3D's rules (`runtime/src/uav_clear.h`): Uint copies the low bits of each value into its channel
     with no conversion, whatever the format's type; Float converts (UNORM/SNORM clamp and round to nearest, NaN is
-    0; 16-bit and the packed 11/10-bit floats round to nearest even). A raw or structured view takes value 0 for
-    every 32-bit word (Float: its bits). D3D11 calls Float on an integer view invalid and D3D12 does not say; here
-    the value is converted (toward zero, clamped, NaN 0) so the result is defined. These are checked against
-    hand-computed elements in `d3d12_uav_clear_test`.
+    0; 16-bit and the packed 11/10-bit floats round toward zero, a finite value too large becoming the largest
+    finite). A raw or structured view takes value 0 for every 32-bit word (Float: its bits). D3D11 calls Float on an
+    integer view invalid and D3D12 does not say; here the value is converted (toward zero, clamped, NaN 0) so the
+    result is defined. These are checked against hand-computed elements in `d3d12_uav_clear_test`.
   - Buffers: elements of up to 4 bytes repeat in every aligned word, so `vkCmdFillBuffer` writes the aligned middle
     and `vkCmdCopyBuffer` copies the unaligned ends from it (an 8-bit view at an odd offset, say). 8- and 16-byte
     elements are written with `vkCmdUpdateBuffer` (up to 64 KiB) and doubled with copies. A rectangle is an
@@ -788,7 +788,14 @@ descriptor, as D3D12 refuses it), and stencil-plane views (`PlaneSlice` 1, as
 `X24_TYPELESS_G8_UINT` or `X32_TYPELESS_G8X24_UINT`) are an 8_UINT T# that set 0 shows through the stencil
 aspect, in its float-typed sampled arrays like other single-sampled UINT views. Other gaps include descriptors
 the game writes itself, which need
-the execute-time scan of section 3.4 (only descriptors made through the device are registered); the literal S#s of shaders (`literal_samplers` in the index),
+the execute-time scan of section 3.4 (only descriptors made through the device are registered). A retail
+descriptor heap census (BL-4, measuring the primary 1,245,184-slot console CBV/SRV/UAV heap across submissions
+50, 500, and 5000 on RTX 5070 / Windows 11) confirms the slot distribution: 910,244 empty slots; 327,543 single-dword
+free-list links (`value = slot_index + 1`, ending at `0xFFFFFFFF`); 261 T# with layer-assigned addresses above 4 GiB;
+5,840 V# (3,024 with a null base, 2,816 with a sub-4-GiB arena base); 1,296 slots containing interleaved constant data
+(IEEE-754 floats); and zero bare 32-bit GPU addresses. Console descriptors do not store standalone 32-bit pointer words;
+buffer and image base addresses are packed into standard 48-bit V# and T# records conforming to the arena layout
+(modeled by model-level reference contract suite `tests/test_descriptor_address_translation.py`); the literal S#s of shaders (`literal_samplers` in the index),
 which `rt::d3d12::register_samplers` registers without a heap slot but which nothing passes to it yet (the call at
 pipeline creation comes with the shader index, #291);
 custom border colours without VK_EXT_custom_border_color, and minimum/maximum filters, anisotropy or mirror-once addressing without the Vulkan
@@ -1837,7 +1844,10 @@ The game can use D3D12 descriptors in three ways, and the layer must handle all 
    No sampler-indexing entry had a matched layout. Putting the resource heap first when both flags are set, then the
    sampler in the next dword, remains a hypothesis. D3D-329's adjacent SGPR examples alone do not establish it.
    The runtime snapshots the bound resource and sampler heap pointers in that order after the explicit
-   arguments for direct and indirect compute dispatches with an inline signature. An unbound heap contributes
+   arguments for direct and indirect compute dispatches with an inline signature. Bound console descriptor heap
+   base addresses are remapped through `console_descriptor_table_va` so that user SGPRs receive the arena copy's
+   shader virtual address (where GPU descriptor reads land, preventing `READ_INVALID` device loss during world
+   load), while unshadowed host heaps remain unchanged. An unbound heap contributes
    zero, and rebinding affects later commands. A heap that cannot fit in the inline user data is reported once,
    and a signature whose compute arguments spill gets nothing written (logged once). Set
    `LEONIDA_COMPUTE_DIRECT_HEAPS=0` to restore the previous compute arguments.
@@ -2158,7 +2168,21 @@ sets them, and it does so twice.
 
 `amd_fidelityfx_upscaler_xbox.dll` does neither. Its 29 `RTS0` parts carry `Flags = 0`, and no instruction in it uses
 the constant `0x3000000`. So the bits are not a property of every console root signature; this builder adds them. The
-game executable is not in the package, so whether its root signatures carry them is open.
+retail executable's root signatures do not carry them either (old upstream PR 7140): its direct call passes a 1.1
+description with `Flags = 0x80` (`LOCAL_ROOT_SIGNATURE`), and its root-signature decoder reads `Flags` as a
+zero-extended 16-bit value.
+
+The mask stays unconditional, because it can't touch a public flag: it clears bits 24-31
+(`kXboxRootSignatureFlagHighByte`, `runtime/shims/d3d12_xs_rootsig.h`), and every public
+`D3D12_ROOT_SIGNATURE_FLAGS` value is in bits 0-11 (the highest is `SAMPLER_HEAP_DIRECTLY_INDEXED`, `0x800`). So it is
+safe on every descriptor and blob, whatever built it. `root_sig_public_flags_test` pins this:
+
+- the helpers keep every flag value in `[0, 0xFFFF]`;
+- the shims' serializers give the host's blob byte for byte for each public flag the host takes. Where the host
+  refuses only `CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED` or `SAMPLER_HEAP_DIRECTLY_INDEXED` (Windows 10's in-box `d3d12.dll`),
+  they serialize on purpose: the blob is the host's blob without those bits, with the full flags in `RTS0` and a valid
+  container hash (`kDirectlyIndexedFlags`, `runtime/shims/d3d12_xs_rootsig.h`);
+- a blob with `0x03000080` comes back as `0x80`.
 
 **Version 1.2 on older runtimes.** The in-box `d3d12.dll` of Windows 10 (measured on 22H2, 10.0.19045, without the
 Agility SDK) and of Windows 11 23H2 (#361) serializes root signatures only up to 1.1. On Windows 10 it rejects even an
@@ -2439,9 +2463,7 @@ Pipeline creation:
   is when each is compiled alone, so a PSO released meanwhile waits for the submission. The workers have ended before
   the session cache is read at device teardown. `LEONIDA_PIPELINE_THREADS=<n>` sets the workers: unset, half the
   logical processors and at most 8; `0` compiles each pipeline on the submitting thread where `prepare()` meets it.
-  Graphics pipelines of 1 MiB of SPIR-V or more, and compute pipelines over 128 KiB (`LEONIDA_SERIAL_BIG_COMPILES`),
-  are compiled one after another beside the smaller ones, because a compile takes the driver some hundred bytes of
-  memory for each byte of SPIR-V ([pipeline_check.md](pipeline_check.md)); so are the variants of one PSO.
+  Large pipelines (below) are compiled within a memory budget, and the variants of one PSO one after another.
   `LEONIDA_ASYNC_PIPELINES=1` is not changed: its builds stay on the compile worker. Measured with synthetic programs
   never compiled before and the warm-up off (RTX 3080, NVIDIA 621.24, Windows 11, 16 logical processors, 8 workers,
   three runs each): the first submission of 192 graphics pipelines takes 126 to 143 ms instead of 861 to 882, of 192
@@ -2449,6 +2471,29 @@ Pipeline creation:
   holds about 50 MiB more (the driver keeps memory for each thread that compiles). One `VkPipelineCache` is enough: one
   cache per thread, merged, was about as fast. Tested by `pipeline_workers`, `replay_pipeline_compiles` and
   `d3d12_pipeline_workers`.
+- Large pipelines: a compile takes the driver some hundred bytes of memory for each byte of SPIR-V
+  ([pipeline_check.md](pipeline_check.md), "Limiting concurrent compilation of large modules"), so compute modules over
+  128 KiB and graphics pipelines of 1 MiB or more compile side by side only while their estimates (512 bytes for each
+  byte of SPIR-V) fit a budget: three quarters of the smaller of the free RAM and the room under the commit limit, read
+  again whenever a place at the gate (`runtime/src/large_module_gate.h`, one for the process) is given or returned. One
+  always gets in when none is, so a pipeline larger than the budget compiles alone. An estimate counts in full until
+  the compile ends, although the driver has taken part of it by then. They get in in the order they came; while the
+  first in line does not fit, the next behind it that does may pass, as long as all that have passed it would fit the
+  budget together with it, so that a stream of small ones does not keep it out. The ones a submission waits for (and
+  those of `LEONIDA_ASYNC_PIPELINES`) go before the warm-up's, which take a quarter of the budget at most and none while
+  a submission that has large ones is compiling on its workers. A thread that waits for its place holds no PSO's lock,
+  and one that has a place waits for none. `PipelineCompiles::build` gives a submission
+  as many jobs for large ones as its smallest could be in at once, largest first; where the next one does not fit, the
+  job compiles small ones in the meantime. `LEONIDA_SERIAL_BIG_COMPILES=1` compiles them one after another instead, as
+  before there was a budget, `=0` has no limit, `LEONIDA_BIG_COMPILE_BUDGET_MB` fixes the budget. Measured with
+  synthetic integer modules never compiled before and the warm-up off (RTX 3080, NVIDIA 621.24, Ryzen 7 5800X3D, 8
+  workers and the submitting thread, three alternating runs each): the first submission of 16 modules of 256 KiB takes
+  0.8 s instead of 4.0 to 4.8 s, 16 of 512 KiB 2.0 to 2.2 s instead of 10.2 to 11.4, 15 of 1 MiB 5.8 to 6.1 s instead
+  of 29.2 to 31.2, 12 of 0.5 to 2 MiB 8.0 to 10.5 s instead of 38.9 to 39.9. While the 15 of 1 MiB compile, private
+  memory peaks 656 to 676 MiB over what it was, instead of 140 to 147 (one compile takes 85 to 131 bytes for each byte
+  of SPIR-V here, and the driver keeps memory for each thread that compiles). With a budget of 1536 MiB, two at once,
+  they take 18.5 s and peak 202 MiB over. Not measured: other drivers, and the title. Tested by `big_compile_gate`,
+  `replay_pipeline_compiles` and `d3d12_big_compute`.
 
 **Open:** whether the game uses `D3D12_PIPELINE_STATE_STREAM_DESC` for mesh/RT and which subobject types appear.
 The trace will enumerate them.
@@ -3508,7 +3553,11 @@ will forward to. The queue-side calls ignore which queue they came on (one `VkQu
   `WaitFrameEventX` returns at the next origin with the next token (1, 2, 3, ...; 0 is the null token) and does not
   return while `latency` presented frames are still waiting for their vblank. A frame presented before the origin event
   is armed is not paced (`PresentX` does not hold it for a vblank), so it is shown at once and never waits for a vblank:
-  blank presents of a loading screen do not delay the first wait. A wait that comes late returns at once
+  blank presents of a loading screen do not delay the first wait. At most `latency` frames are in flight once the event
+  is armed: a present into a full queue (several presents with no wait between them) replaces the newest queued frame
+  and takes its vblank, like a mailbox, so the replaced frame is never shown (no display statistic) and the older ones
+  keep their vblanks. However many presents come between two waits, the next wait passes when the oldest frame is
+  shown. A wait that comes late returns at once
   with the newest passed origin; the missed ones are skipped. A finite timeout gives
   `HRESULT_FROM_WIN32(WAIT_TIMEOUT)`; nothing registered, or suspended, gives `HRESULT_FROM_WIN32(ERROR_INVALID_STATE)`.
   `LEONIDA_PRESENT_UNCAP` (any non-empty value other than "0", read when the object is made) takes the frame-rate
@@ -3524,8 +3573,11 @@ will forward to. The queue-side calls ignore which queue they came on (one `VkQu
   `SuspendX`/`ResumeX` so suspended pauses are excluded), computing nearest-rank `p50`/`p95`/`p99` and the mean drift
   against the active target interval (`FramePacer::pacing_summary()`). On teardown after at least one present,
   `XboxPresentation` logs a single `[rt] present: pacing summary ...` line on stderr, which `tools/boot_trace.py`
-  surfaces beside the D3D12 call counts. Confirmed on a fake clock by `frame_pacer_test` (known 100-frame distribution,
-  positive and negative drift, ring-buffer wrap-around, suspend/resume exclusion, uncapped mode) and by
+  surfaces beside the D3D12 call counts. The intervals are between `PresentX` calls, not between frames shown: a frame
+  replaced in a full queue (see the latency limit above) still counts as a present with its real interval, so the
+  percentiles describe the title's present cadence, and a burst of presents between two waits shows up as short
+  intervals. Confirmed on a fake clock by `frame_pacer_test` (known 100-frame distribution,
+  positive and negative drift, ring-buffer wrap-around, suspend/resume exclusion, uncapped mode, replaced frames) and by
   `tests/test_boot_trace.py`.
 - *`PresentX`*: 0 planes presents a black frame (no token needed). 1 plane blits plane 0's first resource (a
   single-sample 2D colour texture in `PRESENT`) to the swapchain image, limited to `pSrcViewRects[0]` when set
@@ -3744,7 +3796,8 @@ will forward to. The queue-side calls ignore which queue they came on (one `VkQu
   (placement, point/bilinear, alpha overlay, HDR10 and PQ conversions, refusals; against a CPU model), token errors,
   statistics, suspend/resume, `ImmediateThresholdPercent` with a late frame at several thresholds (immediate mode
   chosen, or not for 0, below the lateness, on time) and with `LEONIDA_PRESENT_NO_TEAR=1`, 30 frames at 60 Hz in real
-  time; skipped, exit 77, without a Vulkan device). `frame_pacer_test` also sweeps `decide_present_sync`.
+  time; skipped, exit 77, without a Vulkan device). `frame_pacer_test` also sweeps `decide_present_sync`, and checks
+  that 1000 presents between two waits leave at most `latency` frames in flight (latency 1, 2 and 3).
 
 ### 4.6 Queries
 
@@ -3767,15 +3820,20 @@ Implemented (`QueryHeap` in `runtime/shims/d3d12_vulkan_device.cpp`, the query c
   (`compare_invalid_arguments`, "query heap:", RTX 5070 / 621.14): `E_INVALIDARG` for no queries, a node other than
   node 0, or a type past `PIPELINE_STATISTICS1` (7), checked before the output; a valid description with a null
   output is then `E_UNEXPECTED`, not `S_FALSE`.
-- **Stream-output statistics** (D3D-302). The layer has no stream output: a graphics PSO with `StreamOutput`
-  entries is refused and `SOSetTargets` is not implemented, so no primitive reaches a stream and every
-  `SO_STATISTICS_STREAM0..3` query counts 0 written and 0 needed. An `SO_STATISTICS` heap is therefore made without
-  a `VkQueryPool`: `BeginQuery`/`EndQuery` record nothing in Vulkan (D3D12's call rules are still kept, and the
+- **Stream-output statistics** (D3D-302). The layer still refuses `StreamOutput` PSOs and does not implement
+  `SOSetTargets`, so no primitive reaches a stream yet. With `VK_EXT_transform_feedback` enabled on the device
+  (`D3D-TRANSFORM-FEEDBACK-DEVICE`) and its `transformFeedbackQueries` property set, an `SO_STATISTICS` heap is a
+  real `VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT` pool begun and ended indexed on the stream
+  (`vkCmdBeginQueryIndexedEXT` / `vkCmdEndQueryIndexedEXT`), and `ResolveQueryData` copies the two 64-bit results per
+  query (16 bytes: `NumPrimitivesWritten`, `PrimitivesStorageNeeded`), in the same order; with no stream output they
+  are 0. A stream at or above the device's `maxTransformFeedbackStreams` runs nothing and resolves zero, as if the
+  heap had no pool. Without the feature, the property, or a nonzero `maxTransformFeedbackStreams`, the heap is made
+  without a `VkQueryPool`: `BeginQuery`/`EndQuery` run nothing in Vulkan (D3D12's call rules are still kept, and the
   heap's queries track ended or not as the others do), they overlap no other query, and `ResolveQueryData` writes
-  zeros (`vkCmdFillBuffer`, 16 bytes per query: `NumPrimitivesWritten`, `PrimitivesStorageNeeded`), with no
-  statistics split since nothing is dispatched. When stream output lands, the heap becomes a
-  `VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT` pool begun with `vkCmdBeginQueryIndexedEXT` on the stream, whose two
-  results are in the same order.
+  zeros (`vkCmdFillBuffer`, 16 bytes per query), with no statistics split since nothing is dispatched. Two
+  overlapping `SO_STATISTICS` queries on one stream would be two active indexed queries in one pool
+  (`VUID-vkCmdBeginQueryIndexedEXT-queryPool-04753`), so `prepare()` refuses such a list
+  (`ReplayResult::invalid_query`); queries on different streams are fine.
 - **Recording.** The list keeps D3D12's rules for the calls: timestamps only have `EndQuery`; every other query is
   begun and ended in the same list with the same type, is not begun again while it runs, and is not resolved while
   it runs; resolve offsets are multiples of 8. A list closed with a query still running reports `E_INVALIDARG` and

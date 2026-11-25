@@ -46,6 +46,8 @@
 #include "../src/pipeline_profile.h"
 #include "../src/submit_phases.h"
 #include "../src/pipeline_cache_store.h"
+#include "../src/large_module_gate.h"
+#include "../src/dev_status.h"
 #include "../src/conservative_raster.h"
 #include "../src/resource_detile.h"
 #include "../src/console_texture_layout.h"
@@ -1403,14 +1405,39 @@ bool console_format_stand_ins() {
     return on;
 }
 
-// A driver's compiler needs hundreds of MiB for a very large module; several at once exhausted host memory. Compute modules
-// over 128 KiB compile one at a time (LEONIDA_SERIAL_BIG_COMPILES=0: as many as are asked for).
-bool serial_big_compile(std::size_t spirv_bytes) {
-    static const bool serial = [] {
+// A driver's compiler needs hundreds of MiB for a very large module; several at once exhausted host memory. Large are
+// compute modules over 128 KiB and graphics pipelines of PipelineCompiles::large_spirv_bytes or more. They compile side by
+// side while their estimates fit the memory that is free (big_compile_gate). LEONIDA_SERIAL_BIG_COMPILES=1: one at a time,
+// as before there was a budget (graphics: one after another in each submission). 0: as many as are asked for.
+enum class BigCompiles { budget, serial, unlimited };
+BigCompiles big_compiles() {
+    static const BigCompiles mode = [] {
         wchar_t v[2]{};
-        return !(GetEnvironmentVariableW(L"LEONIDA_SERIAL_BIG_COMPILES", v, 2) == 1 && v[0] == L'0');
+        const DWORD n = GetEnvironmentVariableW(L"LEONIDA_SERIAL_BIG_COMPILES", v, 2);
+        if (n == 0) return BigCompiles::budget;
+        return n == 1 && v[0] == L'0' ? BigCompiles::unlimited : BigCompiles::serial;
     }();
-    return serial && spirv_bytes > 128 * 1024;
+    return mode;
+}
+bool big_compute(std::size_t spirv_bytes) { return spirv_bytes > 128 * 1024; }
+
+// Where large compiles wait for memory: one for the process, as the memory is the machine's. Never destroyed: static
+// destruction must not race the compile worker.
+leonida::LargeModuleGate& big_compile_gate() {
+    static auto* const gate = [] {
+        char text[32]{};
+        std::size_t length = 0;
+        const bool present = getenv_s(&length, text, "LEONIDA_BIG_COMPILE_BUDGET_MB") == 0 && length > 1;
+        const auto setting = leonida::large_compile_budget(present ? text : "");
+        if (!setting.valid)
+            std::fprintf(stderr, "[rt] d3d12: LEONIDA_BIG_COMPILE_BUDGET_MB=%s is not a number; not used\n", text);
+        auto budget = [fixed = setting.fixed] { return fixed ? *fixed : leonida::large_compile_budget_bytes(); };
+        std::fprintf(stderr, "[rt] d3d12: large pipelines compile side by side within %llu MiB (%s)\n",
+                     static_cast<unsigned long long>(budget() >> 20),
+                     setting.fixed ? "LEONIDA_BIG_COMPILE_BUDGET_MB" : "3/4 of the memory free now");
+        return new leonida::LargeModuleGate(std::move(budget));
+    }();
+    return *gate;
 }
 
 bool startup_cache_checkpoints_enabled() {
@@ -1905,12 +1932,68 @@ bool console_heap_shadow_enabled() {
 // What a T# the title wrote itself into a console descriptor heap came to (bind_title_image, after Resource).
 // not_tsharp: words with an image TYPE that do not decode as a T#: data, not a descriptor (the retail heap's last
 // 27 MiB are also the slot-133 pool, whose buffers sit there; T14 in ref/GAP-ANALYSIS-2.md).
-enum class TitleImage { known, bound, unknown, refused, not_tsharp };
+// TitleImage is defined in d3d12_com.h.
 class Resource;
 struct DeviceState;
 // `why`, when given, says what refused a T#: the first refusals are logged with their words (scan_console_slots).
 TitleImage bind_title_image(DeviceState& device, const leonida::gfx10::ImageWords& words, const char** why = nullptr);
 struct TitleTexture;  // a texture the title keeps in its own memory (TitleTexture, after Resource)
+
+// The first refused T#s of each reason, with where they sit in the heap and their words, and counts of the
+// distinct slots refused overall and per reason (a slot is scanned again every pass over the heap).
+struct UnboundTsharpTracker {
+    std::mutex mutex;
+    std::set<std::size_t> total_slots;
+    std::map<std::string, std::set<std::size_t>> slots_by_reason;
+    std::map<std::string, std::uint64_t> counts_by_reason;
+    std::map<std::string, unsigned> logged;
+    std::uint64_t total_refusals = 0;
+
+    void note(std::uint64_t heap_va, std::size_t offset, const leonida::gfx10::ImageWords& words, const char* why) {
+        std::lock_guard lock(mutex);
+        const std::string reason = why ? why : "?";
+        ++total_refusals;
+        ++counts_by_reason[reason];
+        if (total_slots.size() >= 262144) return;  // enough to say how many
+        const bool fresh_overall = total_slots.insert(offset).second;
+        const bool fresh_reason = slots_by_reason[reason].insert(offset).second;
+        unsigned& n = logged[reason];
+        if ((!fresh_overall && !fresh_reason) || n >= 6) return;
+        ++n;
+        std::fprintf(stderr,
+                     "[rt] d3d12: unbound T# in console heap 0x%llx at +0x%zx (%zu distinct slots so far, %zu for '%s'): %s: "
+                     "%08x %08x %08x %08x %08x %08x %08x %08x\n",
+                     static_cast<unsigned long long>(heap_va), offset, total_slots.size(),
+                     slots_by_reason[reason].size(), reason.c_str(), reason.c_str(), words[0],
+                     words[1], words[2], words[3], words[4], words[5], words[6], words[7]);
+    }
+
+    UnboundTsharpStats stats() {
+        std::lock_guard lock(mutex);
+        UnboundTsharpStats s;
+        s.total_distinct_slots = total_slots.size();
+        s.total_refusals = total_refusals;
+        for (const auto& [reason, slots] : slots_by_reason) {
+            s.by_reason[reason].distinct_slots = slots.size();
+            s.by_reason[reason].total_refusals = counts_by_reason[reason];
+        }
+        return s;
+    }
+
+    void reset() {
+        std::lock_guard lock(mutex);
+        total_slots.clear();
+        slots_by_reason.clear();
+        counts_by_reason.clear();
+        logged.clear();
+        total_refusals = 0;
+    }
+};
+
+UnboundTsharpTracker& unbound_tsharp_tracker() {
+    static UnboundTsharpTracker tracker;
+    return tracker;
+}
 
 // What a device's children need from it, kept apart from the COM class so children can hold a plain pointer.
 class Resource;
@@ -3231,6 +3314,7 @@ struct DeviceState {
         // Since the last log line.
         std::uint64_t copied = 0, vsharps = 0, unbacked = 0, retried = 0;
         std::uint64_t images[5] = {};  // by TitleImage
+        std::map<std::string, std::uint64_t> refused_reasons;
         double ms = 0, pages_ms = 0, fix_ms = 0, retry_ms = 0;  // ms: all; the others its parts
     };
     std::mutex console_heap_mutex;  // taken before title_window_mutex, shadow_mutex and descriptor_mutex
@@ -3283,8 +3367,11 @@ struct DeviceState {
             if (leonida::gfx10::is_image(words)) {
                 const char* why = nullptr;
                 const TitleImage result = bind_title_image(*this, words, &why);
-                if (result == TitleImage::unknown || result == TitleImage::refused)
+                if (result == TitleImage::unknown || result == TitleImage::refused) {
                     note_refused_tsharp(heap, slot * kDescriptorSize, words, why);
+                    if (result == TitleImage::refused)
+                        ++heap.refused_reasons[why ? why : "?"];
+                }
                 ++heap.images[unsigned(result)];
                 settled = result != TitleImage::unknown && result != TitleImage::refused;
                 if (result == TitleImage::not_tsharp) std::memset(w, 0, 16);
@@ -3379,24 +3466,9 @@ struct DeviceState {
         heap.retried += visited;
     }
 
-    // The first refused T#s of each reason, with where they sit in the heap and their words, and a count of the
-    // distinct slots refused (a slot is scanned again every pass over the heap).
     void note_refused_tsharp(ConsoleHeap& heap, std::size_t offset, const leonida::gfx10::ImageWords& words,
                              const char* why) {
-        static std::mutex mutex;
-        static std::map<std::string, unsigned> logged;
-        static std::set<std::size_t> slots;
-        std::lock_guard lock(mutex);
-        if (slots.size() >= 262144) return;  // enough to say how many
-        const bool fresh = slots.insert(offset).second;
-        unsigned& n = logged[why ? why : "?"];
-        if (!fresh || n >= 6) return;
-        ++n;
-        std::fprintf(stderr,
-                     "[rt] d3d12: unbound T# in console heap 0x%llx at +0x%zx (%zu distinct slots so far): %s: "
-                     "%08x %08x %08x %08x %08x %08x %08x %08x\n",
-                     static_cast<unsigned long long>(heap.console_va), offset, slots.size(), why ? why : "?", words[0],
-                     words[1], words[2], words[3], words[4], words[5], words[6], words[7]);
+        unbound_tsharp_tracker().note(heap.console_va, offset, words, why);
     }
 
     void refresh_console_heap(ConsoleHeap& heap) {  // console_heap_mutex held
@@ -3494,6 +3566,13 @@ struct DeviceState {
                          static_cast<unsigned long long>(heap->images[unsigned(TitleImage::unknown)]),
                          static_cast<unsigned long long>(heap->images[unsigned(TitleImage::refused)]),
                          static_cast<unsigned long long>(heap->images[unsigned(TitleImage::not_tsharp)]));
+            std::string refused_breakdown;
+            for (const auto& [reason, count] : heap->refused_reasons)
+                refused_breakdown += (refused_breakdown.empty() ? "" : "; ") + reason + " " + std::to_string(count);
+            if (!refused_breakdown.empty())
+                std::fprintf(stderr, "[rt] d3d12: console descriptor heap 0x%llx unbound T#s by reason: %s\n",
+                             static_cast<unsigned long long>(heap->console_va), refused_breakdown.c_str());
+            heap->refused_reasons.clear();
             heap->copied = heap->vsharps = heap->unbacked = heap->retried = heap->deferred_fixes = 0;
             for (auto& n : heap->images) n = 0;
             heap->ms = heap->pages_ms = heap->fix_ms = heap->retry_ms = 0;
@@ -4644,12 +4723,10 @@ struct DeviceState {
             }
         }
         view_info.components = g::vulkan_swizzle(swizzle, channels_format);
-        // The cast: MSVC's enums are ints, and it rejects int to VkImageAspectFlags in braces as narrowing.
-        view_info.subresourceRange = {
-            VkImageAspectFlags(stencil                                   ? VK_IMAGE_ASPECT_STENCIL_BIT
-                               : (aspects & VK_IMAGE_ASPECT_DEPTH_BIT) ? VK_IMAGE_ASPECT_DEPTH_BIT
-                                                                       : VK_IMAGE_ASPECT_COLOR_BIT),
-            image.first_mip, image.mip_count, image.first_layer, image.layer_count};
+        view_info.subresourceRange = g::vulkan_subresource_range(
+            image, stencil ? VK_IMAGE_ASPECT_STENCIL_BIT
+                            : (aspects & VK_IMAGE_ASPECT_DEPTH_BIT) ? VK_IMAGE_ASPECT_DEPTH_BIT
+                                                                   : VK_IMAGE_ASPECT_COLOR_BIT);
         ImageEntry entry{dimension, 0, VK_NULL_HANDLE, VK_NULL_HANDLE, image.address};
         if (sampled) {
             const VkResult result = vk.vkCreateImageView(info.device, &view_info, nullptr, &entry.sampled);
@@ -5639,8 +5716,8 @@ public:
             // No host pointer: this is DEFAULT-heap arena memory the GPU may write, so its mapped bytes can be
             // stale. host_at() must not treat it as a CPU-written instance pointer list.
             // A default-heap AS resource is one of these ranges: a GENERIC acceleration structure covers it where
-            // it sits. It is named by its real device address (heap base + offset), as instance descriptors and
-            // BuildRaytracingAccelerationStructure hand that address to the driver, not a console VA.
+            // it sits. It is named by its device address (heap base + offset, as the driver reports it), as instance
+            // descriptors and BuildRaytracingAccelerationStructure hand that address to the driver, not a console VA.
             if (device_.info.ray_tracing &&
                 initial_state == D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE &&
                 vk.vkCreateAccelerationStructureKHR) {
@@ -5651,7 +5728,27 @@ public:
                 asci.type = VK_ACCELERATION_STRUCTURE_TYPE_GENERIC_KHR;
                 if (vk.vkCreateAccelerationStructureKHR(device_.info.device, &asci, nullptr, &accel_) == VK_SUCCESS) {
                     gpu_va_ = device_.arena.address + va_;
+                    // An instance names its BLAS by a value obtained from vkGetAccelerationStructureDeviceAddressKHR
+                    // (VUID-vkCmdBuildAccelerationStructuresKHR-pInfos-12281), so ask for it, as the committed path
+                    // below does. For GENERIC the spec only promises that these addresses keep the offsets between
+                    // the structures of one buffer; drivers return buffer address + offset (vkd3d-proton checks the
+                    // same). If one ever does not, the driver's address is the one instances must hold.
+                    if (vk.vkGetAccelerationStructureDeviceAddressKHR) {
+                        VkAccelerationStructureDeviceAddressInfoKHR dai{
+                            VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR};
+                        dai.accelerationStructure = accel_;
+                        const std::uint64_t as_va =
+                            vk.vkGetAccelerationStructureDeviceAddressKHR(device_.info.device, &dai);
+                        if (as_va && as_va != gpu_va_) {
+                            log_once("GENERIC acceleration structure address is not its buffer address + offset; "
+                                     "arena offset in KiB:", int(arena_offset_ / 1024));
+                            buffer_va_ = gpu_va_;
+                            gpu_va_ = as_va;
+                        }
+                    }
                     device_.context->register_acceleration_structure(gpu_va_, accel_);
+                    if (buffer_va_ && buffer_va_ != gpu_va_)
+                        device_.context->register_acceleration_structure(buffer_va_, accel_);
                 }
             }
             device_.context->add_resource(id(), binding);
@@ -8491,8 +8588,8 @@ public:
         if (vs_stage.entry && ps_stage.entry && !gs_stage.entry &&
             (!ps_stage.entry->f16_halves.empty() || !vs_stage.entry->f16_halves.empty())) {
             std::string link_error;
-            if (!leonida::link_f16_halves(vs_stage.words, *vs_stage.entry, ps_stage.words, *ps_stage.entry,
-                                          &link_error, device_.f16_half_top_location)) {
+            if (!link_f16_halves(vs_stage.words, *vs_stage.entry, ps_stage.words, *ps_stage.entry,
+                                 &link_error)) {
                 std::fprintf(stderr, "[rt] d3d12: %s\n", link_error.c_str());
                 return E_FAIL;
             }
@@ -8931,7 +9028,9 @@ public:
             const auto it = variants_.find(unbound);
             return it == variants_.end() ? VkPipeline(VK_NULL_HANDLE) : it->second;
         };
-        graphics_.large = spirv_bytes >= leonida::PipelineCompiles::large_spirv_bytes;
+        graphics_.large = spirv_bytes >= leonida::PipelineCompiles::large_spirv_bytes &&
+                          big_compiles() != BigCompiles::unlimited;
+        graphics_.estimate = leonida::large_module_estimate(spirv_bytes);
 
         if (code_stage) {
             VkDeviceSize offset = 0;
@@ -9061,6 +9160,7 @@ public:
         if (vk.vkCreatePipelineLayout(dev, &layout_info, nullptr, &pipeline_.layout) != VK_SUCCESS) return E_FAIL;
         compute_entry_ = entry;
         stage_bytes_ = spirv_bytes;
+        pipeline_.estimate = leonida::large_module_estimate(spirv_bytes);
         // The title creates hundreds of compute pipelines from job threads during startup and one of its init tasks
         // waits for all of them; some modules (wave64-emulated ray-tracing resolves, 4 MiB of SPIR-V) take the driver
         // minutes each. So the Vulkan pipeline is built on first use (build_compute): at the first dispatch that names
@@ -9096,7 +9196,7 @@ public:
                 std::unique_lock lock(pso->variants_mutex_, std::try_to_lock);  // held: another thread is compiling it
                 return lock.owns_lock() ? pso->pipeline_.pipeline : VkPipeline(VK_NULL_HANDLE);
             };
-            pipeline_.large = serial_big_compile(spirv_bytes);
+            pipeline_.large = big_compute(spirv_bytes) && big_compiles() != BigCompiles::unlimited;
         } else if (!build_compute("compute-create")) {
             return E_FAIL;
         }
@@ -9117,12 +9217,32 @@ public:
     }
 
 private:
+    using Work = leonida::LargeModuleGate::Work;
+
+    // Locks the PSO (`lock`, on variants_mutex_) for a build and, with an `estimate`, takes the build's place at the gate. A
+    // thread that waits for its place holds no PSO's lock, and one that has its place waits for none: another thread may be
+    // building that PSO, with a place of its own. Returns without a place when the PSO is `built` already.
+    template<typename Built>
+    leonida::LargeModuleGate::Ticket enter_build(std::unique_lock<std::mutex>& lock, std::uint64_t estimate, Work work,
+                                                 Built&& built) {
+        for (;;) {
+            lock.lock();
+            if (!estimate || built()) return {};
+            lock.unlock();
+            leonida::LargeModuleGate::Ticket place(big_compile_gate(), estimate, work);
+            if (lock.try_lock()) return place;
+        }
+    }
+
     // The compute pipeline, built once: by create_compute (LEONIDA_LAZY_COMPUTE=0), by the first dispatch that names
     // it (the replay layer calls ComputePipeline::build) or by the warm-up thread. Null when it cannot be built; the
     // failure is logged and not retried.
-    VkPipeline build_compute(const char* trigger) {
+    VkPipeline build_compute(const char* trigger, Work work = Work::demand) {
         CompileActivity activity(device_.active_compiles);
-        std::lock_guard lock(variants_mutex_);
+        std::unique_lock lock(variants_mutex_, std::defer_lock);
+        const bool budgeted = big_compute(stage_bytes_) && big_compiles() == BigCompiles::budget;
+        auto place = enter_build(lock, budgeted ? pipeline_.estimate : 0, work,
+                                 [this] { return pipeline_.pipeline || compute_failed_; });
         if (pipeline_.pipeline || compute_failed_) return pipeline_.pipeline;
         compute_failed_ = true;  // until the pipeline exists
         auto& vk = device_.context->vk;
@@ -9132,7 +9252,7 @@ private:
         if (!library || !entry) return VK_NULL_HANDLE;
         static std::mutex big_compile;
         std::unique_lock<std::mutex> big_lock(big_compile, std::defer_lock);
-        if (serial_big_compile(stage_bytes_)) big_lock.lock();
+        if (big_compute(stage_bytes_) && big_compiles() == BigCompiles::serial) big_lock.lock();
         auto words = library->spirv(*entry);
         if (words.empty()) {
             std::fprintf(stderr, "[rt] d3d12: %s.spv is missing or not SPIR-V\n", entry->name.c_str());
@@ -9162,11 +9282,13 @@ private:
         VkPipeline built = VK_NULL_HANDLE;
         CompileTrace trace;
         trace.begin(pipeline_info, device_.info.pipeline_creation_feedback, trigger, entry->name.c_str(), 0, bytes, cache_key_);
+        const leonida::dev_status::Build dev_build(entry->name.c_str());
         const leonida::pipeline_profile::DriverCall profile("cs", trigger, entry->name.c_str());
         const VkResult created = vk.vkCreateComputePipelines(dev, cache, 1, &pipeline_info, nullptr, &built);
         profile.finish(int(created));
         trace.end(trigger, entry->name.c_str(), 0, bytes, created);
         if (big_lock.owns_lock()) big_lock.unlock();
+        place.release();
         vk.vkDestroyShaderModule(dev, module, nullptr);  // Vulkan lets a module go once the pipeline exists
         const ULONGLONG took = GetTickCount64() - started;
         if (created != VK_SUCCESS || !built) {
@@ -9231,7 +9353,8 @@ private:
             queued = PipelineCompiler::instance().submit(compile_owner(), &device_, warm_bytes, [this, compute, warm, unbound] {
                 VkPipeline built{};
                 try {
-                    built = compute ? build_compute(warm ? "warmup" : "dispatch-worker")
+                    built = compute ? build_compute(warm ? "warmup" : "dispatch-worker",
+                                                    warm ? Work::speculative : Work::demand)
                                     : variant(unbound, "draw-worker");
                     if (async_replay_compile()) {
                         unsigned long long skipped = 0;
@@ -9471,6 +9594,7 @@ private:
         }
         CompileTrace trace;
         trace.begin(info, device_.info.pipeline_creation_feedback, trigger, profile_shaders_.c_str(), unbound, bytes, cache_key_);
+        const leonida::dev_status::Build dev_build(r.mesh ? "mesh pipeline" : "graphics pipeline");
         const leonida::pipeline_profile::DriverCall profile(r.mesh ? "ms" : "vs", lazy_ ? "lazy" : "eager",
                                                          program, fragment, unbound);
         const auto result = device_.context->vk.vkCreateGraphicsPipelines(device_.info.device, cache, 1, &info, nullptr, &pipeline);
@@ -9505,10 +9629,22 @@ private:
         return true;
     }
 
+    bool link_f16_halves(std::vector<std::uint32_t>& vs_words, const leonida::ShaderEntry& vs_entry,
+                         std::vector<std::uint32_t>& ps_words, const leonida::ShaderEntry& ps_entry,
+                         std::string* error) const {
+        return leonida::link_f16_halves(vs_words, vs_entry, ps_words, ps_entry, error,
+                                        device_.f16_half_top_location);
+    }
+
+public:
     bool stage_words(std::vector<std::vector<std::uint32_t>>& words, std::string& why) const {
         const leonida::ShaderLibrary* library = device_.library();
         if (!library) {
             why = "no shader library";
+            return false;
+        }
+        if (sources_.empty()) {
+            why = "not a lazy pipeline";
             return false;
         }
         words.assign(sources_.size(), {});
@@ -9530,7 +9666,7 @@ private:
         }
         if (f16_linked_) {
             if (vs == SIZE_MAX || ps == SIZE_MAX ||
-                !leonida::link_f16_halves(words[vs], *sources_[vs].entry, words[ps], *sources_[ps].entry, &why))
+                !link_f16_halves(words[vs], *sources_[vs].entry, words[ps], *sources_[ps].entry, &why))
                 return false;
         }
         for (std::size_t i = 0; i < sources_.size(); ++i) {
@@ -9553,9 +9689,13 @@ private:
         return true;
     }
 
+private:
     // Built on first use and kept until the PSO is released (replay may call this from any queue).
     VkPipeline variant(std::uint32_t unbound, const char* trigger) {
-        std::lock_guard lock(variants_mutex_);
+        std::unique_lock lock(variants_mutex_, std::defer_lock);
+        const bool budgeted = graphics_.large && big_compiles() == BigCompiles::budget;
+        const auto place = enter_build(lock, budgeted ? graphics_.estimate : 0, Work::demand,
+                                       [&] { return variants_.contains(unbound); });
         if (const auto it = variants_.find(unbound); it != variants_.end()) return it->second;
         const VkPipeline pipeline = build(unbound, trigger);
         if (!pipeline) {
@@ -10271,6 +10411,8 @@ TitleImage bind_title_image(DeviceState& device, const leonida::gfx10::ImageWord
         std::lock_guard lock(device.descriptor_mutex);
         if (!device.bindless) return refuse("no bindless set");
         if (device.image_entries.count(words)) return TitleImage::known;
+        if (g::has_hardware_volume_uav_slice_offset(words, image))
+            return refuse("a title-written 3D UAV with a slice offset is not supported");
         auto found = device.images_by_address.find(image.address);
         // Memory of the texture stream pool has two addresses, the CPU view's and the GPU-only alias the title hands
         // to the GPU (title_gpu_views): a T# naming either finds a texture registered under the other.
@@ -10284,7 +10426,10 @@ TitleImage bind_title_image(DeviceState& device, const leonida::gfx10::ImageWord
             const auto alias = leonida::title_gpu_views::other_view(image.address);
             if (auto* candidate = device.gpu_placements.find(image.address, alias, matches)) owner = candidate;
         }
-        if (!owner) return TitleImage::unknown;
+        if (!owner) {
+            if (why) *why = "no texture at T# address";
+            return TitleImage::unknown;
+        }
         const Resource& r = *owner;
         image.address = r.image_address();  // release this key with its actual owner
         const D3D12_RESOURCE_DESC& d = r.desc();
@@ -10300,10 +10445,10 @@ TitleImage bind_title_image(DeviceState& device, const leonida::gfx10::ImageWord
         if (!r.descriptor_image()) return refuse("the texture has no image");
         if (!type_fits) return refuse("T# type or samples do not fit the texture");
         if (!msaa && image.first_mip + image.mip_count > d.MipLevels) return refuse("T# names mips the texture lacks");
+        if (image.type == g::ImageType::cube && !(r.format() && layers >= 6))
+            return refuse("cube T# on fewer than six layers");
         if (!volume && image.first_layer + image.layer_count > layers)
             return refuse("T# names layers the texture lacks");
-        if (image.type == g::ImageType::cube && !(r.format() && image.layer_count >= 6))
-            return refuse("cube T# on fewer than six layers");
         const bool storage = (d.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) && !msaa &&
                              r.aspects() == VK_IMAGE_ASPECT_COLOR_BIT;
         if (!device.bind_image_locked(words, image, r.descriptor_image(), r.format(), r.aspects(), storage,
@@ -10650,11 +10795,17 @@ public:
             break;
         }
         case h::so_statistics:
-            // The layer has no stream output: a graphics PSO with StreamOutput entries is refused (E_NOTIMPL) and
-            // SOSetTargets is not implemented, so no primitive ever reaches a stream and every query of this heap
-            // counts 0 written and 0 needed. That needs no Vulkan pool: Begin/EndQuery run nothing and a resolve fills zeros. When stream
-            // output lands, this becomes a VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT pool (D3D-302).
-            return register_pool(desc);
+            // D3D-302: with VK_EXT_transform_feedback enabled, an SO_STATISTICS heap is a real transform-feedback
+            // pool whose queries begin/end on a stream (vkCmdBeginQueryIndexedEXT); a resolve copies 16 bytes per
+            // query (NumPrimitivesWritten, PrimitivesStorageNeeded), in the same order. StreamOutput PSOs are still
+            // refused and SOSetTargets is still not implemented, so no primitive reaches a stream yet and every
+            // query counts 0. The pool needs the transformFeedbackQueries property and at least one stream; without
+            // them (or without the feature) the heap is made without a pool and every query resolves to zero.
+            if (!device_.info.transform_feedback || !device_.info.transform_feedback_queries ||
+                !device_.info.max_transform_feedback_streams)
+                return register_pool(desc);
+            info.queryType = VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT;
+            break;
         case h::pipeline_statistics:
             if (!device_.info.pipeline_statistics_query) {
                 log_once("pipeline-statistics query heap: pipelineStatisticsQuery not enabled; type", desc.Type);
@@ -10683,6 +10834,9 @@ private:
         pool.count = desc.Count;
         pool.precise = device_.info.occlusion_query_precise;
         pool.ended.assign(desc.Count, false);
+        // D3D-302: a real transform-feedback pool queries streams below maxTransformFeedbackStreams; D3D12 has four.
+        if (pool_ && desc.Type == leonida::d3d12_query_heap::so_statistics)
+            pool.streams = std::min<std::uint32_t>(4, device_.info.max_transform_feedback_streams);
         device_.context->add_query_pool(id(), pool);
         registered_ = true;
         return S_OK;
@@ -10706,6 +10860,15 @@ private:
 std::timed_mutex exit_cache_mutex;
 std::vector<DeviceState*> exit_cache_devices;
 std::atomic<bool> exit_cache_saved{false};
+
+// VK_EXT_memory_budget read from a device's info: the reader a device publishes for the title HUD and the dev overlay
+// (src/memory_figures.h), and vulkan_vram_budget. Not available without the extension.
+leonida::VramBudget read_vram_budget(const VulkanDeviceInfo& info) {
+    if (!info.memory_budget || !info.get_instance_proc || !info.instance) return {};
+    const auto get = reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties2>(
+        info.get_instance_proc(info.instance, "vkGetPhysicalDeviceMemoryProperties2"));
+    return leonida::query_vram_budget(get, info.physical);
+}
 
 // The Vulkan objects create_vulkan_device_standalone made, destroyed with the device.
 struct OwnedRuntime {
@@ -10737,6 +10900,11 @@ public:
             std::lock_guard lock(exit_cache_mutex);
             exit_cache_devices.push_back(&state_);
         }
+        // The GPU memory figure of the title HUD and the dev overlay: the newest device with VK_EXT_memory_budget.
+        if (info.memory_budget)
+            leonida::memory_figures::publish_vram_reader(
+                [](const void* context) { return read_vram_budget(static_cast<const DeviceState*>(context)->info); },
+                &state_);
         queue_users_.resize(info.command_queues.size(), 0);
         compute_users_.resize(info.compute_queues.size(), 0);
         copy_users_.resize(info.copy_queues.size(), 0);
@@ -10846,8 +11014,10 @@ public:
                     VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT | VK_SAMPLE_COUNT_8_BIT | VK_SAMPLE_COUNT_16_BIT;
                 state_.no_output_sample_counts =
                     static_cast<UINT>(props.limits.framebufferNoAttachmentsSampleCounts & kD3D12SampleCounts);
-                state_.f16_half_top_location = leonida::f16_half_top_location(
-                    props.limits.maxVertexOutputComponents, props.limits.maxFragmentInputComponents);
+                state_.f16_half_top_location = info.f16_half_top_location != 0
+                    ? info.f16_half_top_location
+                    : leonida::f16_half_top_location(
+                          props.limits.maxVertexOutputComponents, props.limits.maxFragmentInputComponents);
             }
             if (const auto get_props2 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
                     info.get_instance_proc(info.instance, "vkGetPhysicalDeviceProperties2"))) {
@@ -10952,6 +11122,10 @@ public:
                              threads.count);
             if (threads.count)
                 state_.context->set_pipeline_workers(std::make_unique<leonida::PipelineWorkers>(threads.count));
+            if (big_compiles() == BigCompiles::budget)
+                state_.context->set_large_compiles(
+                    [] { return big_compile_gate().budget(); },
+                    [] { return std::make_shared<leonida::LargeModuleGate::Demand>(big_compile_gate()); });
         }
         leonida::title_va_aliases().set_hooks(
             &state_,
@@ -11588,6 +11762,7 @@ public:
     }
 
     ~Device() override {
+        leonida::memory_figures::withdraw_vram_reader(&state_);  // waits for a read of this device in progress
         {
             // Before anything goes: an exit save in progress finishes with this device first.
             std::lock_guard lock(exit_cache_mutex);
@@ -11679,6 +11854,7 @@ public:
     bool upload_in_vram() const { return state_.upload_in_vram; }
     leonida::VulkanContext& context() { return *state_.context; }
     const leonida::BindlessSet* bindless() const { return state_.bindless.get(); }
+    DeviceState& state() { return state_; }
     const DeviceState& state() const { return state_; }
     HRESULT create_native_graphics(const leonida::native_pso::GraphicsDesc& desc, REFIID iid, void** out) {
         const auto* shaders = state_.library();
@@ -17122,6 +17298,16 @@ const std::vector<leonida::SubgroupRequest>* pipeline_subgroup_requests(ID3D12Pi
     return p && (p->compute() || p->graphics()) ? &p->subgroup_requests() : nullptr;
 }
 
+bool pipeline_stage_words(ID3D12PipelineState* pipeline, std::vector<std::vector<std::uint32_t>>& words,
+                          std::string& why) {
+    const PipelineState* p = PipelineState::from<PipelineState>(pipeline);
+    if (!p) {
+        why = "not a PipelineState";
+        return false;
+    }
+    return p->stage_words(words, why);
+}
+
 long live_pipeline_states() { return live_pipeline_state_count.load(); }
 
 bool write_placed_buffer_view(ID3D12Device* device, bool unordered, const void* view, std::uint64_t address,
@@ -17231,6 +17417,11 @@ const VulkanDeviceInfo* vulkan_device_info(ID3D12Device* device) {
     ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
     if (auto* d = Device::from<Device>(real ? real : device)) return &d->state().info;
     return nullptr;
+}
+
+leonida::VramBudget vulkan_vram_budget(ID3D12Device* device) {
+    const VulkanDeviceInfo* info = vulkan_device_info(device);
+    return info ? read_vram_budget(*info) : leonida::VramBudget{};
 }
 
 std::uint64_t title_shadow_refresh_queries(ID3D12Device* device) {
@@ -17869,6 +18060,10 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR};
     VkPhysicalDeviceRayQueryFeaturesKHR rq_features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR};
     VkPhysicalDeviceMeshShaderFeaturesEXT mesh_features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT};
+    VkPhysicalDeviceTransformFeedbackFeaturesEXT transform_feedback_features{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT};
+    VkPhysicalDeviceTransformFeedbackPropertiesEXT transform_feedback_properties{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_PROPERTIES_EXT};
     {
         std::uint32_t extension_count = 0;
         vkEnumerateDeviceExtensionProperties(info.physical, nullptr, &extension_count, nullptr);
@@ -17893,10 +18088,28 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
                 vkGetPhysicalDeviceFeatures2(info.physical, &features);
                 info.mesh_shader = mesh_features.meshShader == VK_TRUE;
                 info.mesh_shader_queries = mesh_features.meshShaderQueries == VK_TRUE;
+            } else if (!std::strcmp(e.extensionName, VK_EXT_TRANSFORM_FEEDBACK_EXTENSION_NAME)) {
+                VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+                                                   &transform_feedback_features};
+                vkGetPhysicalDeviceFeatures2(info.physical, &features);
+                info.transform_feedback = transform_feedback_features.transformFeedback == VK_TRUE;
+                info.transform_feedback_geometry_streams = transform_feedback_features.geometryStreams == VK_TRUE;
+                // D3D-302: the queries and the stream count are properties, not features.
+                VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+                                                       &transform_feedback_properties};
+                vkGetPhysicalDeviceProperties2(info.physical, &properties);
+                info.transform_feedback_queries = transform_feedback_properties.transformFeedbackQueries == VK_TRUE;
+                info.max_transform_feedback_streams = transform_feedback_properties.maxTransformFeedbackStreams;
             }
         }
         if (!info.mesh_shader)
             std::fprintf(stderr, "[rt] d3d12: the GPU has no VK_EXT_mesh_shader: mesh-shader PSOs are unsupported\n");
+        if (!info.transform_feedback)
+            std::fprintf(stderr,
+                         "[rt] d3d12: the GPU has no VK_EXT_transform_feedback: SO_STATISTICS query pools read zero\n");
+        else if (!info.transform_feedback_queries || !info.max_transform_feedback_streams)
+            std::fprintf(stderr, "[rt] d3d12: the GPU has no transform-feedback queries (transformFeedbackQueries, "
+                                 "maxTransformFeedbackStreams): SO_STATISTICS query pools read zero\n");
         if (has_as && has_dho && has_rq && chosen12.bufferDeviceAddress) {
             as_features.pNext = &rq_features;
             VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &as_features};
@@ -17932,10 +18145,21 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     // The mesh-primitives query, which counts the primitives a mesh shader emits (D3D-MESH-CLIPPING-COUNTER).
     enable_mesh.meshShaderQueries = info.mesh_shader_queries ? VK_TRUE : VK_FALSE;
 
+    // D3D-302: real SO_STATISTICS queries need transformFeedback; geometryStreams is only requested when the device
+    // already offers it, so the enable chain matches vk_pipeline_check's (a driver keys the pipeline cache on it).
+    VkPhysicalDeviceTransformFeedbackFeaturesEXT enable_transform_feedback{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT};
+    enable_transform_feedback.transformFeedback = VK_TRUE;
+    enable_transform_feedback.geometryStreams = info.transform_feedback_geometry_streams ? VK_TRUE : VK_FALSE;
+
     void* ext_chain = nullptr;
     if (info.mesh_shader) {
         enable_mesh.pNext = ext_chain;
         ext_chain = &enable_mesh;
+    }
+    if (info.transform_feedback) {
+        enable_transform_feedback.pNext = ext_chain;
+        ext_chain = &enable_transform_feedback;
     }
     if (info.ray_tracing) {
         enable_rq.pNext = ext_chain;
@@ -18439,6 +18663,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     if (has_swapchain && instance_has_surface) device_extensions.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
     if (swapchain_m1_name) device_extensions.push_back(swapchain_m1_name);
     if (info.mesh_shader) device_extensions.push_back(VK_EXT_MESH_SHADER_EXTENSION_NAME);
+    if (info.transform_feedback) device_extensions.push_back(VK_EXT_TRANSFORM_FEEDBACK_EXTENSION_NAME);
     if (info.ray_tracing) {
         device_extensions.push_back(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
         device_extensions.push_back(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
@@ -18449,6 +18674,9 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     if (info.custom_border_color) device_extensions.push_back(custom_border_name);
     if (info.null_descriptor || info.robust_index_view) device_extensions.push_back(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
     if (info.host_pointer_alignment) device_extensions.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+    // Optional: VK_EXT_memory_budget gives the GPU memory in use and the budget (vulkan_vram_budget, the title HUD).
+    info.memory_budget = has_device_extension(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+    if (info.memory_budget) device_extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
     leonida::DeviceFaultFeatures fault_features;
     const bool aftermath = leonida::aftermath::enable();  // already on, before the instance: see above
     char device_fault[2]{};
@@ -18569,6 +18797,38 @@ HRESULT create_console_descriptor_heap(ID3D12Device* device, const D3D12_DESCRIP
     auto* d = Device::from<Device>(real ? real : device);
     if (!d) return E_INVALIDARG;
     return d->create_console_descriptor_heap(desc, console_address, console_size, riid, out);
+}
+
+UnboundTsharpStats unbound_tsharp_stats() {
+    return unbound_tsharp_tracker().stats();
+}
+
+void reset_unbound_tsharp_stats() {
+    unbound_tsharp_tracker().reset();
+}
+
+void note_refused_tsharp_for_test(std::uint64_t heap_va, std::size_t offset,
+                                  const std::array<std::uint32_t, 8>& words, const char* why) {
+    leonida::gfx10::ImageWords w;
+    std::memcpy(w.data(), words.data(), sizeof(w));
+    unbound_tsharp_tracker().note(heap_va, offset, w, why);
+}
+
+TitleImage test_bind_title_image(ID3D12Device* device, const std::array<std::uint32_t, 8>& words,
+                                 const char** why) {
+    if (!device) return TitleImage::not_tsharp;
+    ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
+    Device* d = Device::from<Device>(real ? real : device);
+    if (!d) return TitleImage::not_tsharp;
+    leonida::gfx10::ImageWords w;
+    std::memcpy(w.data(), words.data(), sizeof(w));
+    return bind_title_image(d->state(), w, why);
+}
+
+std::uint64_t resource_image_address(ID3D12Resource* resource) {
+    if (!resource) return 0;
+    const Resource* r = Resource::from<Resource>(resource);
+    return r ? r->image_address() : 0;
 }
 
 std::filesystem::path configured_shader_directory(std::string* error, const std::filesystem::path& config) {
