@@ -15,7 +15,8 @@ run_gpu_tests.py: 257 shaders: 257 translated, 257 pass spirv-val (both modes)
             Arithmetic: native 194 + 52 + 2 = 248; emulated 226 + 20 + 2 = 248.
 Failed:     cs_imgload_d16_tfe and cs_imgload_tfe, with byte-identical output in both modes:
             "exit 1: r32 sint (sint view): 64 bad, texel(5,3) = 2071". That is the known #31
-            pair and the same words as RTX5070.txt and IntelMTL.txt; those records report the pair passing with #98 (not measured here).
+            pair and the same words as RTX5070.txt and IntelMTL.txt; IntelMTL.txt reports the pair passing with #98 (not measured here);
+            RTX5070.txt does not mention #98.
 Skipped:    native 52 = 16 documented "run by d3d12_*_test / w64_graphics.py" cases
             (cs_buf_counter, cs_buf_typed, cs_m4_fill, cs_m4_indirect, ps_live_width, ps_m15,
             ps_m2, ps_m2_array, ps_m2_literal, ps_m2_uoff, ps_m3, ps_m3_post, ps_m3_query,
@@ -55,7 +56,7 @@ Notes:
   the same two failures in both modes. Its skip categories are the three seen here too -
   16 documented, 31 plus 1 wave64, and one fragment-subgroup case - and this record skips
   exactly 3 more in each mode (52 vs 49, 20 vs 17), which is the three ps_texoff* fixtures. That
-  difference follows from the graphics stack (Ubuntu's Vulkan headers 1.4.275 vs the SDK's
+  difference follows from the graphics stack (Ubuntu's Vulkan headers 1.3.275 (VK_HEADER_VERSION 275) vs the SDK's
   1.4.363), not from the GPU, and it is the only skip difference. This GPU also passes 3 fewer
   cases than the RTX 5070 natively (194 vs 197) and 3 fewer emulated (226 vs 229), the same three
   fixtures.

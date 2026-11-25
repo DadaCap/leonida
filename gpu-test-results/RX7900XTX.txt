@@ -24,7 +24,8 @@ Failed:     cs_imgload_d16_tfe and cs_imgload_tfe, byte-identical in both modes:
             record's result, not this machine's.
             cs_w32_salu64, the same eight words in both modes:
             "510274632 4660 0 4008636142 4008636142 4008636142 4008636142 4008636142".
-            Word 2 reads 0, want 0xFFFFFFFF: the RADV Mesa 25.2 bug of the "Two Mesa bugs, not
+            Word 2 reads 0, want 0xFFFFFFFF, and words 3..7 all read 4008636142 (0xEEEEEEEE, the unwritten
+            fill) rather than a computed value: the RADV Mesa 25.2 bug of the "Two Mesa bugs, not
             translator bugs" row in docs/testing.md (#166). ACO's combine_add_sub_b2i reads a
             temporary without counting the use, dead-code elimination removes it (ACO ERROR with
             MESA_SHADER_CACHE_DISABLE=true) and RADV_DEBUG=llvm passes. Not a translator bug.
@@ -86,10 +87,12 @@ Notes:
   pixels each. No case printed an inexact pixel result outside the three FAIL lines, and none of the
   three is a pixel case.
 - Compared with RTX5060Laptop.txt (same container, kernel, CPU and commit): 225/248 native against
-  194/248, i.e. exactly the 31 compute wave64 cases that skip on a 32..32 device and run here;
+  194/248, i.e. +31 net: the 31 compute wave64 cases plus ms_w64x_ballot (the mesh case) skip on a 32..32
+  device and run here, +32 passes, minus the cs_w32_salu64 pass the 5060 has and this GPU lacks;
   skipped 20 against 52 (52 - 31 compute - 1 mesh = 20, the same 16 documented + 3 maintenance8 +
   1 fragment-subgroup set); 3 failures against 2, the extra one being cs_w32_salu64, which only RADV
-  has because only RADV runs ACO. Emulated the same on both.
+  has because only RADV runs ACO. Emulated: 225/248, 3 failed here against 226/248, 2 failed on
+  the 5060 (same extra cs_w32_salu64 failure, so one pass fewer).
 - First 7900 XTX entry here. The landed RDNA3/RDNA4 siblings are RX9070XT.txt (Windows, AMD LLPC
   26.11.2, 224/241 native, 16 skipped, ms_wave_info_s3) and RX9070GRE.txt (RADV Mesa 26.3.1,
   218/235, 16 skipped, ms_wave_info_s3), so the 241/235-case builds predate this 248-case suite.

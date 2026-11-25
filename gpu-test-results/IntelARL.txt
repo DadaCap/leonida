@@ -40,9 +40,10 @@ Notes:
   VK_KHR_maintenance8. Thus the three maintenance8 skips are not exposed by this Mesa driver;
   the barycentric fallback explains the untranslated computed-I/J fixture. Mesh support is
   exposed, while the device still has no 64-wide subgroup.
-- cs_signed_zero_nan is the documented Mesa 25.2+ NIR range-analysis bug: docs/testing.md
-  specifically records it on ANV 25.2.8 and says NIR folds the NaN check despite
-  SignedZeroInfNanPreserve. cs_fmt_int_narrow does not appear in docs/testing.md's Known
+- cs_signed_zero_nan: word 5 = 0 is the documented Mesa 25.2+ NIR range-analysis bug (docs/testing.md
+  records it on ANV 25.2.8: NIR folds the NaN check despite SignedZeroInfNanPreserve). It is not
+  the whole failure: word 2 reads 0x80000000 where scripts/run_gpu_tests.py:1219 wants 0x80008000,
+  and the documented bug does not explain that word, so it is an additional unexplained mismatch. cs_fmt_int_narrow does not appear in docs/testing.md's Known
   problems (or elsewhere in that file), so word 34 = 0 may be a new driver observation.
 - Compared with IntelMTL.txt at 84347bb on ANV Mesa 26.2.7 (194/248 native, 52 skipped,
   2 failed; 226/248 emulated, 20 skipped, 2 failed), this older Mesa 25.2.8 adds the known
