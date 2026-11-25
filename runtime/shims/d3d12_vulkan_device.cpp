@@ -4595,14 +4595,24 @@ struct DeviceState {
         }
     }
 
+    // The range goes back once every execute being prepared now, whose descriptors may name it, has retired. Its
+    // backing goes at once: a snapshot taken from here on must not name it.
     void arena_release(VkDeviceSize offset, VkDeviceSize bytes, ArenaUse use) {
         if (!bytes) return;
+        if (context && offset < arena.size) {
+            backing(arena.address + offset, bytes, offset, false);
+            if (context->defer_past_executes([this, offset, bytes, use] { arena_free(offset, bytes, use); }, bytes))
+                return;
+        }
+        arena_free(offset, bytes, use);
+    }
+
+    void arena_free(VkDeviceSize offset, VkDeviceSize bytes, ArenaUse use) {
         std::lock_guard lock(arena.mutex);
         // The range is validated and merged before the live-byte counters move: a release of a range the arena never
         // had must not change them, and a double free must not count the bytes twice.
         const auto fault = arena.blocks.release(offset, bytes);
         if (fault != leonida::ArenaBlocks::Fault::outside_arena) {
-            backing(arena.address + offset, bytes, offset, false);
             arena.in_use -= bytes;
             arena.use_in_use[use] -= bytes;
             // A heap copy re-fixes the slots that named a backing that has gone (slot_changes): the range is no view's.
@@ -5343,6 +5353,25 @@ struct DeviceState {
         return false;
     }
 
+    // Title memory imported as a buffer. VK_EXT_external_memory_host needs the caller's pages to stay valid for the
+    // imported memory's whole lifetime, and a title may free them right after releasing the resource: so it is not left
+    // to the deferred queue (freed after the *next* submission retires) but freed here, once what was submitted is done
+    // (found in review). An execute being prepared may still name it, though, and may be held up for long by whatever
+    // the title does next: the memory then goes when that one retires, and this does not wait for it.
+    void release_import(VkBuffer buffer, VkDeviceMemory memory, VkDeviceSize bytes, std::uint64_t pin, bool counted) {
+        const auto release = [this, buffer, memory, pin, counted] {
+            if (buffer) context->vk.vkDestroyBuffer(info.device, buffer, nullptr);
+            if (memory) {
+                context->vk.vkFreeMemory(info.device, memory, nullptr);
+                if (counted) host_imports.fetch_sub(1, std::memory_order_relaxed);
+            }
+            leonida::kernel_writes::release(pin);
+        };
+        if (context->defer_past_executes(release, bytes)) return;
+        context->wait_retire_ticket(context->submitted_retire_ticket());
+        release();
+    }
+
     void remove_console_heap(std::uint64_t console_va) {
         std::unique_ptr<ConsoleHeap> heap;
         {
@@ -5372,10 +5401,7 @@ struct DeviceState {
         if (heap->buffer) {
             // As for an imported slot-133 buffer: the title may free its pages right after, so the memory goes once
             // what was submitted retires, not through the deferred queue.
-            context->wait_retire_ticket(context->submitted_retire_ticket());
-            context->vk.vkDestroyBuffer(info.device, heap->buffer, nullptr);
-            context->vk.vkFreeMemory(info.device, heap->memory, nullptr);
-            leonida::kernel_writes::release(std::exchange(heap->pin, 0));
+            release_import(heap->buffer, heap->memory, heap->bytes, std::exchange(heap->pin, 0), false);
         } else {
             arena_release(heap->shader_va, heap->bytes + heap->guard, arena_descriptor_heap);
         }
@@ -8520,30 +8546,22 @@ public:
         if (shadow_) device_.remove_shadow(shadow_);
         if (shadow_ && !in_arena_) device_.remove_copy_target(shadow_);
         if (host_import_) {
-            // VK_EXT_external_memory_host needs the caller's pages to stay valid for the imported memory's whole
-            // lifetime, and a title may free them right after releasing the resource. So the memory is not left to
-            // the deferred queue (freed after the *next* submission retires): wait for what was submitted, then
-            // free it now (found in review).
-            device_.context->wait_retire_ticket(device_.context->submitted_retire_ticket());
-            auto& vk = device_.context->vk;
-            if (buffer_) vk.vkDestroyBuffer(device_.info.device, buffer_, nullptr);
-            if (memory_) {
-                vk.vkFreeMemory(device_.info.device, memory_, nullptr);
-                device_.host_imports.fetch_sub(1, std::memory_order_relaxed);
-            }
-            leonida::kernel_writes::release(std::exchange(host_pin_, 0));
+            device_.release_import(buffer_, memory_, desc_.Width, std::exchange(host_pin_, 0), true);
             buffer_ = VK_NULL_HANDLE;
             memory_ = VK_NULL_HANDLE;
         }
         if (in_arena_) device_.arena_release(arena_offset_, desc_.Width, DeviceState::arena_buffer);
         if (pooled_image_)
-            device_.context->defer_destroy(leonida::DeferredDeletionQueue::Kind::pooled_title_image, pooled_image_.release());
+            device_.context->defer_destroy(leonida::DeferredDeletionQueue::Kind::pooled_title_image, pooled_image_.release(),
+                                           image_backing_bytes_);
         else if (image_ && !sparse_image_)
             device_.context->defer_destroy(leonida::DeferredDeletionQueue::Kind::image, image_);
         if (buffer_) device_.context->defer_destroy(leonida::DeferredDeletionQueue::Kind::buffer, buffer_);
-        if (memory_) device_.context->defer_destroy(leonida::DeferredDeletionQueue::Kind::device_memory, memory_);
+        if (memory_) device_.context->defer_destroy(leonida::DeferredDeletionQueue::Kind::device_memory, memory_,
+                                           image_ ? image_backing_bytes_ : desc_.Width);
         if (image_range_)
-            device_.context->defer_destroy(leonida::DeferredDeletionQueue::Kind::image_memory, image_range_.release());
+            device_.context->defer_destroy(leonida::DeferredDeletionQueue::Kind::image_memory, image_range_.release(),
+                                           image_backing_bytes_);
     }
 
     VkDeviceAddress indexed_bda_{};
