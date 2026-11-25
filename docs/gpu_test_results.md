@@ -17,6 +17,7 @@ post counts and pass/fail lines there, never game shaders, logs or private paths
 | NVIDIA GeForce RTX 5070 Ti (Blackwell), subgroup 32..32 | NVIDIA 617.42, Vulkan 1.4.351, Windows 11 Pro 26300 | `21625bc` | 257/257 translated and valid (run_gpu_tests.py) | run via run_gpu_tests.py | 197/248 passed, 49 skipped, 2 failed (native); 229/248 passed, 17 skipped, 2 failed (`LEONIDA_W64_EMULATE=1`) | `cs_imgload_tfe`, `cs_imgload_d16_tfe` (#31) | [local note](../gpu-test-results/RTX5070Ti.txt) |
 | Apple M5 Pro (16-core GPU, Metal 4), subgroup 4..32 | MoltenVK 1.4.2 (Homebrew), Vulkan 1.4.357, macOS 26.7.3 (25G342) | `d42773d07` | 280/280 translated and valid | 175/219 pass, 39 skipped, 5 failed | 183/248 passed, 61 skipped, 4 failed (native); 214/248 passed, 30 skipped, 4 failed (`LEONIDA_W64_EMULATE=1`) | `cs_fma_fused` (known row), `cs_imgload_tfe`, `cs_imgload_d16_tfe` (pass with #291), `ps_imgatomic` flake (#543) | [local note](../gpu-test-results/AppleM5Pro.txt) |
 | NVIDIA GeForce RTX 3080 (Ampere, GA102, 10 GB GDDR6X), subgroup 32..32 | NVIDIA 580.178.04, Vulkan 1.4.312, Ubuntu 26.04 LTS | `d2cd6c0` | not run | not run | 197/248 passed, 49 skipped, 2 failed (native); 229/248 passed, 17 skipped, 2 failed (`LEONIDA_W64_EMULATE=1`) | `cs_imgload_tfe`, `cs_imgload_d16_tfe` (#31; see #280) | [local note](../gpu-test-results/RTX3080.txt) |
+| AMD Radeon 780M (RDNA3 iGPU, gfx1103), subgroup 32..64 | AMD proprietary 26.10.2 (LLPC), Vulkan 1.4.359, Windows 11 10.0.29712 | `bcaa13d` | not run; 273/273 translated and valid via run_gpu_tests.py | not run separately (run_gpu_tests.py below) | 243/263 passed, 18 skipped, 2 failed (native and emulated) | `cs_imgatomic_ext` (#1518), `cs_texture_uav` (no D3D12 build on this machine) | [local note](../gpu-test-results/780M.txt) |
 
 ## AMD Radeon RX 9070 GRE — 2026-11-23
 
@@ -125,3 +126,34 @@ distribution's build. The full record, with every skip by name, is in
 
 AI-assisted (Claude Code): built `main` at `84347bb`, ran `build.py`, `check.py` and `run_gpu_tests.py` native and
 emulated on this GPU, and reran the tfe pair with #98 applied.
+
+## AMD Radeon 780M — 2026-11-25
+
+```
+GPU:        AMD Radeon 780M Graphics (RDNA3 iGPU, gfx1103, WDDM 3.2, 16 GB shared), subgroup 32..64
+Driver:     AMD proprietary 26.10.2 (32.0.32015.12012, LLPC), Vulkan 1.4.359
+Subgroup:   32..64 (minSubgroupSize 32, maxSubgroupSize 64)
+OS:         Windows 11, 10.0.29712
+Commit:     bcaa13dad35f560748bd9b6293cd46504fe288c6 (main, 2026-11-25)
+run_gpu_tests.py: 273 shaders: 273 translated, 273 pass spirv-val
+            Native: 243/263 passed, 18 skipped, 2 failed.
+            LEONIDA_W64_EMULATE=1: 243/263 passed, 18 skipped, 2 failed.
+Failed:     cs_imgatomic_ext (#1518), cs_texture_uav (no D3D12 build on this machine)
+Skipped:    18 skips are the documented "run by d3d12_*_test / w64_graphics.py" cases.
+```
+
+Setup: `cmake -S runtime -B runtime/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=<llvm-mingw clang++> -DLEONIDA_BUILD_WINDOWS_RUNTIME=OFF -DLEONIDA_VULKAN_HEADERS_FETCH=ON`;
+the pinned Khronos Vulkan-Headers release (6802bb47, vulkan-sdk-1.4.363.0) is declared with a SHA256 URL_HASH in
+`runtime/CMakeLists.txt` and was supplied directly to CMake, because this machine already has Vulkan 1.3 headers in the include search path and the fetch is only taken when no
+Vulkan headers are found. This machine also has no MSVC and no Windows SDK, so the D3D12-side runtime and its tests are not built:
+the 18 cases above skip, and `cs_texture_uav` fails because its D3D12 test program is not built (`docs/testing.md`: a missing test
+executable on Windows fails the runner). The full record, with every skip by name, is in
+[`gpu-test-results/780M.txt`](../gpu-test-results/780M.txt).
+
+Both failing cases are new since the previous record, not regressions. `cs_imgatomic_ext` is the fixture whose 3D volume T# does
+not carry the tag `vk_store_test` now expects (#1518), and pull request 1518 fixes it: with 1518 applied to this commit, `--filter cs_imgatomic` passes 3 of 3 on this GPU.
+`cs_texture_uav` is the D3D12 case above. The four failures of the previous record (`cs_w32_exec_computed`,
+`cs_w64_exec_computed`, `cs_imgload_tfe`, `cs_imgload_d16_tfe`) now pass at this commit.
+
+AI-assisted (MiniMax Code): built `main` at `bcaa13dad`, ran `run_gpu_tests.py` on this GPU natively and with
+`LEONIDA_W64_EMULATE=1`, and reran the `cs_imgatomic` family with 1518 applied.
