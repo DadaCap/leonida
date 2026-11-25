@@ -7,13 +7,15 @@
 //     refuses (MS with VS, CS with PS, a subobject twice or in two versions, an unknown type, a truncated stream) are E_INVALIDARG, and
 //     state not built yet (an amplification shader, a depth-bounds test) is E_NOTIMPL.
 //   - Draws: DispatchMesh(2, 2, 1) with root constants (0, 0) and a red tint fills the top-left quadrant;
-//     DispatchMesh(1, 1, 2) moved by (1, -1) with a green tint fills the top half of the bottom-right one, so the
-//     Y and Z counts reach the shader; the stream's VS PSO draws a full-screen triangle through a viewport on the
+//     ExecuteIndirect with a padded DISPATCH_MESH signature runs a (2, 1, 1) grid. With indirect counts enabled,
+//     a GPU copy sets the count to 1 and suppresses a second nonempty grid. The grid
+//     moved by (1, -1) with a green tint fills the top half of the bottom-right quadrant, so the
+//     X and Y counts reach the shader; the stream's VS PSO draws a full-screen triangle through a viewport on the
 //     bottom-left quadrant (yellow). Each pixel is read back and compared.
 //   - A vertex draw with the mesh PSO, and DispatchMesh with the VS one, fail at execution (ReplayResult::
 //     invalid_draw); a mesh grid beyond D3D12's limits fails at Close; an empty grid records nothing.
-//   - A DISPATCH_MESH command signature is created only with the extension; ExecuteIndirect with it records nothing
-//     yet, so its list closes.
+//   - A DISPATCH_MESH command signature is created only with the extension; ExecuteIndirect replays it from direct
+//     lists and (fixed count) bundles. A compound one is skipped, as is one with a VS PSO; the list still runs.
 // The shaders are GLSL written to the translator's contract (test/glsl/ms_draw.mesh, ps_draw.frag, vs_fullscreen.vert).
 // No game data. Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation.
 #include "vk_test_device.h"
@@ -105,6 +107,8 @@ int main(int argc, char** argv) {
     EXPECT(SetEnvironmentVariableW(L"LEONIDA_XS_STREAM_ENUM", pc_only ? L"0" : L"1"));
     vktest::Device d;
     d.request_mesh_shader = true;
+    d.request_buffer_device_address = true;
+    d.request_draw_indirect_count = true;
     const auto device_status = d.initialize();
     if (device_status == vktest::DeviceStatus::unavailable) {
         std::fprintf(stderr, "SKIP: no usable Vulkan 1.3 device\n");
@@ -158,6 +162,8 @@ int main(int argc, char** argv) {
         info.buffer_device_address = true;
         info.shader_dir = library.string();
         info.mesh_shader = mesh;
+        info.draw_indirect_count_enabled = d.draw_indirect_count_enabled;
+        info.max_draw_indirect_count = d.max_draw_indirect_count;
         info.mesh_shader_queries = mesh && d.mesh_shader_queries;
         info.pipeline_statistics_query = d.pipeline_statistics_query;
         return info;
@@ -233,6 +239,12 @@ int main(int argc, char** argv) {
 
     constexpr UINT size = 64;
     std::vector<std::uint8_t> pixels(size * 256);
+    if (!d.buffer_device_address) {  // the ExecuteIndirect argument clamp needs it
+        std::filesystem::remove_all(library);
+        std::printf("SKIP: no bufferDeviceAddress\n");
+        return 77;
+    }
+    const bool counted_mesh = d.draw_indirect_count_enabled && d.max_draw_indirect_count == UINT32_MAX;
     {
         Ref<ID3D12Device> device;
         Ref<ID3D12RootSignature> root;
@@ -369,7 +381,7 @@ int main(int argc, char** argv) {
         const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
         const D3D12_HEAP_PROPERTIES upload_heap{D3D12_HEAP_TYPE_UPLOAD};
         const D3D12_HEAP_PROPERTIES readback_heap{D3D12_HEAP_TYPE_READBACK};
-        Ref<ID3D12Resource> upload, readback, target;
+        Ref<ID3D12Resource> upload, readback, target, count_buffer;
         const auto upload_desc = buffer_desc(4096);
         EXPECT(SUCCEEDED(device->CreateCommittedResource(&upload_heap, D3D12_HEAP_FLAG_NONE, &upload_desc,
                                                          D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
@@ -378,6 +390,13 @@ int main(int argc, char** argv) {
         EXPECT(SUCCEEDED(device->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &readback_desc,
                                                          D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                                          IID_PPV_ARGS(&readback.p))));
+        constexpr UINT count_offset = 4;
+        if (counted_mesh) {
+            const auto count_desc = buffer_desc(count_offset + sizeof(UINT));
+            EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &count_desc,
+                                                             D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                             IID_PPV_ARGS(&count_buffer.p))));
+        }
         D3D12_RESOURCE_DESC rt_desc{};
         rt_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
         rt_desc.Width = rt_desc.Height = size;
@@ -394,7 +413,22 @@ int main(int argc, char** argv) {
         std::uint8_t* up = nullptr;
         EXPECT(SUCCEEDED(upload->Map(0, nullptr, reinterpret_cast<void**>(&up))));
         for (int i = 0; i < 3; ++i) std::memcpy(up + 256 * i, tints[i], sizeof(tints[i]));
+        constexpr UINT mesh_args_offset = 1024;
+        struct MeshRecord {
+            D3D12_DISPATCH_MESH_ARGUMENTS grid;
+            UINT padding;
+        };
+        const MeshRecord mesh_args[] = {{{0, 0, 0}, 0}, {{2, 1, 1}, 0}, {{2, 2, 1}, 0}};
+        std::memcpy(up + mesh_args_offset, mesh_args, sizeof(mesh_args));
+        constexpr UINT count_upload_offset = mesh_args_offset + sizeof(mesh_args);
+        const UINT mesh_counts[] = {1, UINT32_MAX};
+        std::memcpy(up + count_upload_offset, mesh_counts, sizeof(mesh_counts));
         const D3D12_GPU_VIRTUAL_ADDRESS upload_va = upload->GetGPUVirtualAddress();
+        const D3D12_INDIRECT_ARGUMENT_DESC mesh_argument{D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH};
+        const D3D12_COMMAND_SIGNATURE_DESC mesh_signature_desc{sizeof(MeshRecord), 1, &mesh_argument, 0};
+        Ref<ID3D12CommandSignature> mesh_signature;
+        EXPECT(SUCCEEDED(device->CreateCommandSignature(&mesh_signature_desc, nullptr,
+                                                        IID_PPV_ARGS(&mesh_signature.p))));
 
         const D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
         Ref<ID3D12DescriptorHeap> rtv_heap;
@@ -435,11 +469,50 @@ int main(int argc, char** argv) {
         list->SetGraphicsRootConstantBufferView(1, upload_va);
         list6->DispatchMesh(0, 1, 1);
         list6->DispatchMesh(2, 2, 1);
-        // Mesh draw 2: groups (0,0,0) and (0,0,1), columns 0 and 1 of row 0, moved by (1, -1), green -> the top half
+        // Groups (0,0,0) and (0,0,1), columns 0 and 1 of row 0, green -> the top half of that quadrant: the Z count
+        // reaches the shader. (The clamp of indirect records uses X only, as the console does.)
+        list->SetGraphicsRootConstantBufferView(1, upload_va + 256);
+        list6->DispatchMesh(1, 1, 2);
+        // A fixed-count indirect mesh dispatch in a bundle, yellow -> the bottom half of the bottom-right quadrant.
+        const float down_right_low[2] = {1, -1.5f};
+        list->SetGraphicsRoot32BitConstants(0, 2, down_right_low, 0);
+        list->SetGraphicsRootConstantBufferView(1, upload_va + 512);
+        Ref<ID3D12CommandAllocator> bundle_allocator;
+        Ref<ID3D12GraphicsCommandList> bundle;
+        EXPECT(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_BUNDLE,
+                                                        IID_PPV_ARGS(&bundle_allocator.p))));
+        EXPECT(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_BUNDLE, bundle_allocator.p, mesh_pso.p,
+                                                   IID_PPV_ARGS(&bundle.p))));
+        bundle->ExecuteIndirect(mesh_signature.p, 1, upload.p, mesh_args_offset + sizeof(MeshRecord), nullptr, 0);
+        EXPECT(bundle->Close() == S_OK);
+        list->ExecuteBundle(bundle.p);
+        const auto copy_count = [&](UINT offset) {
+            list->CopyBufferRegion(count_buffer.p, count_offset, upload.p, offset, sizeof(UINT));
+            const auto to_indirect = transition(count_buffer.p, D3D12_RESOURCE_STATE_COPY_DEST,
+                                                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+            list->ResourceBarrier(1, &to_indirect);
+        };
+        if (counted_mesh) copy_count(count_upload_offset);
+        // Mesh draw 2: groups (0,0,0) and (1,0,0), columns 0 and 1 of row 0, moved by (1, -1), green -> the top half
         // of the bottom-right quadrant.
         list->SetGraphicsRoot32BitConstants(0, 2, down_right, 0);
         list->SetGraphicsRootConstantBufferView(1, upload_va + 256);
-        list6->DispatchMesh(1, 1, 2);
+        // A count of one suppresses the second record, which would paint over the yellow pixels below the green band.
+        if (counted_mesh) {
+            list->ExecuteIndirect(mesh_signature.p, 2, upload.p, mesh_args_offset + sizeof(MeshRecord),
+                                  count_buffer.p, count_offset);
+            const auto to_count_copy = transition(count_buffer.p, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                                                  D3D12_RESOURCE_STATE_COPY_DEST);
+            list->ResourceBarrier(1, &to_count_copy);
+            copy_count(count_upload_offset + sizeof(UINT));
+            // UINT32_MAX must be clamped to one, so only the upper band of the top-right quadrant changes.
+            const float up_right[2] = {1, 0};
+            list->SetGraphicsRoot32BitConstants(0, 2, up_right, 0);
+            list->ExecuteIndirect(mesh_signature.p, 1, upload.p, mesh_args_offset + sizeof(MeshRecord),
+                                  count_buffer.p, count_offset);
+        } else {
+            list->ExecuteIndirect(mesh_signature.p, 1, upload.p, mesh_args_offset + sizeof(MeshRecord), nullptr, 0);
+        }
         // The stream's VS PSO: a full-screen triangle through a viewport on the bottom-left quadrant, yellow.
         const D3D12_VIEWPORT bottom_left{0, float(size / 2), float(size / 2), float(size / 2), 0, 1};
         list->RSSetViewports(1, &bottom_left);
@@ -484,6 +557,16 @@ int main(int argc, char** argv) {
             queue->ExecuteCommandLists(1, lists);
             EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::invalid_draw);
         }
+        // An indirect mesh dispatch with the VS PSO is dropped alone (and counted): the list still runs.
+        EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, vs_pso.p)));
+        list->SetGraphicsRootSignature(root.p);
+        list->RSSetViewports(1, &viewport);
+        list->RSSetScissorRects(1, &scissor);
+        list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+        list->ExecuteIndirect(mesh_signature.p, 1, upload.p, mesh_args_offset + sizeof(MeshRecord), nullptr, 0);
+        EXPECT(list->Close() == S_OK);
+        queue->ExecuteCommandLists(1, lists);
+        EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
         // A grid beyond D3D12's limits (65535 per count, 2^22 groups) is a recording error.
         EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, mesh_pso.p)));
         list->SetGraphicsRootSignature(root.p);
@@ -591,8 +674,8 @@ int main(int argc, char** argv) {
                         enabled ? "" : " (LEONIDA_GRAPHICS_DIRECT_HEAPS=0: not written)");
         }
         // A DISPATCH_MESH command signature (D3D12_DISPATCH_MESH_ARGUMENTS, 12 bytes) is created; a stride below its
-        // 12 bytes is refused as the PC runtime refuses it. ExecuteIndirect with it records nothing yet (#3777 replays
-        // it), so the list still closes.
+        // 12 bytes is refused as the PC runtime refuses it. Without a viewport nothing is recorded, and a signature with
+        // root arguments before the dispatch is skipped; the list closes either way.
         {
             const D3D12_INDIRECT_ARGUMENT_DESC mesh_arg{D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH};
             const D3D12_COMMAND_SIGNATURE_DESC mesh_sig{12, 1, &mesh_arg, 0};
@@ -603,7 +686,17 @@ int main(int argc, char** argv) {
             EXPECT(SUCCEEDED(list->Reset(allocator.p, mesh_pso.p)));
             list->SetGraphicsRootSignature(root.p);
             list->ExecuteIndirect(sig.p, 1, upload.p, 0, nullptr, 0);
+            D3D12_INDIRECT_ARGUMENT_DESC compound_args[2]{{D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT}, mesh_arg};
+            compound_args[0].Constant = {0, 0, 2};
+            const D3D12_COMMAND_SIGNATURE_DESC compound_sig{20, 2, compound_args, 0};
+            Ref<ID3D12CommandSignature> compound;
+            EXPECT(SUCCEEDED(device->CreateCommandSignature(&compound_sig, root.p, IID_PPV_ARGS(&compound.p))));
+            list->RSSetViewports(1, &viewport);
+            list->ExecuteIndirect(compound.p, 1, upload.p, 0, nullptr, 0);
             EXPECT(list->Close() == S_OK);
+            std::vector<leonida::Command> commands;
+            EXPECT(rt::d3d12::recorded_commands(list.p, commands));
+            for (const auto& command : commands) EXPECT(!leonida::draw_command(command).state);
         }
         EXPECT(SUCCEEDED(queue->Signal(fence.p, 2)) && SUCCEEDED(fence->SetEventOnCompletion(2, nullptr)));
 
@@ -653,7 +746,8 @@ int main(int argc, char** argv) {
             list->BeginQuery(statistics.p, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 0);
             vertex_draw();
             mesh_draw(2, 2);
-            mesh_draw(1, 1);
+            // Indirect: its clamp pass must stay out of CSInvocations, and its draw in the mesh pool.
+            list->ExecuteIndirect(mesh_signature.p, 1, upload.p, mesh_args_offset + sizeof(MeshRecord), nullptr, 0);
             vertex_draw();
             list->EndQuery(statistics.p, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 0);
             list->BeginQuery(statistics.p, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 1);
@@ -710,10 +804,13 @@ int main(int argc, char** argv) {
             std::printf("pipelineStatisticsQuery not available: the D3D-291 statistics check is skipped\n");
         }
 
-        for (auto* r : {&upload, &readback, &target}) r->reset();
+        for (auto* r : {&upload, &readback, &target, &count_buffer}) r->reset();
         for (auto* p : {&mesh_pso, &vs_pso, &refused}) p->reset();
         root.reset();
         rtv_heap.reset();
+        mesh_signature.reset();
+        bundle.reset();
+        bundle_allocator.reset();
         list6.reset();
         list.reset();
         allocator.reset();
@@ -727,10 +824,11 @@ int main(int argc, char** argv) {
     for (UINT row = 0; row < size; ++row) {
         for (UINT col = 0; col < size; ++col) {
             const bool top = row < size / 2, left = col < size / 2;
+            const bool green = ((left || counted_mesh) && row < size / 4) || (!left && !top && row < size * 3 / 4);
             using Pixel = std::array<std::uint8_t, 4>;
-            const Pixel want = top && left                            ? Pixel{255, 0, 0, 255}
-                               : !top && left                         ? Pixel{255, 255, 0, 255}
-                               : !top && !left && row < size * 3 / 4  ? Pixel{0, 255, 0, 255}
+            const Pixel want = top && left && row >= size / 4         ? Pixel{255, 0, 0, 255}
+                               : !top && (left || row >= size * 3 / 4) ? Pixel{255, 255, 0, 255}
+                               : green                               ? Pixel{0, 255, 0, 255}
                                                                       : Pixel{0, 0, 255, 255};
             const std::uint8_t* got = pixels.data() + row * 256 + col * 4;
             if (std::equal(want.begin(), want.end(), got)) continue;
@@ -740,12 +838,13 @@ int main(int argc, char** argv) {
         }
     }
     EXPECT(!mismatches);
+    std::printf("mesh indirect used %s\n", counted_mesh ? "a GPU count buffer" : "a fixed count (GPU count unavailable)");
     if (d.validation_errors()) {
         std::fprintf(stderr, "%u validation errors\n", d.validation_errors());
         return 1;
     }
     std::printf("D3D-29: mesh tier 1; mesh and VS PSOs from pipeline state streams (9 refused as invalid, 2 as not "
-                "implemented); DispatchMesh over X, Y and Z and a stream VS draw matched all %u pixels; wrong-kind "
+                "implemented); direct and indirect mesh dispatches and a stream VS draw matched all %u pixels; wrong-kind "
                 "draws fail at execution, oversized grids at Close; statistics queries around mesh draws resolve\n",
                 size * size);
     return 0;

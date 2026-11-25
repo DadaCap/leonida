@@ -618,8 +618,8 @@ enum class IndirectKind : std::uint8_t {
     draw = 0,
     draw_indexed = 1,
     dispatch = 2,
-    // D3D12_DISPATCH_MESH_ARGUMENTS. Created on a device with mesh shaders; ExecuteIndirect with it records nothing
-    // yet (the replay is #3777's), so a title that only creates such a signature at startup goes on.
+    // D3D12_DISPATCH_MESH_ARGUMENTS. Created on a device with mesh shaders; recorded as an IndirectRasterDraw whose
+    // state has `mesh` set.
     dispatch_mesh = 3,
 };
 
@@ -816,7 +816,7 @@ public:
     }
     bool draw(Draw&& draw) {
         if (!draw.pipeline) return false;
-        if (!draw.count || !draw.instances) return !closed_;
+        if (!draw.count || !draw.instances || (draw.mesh && !draw.first)) return !closed_;
         return append(std::move(draw));
     }
 

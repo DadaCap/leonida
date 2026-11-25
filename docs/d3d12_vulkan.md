@@ -9,9 +9,9 @@ hand-written RDNA2 run through the translator in `d3d12_translated_draw_test`, a
 `d3d12_m2_textured_test`. `D3D12XboxCreateDevice` uses it when `LEONIDA_D3D12=vulkan` is
 set and the host PC device otherwise. Root signatures (packed into the 32 user-data dwords), graphics and compute
 PSOs, draws, dispatches, `ExecuteIndirect`, and presentation through `PresentX` or a DXGI swapchain are implemented
-and have GPU tests; which present path the game uses is still open (question 6). Shader-resource views of buffers,
-pipeline-state streams (`CreatePipelineState`), tessellation and stream-output pipelines are not implemented, and
-mesh shaders are reported as not supported (stream PSOs and mesh shaders: D3D-29, #1712). The device reports
+and have GPU tests; which present path the game uses is still open (question 6). Buffer SRVs and pipeline-state
+streams (`CreatePipelineState`) are implemented. Mesh PSOs, `DispatchMesh`, and indirect mesh dispatches
+are supported with `VK_EXT_mesh_shader`; GPU count buffers have additional requirements (section 4.7). The device reports
 `RaytracingTier` as `NOT_SUPPORTED`, yet `BuildRaytracingAccelerationStructure` builds XDXR BVH4 structures on the
 GPU (section 4.8).** This is the plan for
 replacing the console's `d3d12_xs.dll` with an implementation that records D3D12 commands and replays them on
@@ -3899,7 +3899,15 @@ Not implemented yet:
 - `D3D12_COMMAND_SIGNATURE_DESC` describes the argument stride and a list of argument types. Simple draw,
   draw-indexed, dispatch and mesh-dispatch signatures map to `vkCmdDraw*Indirect`, `vkCmdDispatchIndirect` and
   `vkCmdDrawMeshTasksIndirectEXT`; use the `*Count` variants (`VK_KHR_draw_indirect_count`, core 1.2) when the
-  `ExecuteIndirect` call supplies a count buffer.
+  `ExecuteIndirect` call supplies a count buffer for draw or draw-indexed signatures.
+- A single `DISPATCH_MESH` argument is supported on direct lists, and with a fixed count in bundles. Recording captures
+  the graphics PSO, root arguments and render targets as `DispatchMesh` does. Vulkan reads the three group counts
+  from the argument buffer at execution, using the signature's byte stride. The records pass the same argument clamp as
+  indirect draws (`vulkan_indirect_clamp.h`: X up to 65535, Y and Z taken as 1, 128 work units per group), outside
+  pipeline statistics segments. A count buffer needs `drawIndirectCount`, a fixed count above 1 `multiDrawIndirect`;
+  without them the call is skipped and counted (`indirect_draw_stats.h`), as is one whose bound pipeline has no mesh
+  shader. Mesh signatures with additional arguments are skipped as compound draws are. The retail title's only
+  `DISPATCH_MESH` signature found statically has one argument and a 12-byte stride (`d3d12_xs_device.cpp`, slot 41).
 - Signatures that change root constants, vertex/index buffers or descriptors per argument cannot be expressed by
   one Vulkan indirect call. Use a compute expansion pass that writes a Vulkan-shaped indirect buffer, or
   `VK_NV_device_generated_commands` on NVIDIA. Start with the simple signatures; the trace will show which

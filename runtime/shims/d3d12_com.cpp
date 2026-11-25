@@ -151,7 +151,7 @@ public:
                      std::span<const D3D12_INDIRECT_ARGUMENT_DESC> prefix)
         : kind_(kind), stride_(byte_stride), packed_size_(packed_size), terminal_only_(prefix.empty()) {
         // The caller may free the description immediately. Single-operation signatures allocate nothing.
-        if (!prefix.empty() && (kind == leonida::IndirectKind::draw || kind == leonida::IndirectKind::draw_indexed))
+        if (!prefix.empty() && kind != leonida::IndirectKind::dispatch)
             graphics_writes_.assign(prefix.begin(), prefix.end());
     }
 
@@ -548,28 +548,10 @@ public:
             stub("DispatchMesh(root signature larger than a mesh shader's root window)");
             return check(false);
         }
-        // The directly indexed heaps follow the arguments (graphics_user_data). The window shows a mesh shader push
-        // dwords 8..23 only (s16..s31), so a signature that fills it leaves a heap where the mesh stage cannot read.
-        {
-            constexpr std::uint32_t window_end = rt::rootsig::stage_base(rt::rootsig::Stage::Pixel) +
-                                                 rt::rootsig::kMaxUserSgprs -
-                                                 rt::rootsig::stage_base(rt::rootsig::Stage::Mesh);
-            const auto flags = graphics_.layout->flags;
-            const bool resource = flags & D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED;
-            const bool sampler = flags & D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED;
-            const std::uint32_t end = graphics_.layout->graphics_arguments_end;
-            if (resource && end >= window_end)
-                note_once("mesh direct heaps: no SGPR left in the mesh window (s16..s31) for the resource heap");
-            if (sampler && end + (resource ? 1u : 0u) >= window_end)
-                note_once("mesh direct heaps: no SGPR left in the mesh window (s16..s31) for the sampler heap");
-        }
+        note_mesh_direct_heaps();
         if (!any_nonempty_viewport()) return;  // as record_draw: nothing is rasterized
-        leonida::Draw draw{graphics_pipeline_, graphics_user_data(), draw_views(), depth_, {}, 0, viewport_,
-                           scissor_, blend_factor_, front_stencil_ref_, back_stencil_ref_, false, x, y, z, 0, 0};
         note_direct_heap_indexing(graphics_.layout);
-        draw.mesh = true;
-        draw.viewports = draw_viewports();
-        check(list_.draw(std::move(draw)));
+        record_mesh_draw(x, y, z);
     }
 
     void STDMETHODCALLTYPE ResourceBarrier(UINT count, const D3D12_RESOURCE_BARRIER* barriers) override {
@@ -1014,13 +996,7 @@ public:
         if (!leonida::indirect_records_fit(arg_desc.Width, argument_buffer_offset, max_command_count,
                                           stride, sig->packed_size()))
             return check(false);
-        if (kind == leonida::IndirectKind::dispatch_mesh) {
-            // Not replayed yet (#3777 replays it as vkCmdDrawMeshTasksIndirectEXT): nothing is recorded, and the
-            // first such call says so. The list stays valid.
-            leonida::indirect_stats::skip(leonida::indirect_stats::Event::record_skip, leonida::indirect_stats::mesh);
-            return;
-        }
-        if (!terminal_only && (kind == leonida::IndirectKind::draw || kind == leonida::IndirectKind::draw_indexed)) {
+        if (!terminal_only && kind != leonida::IndirectKind::dispatch) {
             if (type_ != D3D12_COMMAND_LIST_TYPE_DIRECT) return check(false);
             // Compound draw emission is not yet supported. Reset the written bindings even if no
             // records execute. Bundle nesting and prefixes were already rejected above for bundles.
@@ -1913,7 +1889,7 @@ private:
     }
 
     void record_indirect(leonida::IndirectKind kind, bool terminal_only, const leonida::IndirectDrawArgs& args) {
-        if (kind == leonida::IndirectKind::draw || kind == leonida::IndirectKind::draw_indexed) {
+        if (kind != leonida::IndirectKind::dispatch) {
             if (type_ != D3D12_COMMAND_LIST_TYPE_DIRECT) return check(false);
             // A valid zero-count call records nothing, even if graphics state has not been set.
             if (!args.max_count) return;
@@ -1931,12 +1907,19 @@ private:
             if (!terminal_only) return skip(stats::compound);
             if (!graphics_pipeline_) return skip(stats::pipeline);
             if (!graphics_.layout) return skip(stats::root_layout);
-            if (topology_ != D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST) return skip(stats::topology);
+            const bool mesh = kind == leonida::IndirectKind::dispatch_mesh;
+            if (mesh && !graphics_.layout->mesh_ok) return skip(stats::mesh_window);  // as DispatchMesh
+            if (!mesh && topology_ != D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST) return skip(stats::topology);
             if (indexed && (!index_.va || !index_.size ||
                             (index_.format != DXGI_FORMAT_R16_UINT && index_.format != DXGI_FORMAT_R32_UINT)))
                 return skip(stats::index_view);
             if (!(viewport_.width > 0) || !(viewport_.height > 0)) return skip(stats::viewport);
             note_direct_heap_indexing(graphics_.layout);
+            if (mesh) {
+                note_mesh_direct_heaps();
+                record_mesh_draw(0, 0, 0, &args);
+                return;
+            }
             record_raster_draw(indexed, 0, 0, 0, 0, 0, &args);
             return;
         }
@@ -2054,6 +2037,34 @@ private:
         leonida::Draw draw{graphics_pipeline_, graphics_user_data(), draw_views(), depth_, index_, topology_, viewport_,
                            scissor_, blend_factor_, front_stencil_ref_, back_stencil_ref_, indexed, count, instances,
                            first, base_vertex, first_instance};
+        record_raster(std::move(draw), indirect);
+    }
+
+    // As record_raster_draw, for a mesh pipeline: no index buffer and no topology.
+    void record_mesh_draw(UINT x, UINT y, UINT z, const leonida::IndirectDrawArgs* indirect = nullptr) {
+        leonida::Draw draw{graphics_pipeline_, graphics_user_data(), draw_views(), depth_, {}, 0, viewport_,
+                           scissor_, blend_factor_, front_stencil_ref_, back_stencil_ref_, false, x, y, z, 0, 0};
+        draw.mesh = true;
+        record_raster(std::move(draw), indirect);
+    }
+
+    // The directly indexed heaps follow the arguments (graphics_user_data). The window shows a mesh shader push
+    // dwords 8..23 only (s16..s31), so a signature that fills it leaves a heap where the mesh stage cannot read.
+    void note_mesh_direct_heaps() {
+        constexpr std::uint32_t window_end = rt::rootsig::stage_base(rt::rootsig::Stage::Pixel) +
+                                             rt::rootsig::kMaxUserSgprs -
+                                             rt::rootsig::stage_base(rt::rootsig::Stage::Mesh);
+        const auto flags = graphics_.layout->flags;
+        const bool resource = flags & D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED;
+        const bool sampler = flags & D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED;
+        const std::uint32_t end = graphics_.layout->graphics_arguments_end;
+        if (resource && end >= window_end)
+            note_once("mesh direct heaps: no SGPR left in the mesh window (s16..s31) for the resource heap");
+        if (sampler && end + (resource ? 1u : 0u) >= window_end)
+            note_once("mesh direct heaps: no SGPR left in the mesh window (s16..s31) for the sampler heap");
+    }
+
+    void record_raster(leonida::Draw&& draw, const leonida::IndirectDrawArgs* indirect) {
         draw.viewports = draw_viewports();
         const bool recorded = indirect ? list_.draw_indirect(std::move(draw), *indirect) : list_.draw(std::move(draw));
         if (indirect && recorded) leonida::indirect_stats::note(leonida::indirect_stats::Event::recorded);
