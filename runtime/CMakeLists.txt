@@ -3936,6 +3936,10 @@ if(TARGET Vulkan::Headers)
       # the title's pages at the next refresh, and the title's own newer words still win (#1537, WRITE_INVALID).
       add_test(NAME d3d12_title_window_write_back COMMAND d3d12_title_va_test --window-writeback)
       set_tests_properties(d3d12_title_window_write_back PROPERTIES SKIP_RETURN_CODE 77)
+      # A window goes with its pages: released, its bytes, tracker and alias go at the next submission; a new view of
+      # the address gets a new window over the bytes there now, and a window over pages still held stays.
+      add_test(NAME d3d12_title_window_retire COMMAND d3d12_title_va_test --window-retire)
+      set_tests_properties(d3d12_title_window_retire PROPERTIES SKIP_RETURN_CODE 77)
       # The same return copy for a slot-133 buffer's shadow (the write-back of a compute result the title reads again).
       add_test(NAME d3d12_placed_write_back COMMAND d3d12_title_va_test --placed-writeback)
       set_tests_properties(d3d12_placed_write_back PROPERTIES SKIP_RETURN_CODE 77)

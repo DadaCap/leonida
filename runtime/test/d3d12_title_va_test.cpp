@@ -700,6 +700,116 @@ int check_window_write_back(Context& c, bool geometry) {
     return 0;
 }
 
+// One submission in the root view read mode (cs_user_data.comp): title word i = title word 64 + i + kRootAdd, read and
+// written through the window of the title's pages at `va`.
+int submit_read(WriteBack& s, std::uint64_t va) {
+    EXPECT(s.allocator->Reset() == S_OK);
+    EXPECT(s.list->Reset(s.allocator, s.c->pso) == S_OK);
+    ID3D12DescriptorHeap* heaps[] = {s.heap};
+    s.list->SetDescriptorHeaps(1, heaps);
+    s.list->SetComputeRootSignature(s.c->root);
+    s.list->SetComputeRoot32BitConstant(0, kRootAdd, 0);
+    s.list->SetComputeRoot32BitConstant(0, 0xFFFFFFFEu, 1);
+    s.list->SetComputeRootUnorderedAccessView(1, va);
+    s.list->SetComputeRootDescriptorTable(2, D3D12_GPU_DESCRIPTOR_HANDLE{s.gpu});
+    s.list->Dispatch(1, 1, 1);
+    EXPECT(s.list->Close() == S_OK);
+    ID3D12CommandList* lists[] = {s.list};
+    s.c->queue->ExecuteCommandLists(1, lists);
+    EXPECT(rt::d3d12::last_execute_result(s.c->queue) == leonida::ReplayResult::success);
+    EXPECT(SUCCEEDED(s.c->queue->Signal(s.c->fence, ++s.c->fence_value)));
+    s.c->fence->SetEventOnCompletion(s.c->fence_value, nullptr);
+    return 0;
+}
+
+// A title window goes with its pages. A range the title releases (VirtualFree, and what xmem's TitleVirtualFree
+// reports after it: geometry_writes::note_released) leaves the windows at the next submission, with its bytes, its
+// tracker and its alias, and its memory is freed once that submission has completed; a new view of the address gets a
+// new window over the bytes there now; a window over pages the title still holds is left as it was.
+int check_window_retire(Context& c) {
+    constexpr UINT64 ring_bytes = 256 * 1024;
+    const auto reserve = [&](void* at) {
+        return static_cast<std::uint32_t*>(
+            VirtualAlloc(at, ring_bytes, MEM_RESERVE | MEM_COMMIT | (at ? 0 : MEM_TOP_DOWN), PAGE_READWRITE));
+    };
+    const auto fill = [&](std::uint32_t* ring, std::uint32_t base) {
+        for (UINT i = 0; i < ring_bytes / 4; ++i) ring[i] = i < kElements ? 0 : base + i;
+    };
+    const auto came_back = [&](const std::uint32_t* ring, std::uint32_t base) {  // the GPU's words, in the pages
+        UINT n = 0;
+        for (UINT i = 0; i < kElements; ++i) n += ring[i] == base + kElements + i + kRootAdd;
+        return n;
+    };
+    std::uint32_t* freed = reserve(nullptr);
+    std::uint32_t* kept = reserve(nullptr);
+    EXPECT(freed && kept);
+    const auto freed_va = reinterpret_cast<std::uint64_t>(freed), kept_va = reinterpret_cast<std::uint64_t>(kept);
+    auto& aliases = leonida::title_va_aliases();
+    aliases.add_title_memory(freed_va, ring_bytes);
+    aliases.add_title_memory(kept_va, ring_bytes);
+    fill(freed, 0x10000000u);
+    fill(kept, 0x20000000u);
+
+    D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 8,
+                                         D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    Ref<ID3D12DescriptorHeap> heap;
+    EXPECT(SUCCEEDED(c.device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&heap.p))));
+    Ref<ID3D12CommandAllocator> allocator;
+    Ref<ID3D12GraphicsCommandList> list;
+    EXPECT(SUCCEEDED(c.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.p))));
+    EXPECT(SUCCEEDED(c.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, c.pso,
+                                                 IID_PPV_ARGS(&list.p))));
+    EXPECT(list->Close() == S_OK);
+    WriteBack s{&c, allocator.p, list.p, nullptr, heap.p, reinterpret_cast<XboxHeapHandleFn>(slot(heap.p, 10))(heap.p)};
+
+    const auto before = rt::d3d12::title_windows(c.inner);
+    const std::uint64_t trackers = rt::d3d12::title_shadow_trackers(c.inner);
+    EXPECT(submit_read(s, freed_va) == 0);
+    EXPECT(submit_read(s, kept_va) == 0);
+    const auto made = rt::d3d12::title_windows(c.inner);
+    const std::uint64_t kept_shader = aliases.shader_va(kept_va);
+    EXPECT(made.count == before.count + 2 && made.bytes > before.bytes);
+    EXPECT(aliases.shader_va(freed_va) != freed_va && kept_shader != kept_va);
+    EXPECT(rt::d3d12::title_shadow_trackers(c.inner) == trackers + 2);
+    EXPECT(submit_read(s, kept_va) == 0);  // the next refresh copies the GPU's words back
+    std::printf("window retire: %u/%u of the GPU's words over the first bytes came back\n",
+                came_back(freed, 0x10000000u), kElements);
+    EXPECT(came_back(freed, 0x10000000u) == kElements);
+
+    // The title releases the first range and reserves the same address again, with other bytes.
+    EXPECT(VirtualFree(freed, 0, MEM_RELEASE));
+    leonida::geometry_writes::note_released(freed_va, freed_va + ring_bytes);
+    EXPECT(reserve(freed) == freed);
+    fill(freed, 0x30000000u);
+    EXPECT(submit_read(s, kept_va) == 0);  // any submission
+    const auto retired = rt::d3d12::title_windows(c.inner);
+    std::printf("window retire: %llu -> %llu windows, %llu -> %llu KiB after the release (%llu retired)\n",
+                static_cast<unsigned long long>(made.count), static_cast<unsigned long long>(retired.count),
+                static_cast<unsigned long long>(made.bytes >> 10), static_cast<unsigned long long>(retired.bytes >> 10),
+                static_cast<unsigned long long>(retired.retired - made.retired));
+    EXPECT(retired.count == made.count - 1 && retired.bytes < made.bytes && retired.retired == made.retired + 1);
+    EXPECT(aliases.shader_va(freed_va) == freed_va);    // nothing answers for the released pages now
+    EXPECT(aliases.shader_va(kept_va) == kept_shader);  // the window over pages still held stays
+    EXPECT(rt::d3d12::title_shadow_trackers(c.inner) == trackers + 1);
+
+    // A new view of the address: a new window over the bytes there now, and the retired one's memory is freed.
+    EXPECT(submit_read(s, freed_va) == 0);
+    const auto remade = rt::d3d12::title_windows(c.inner);
+    EXPECT(remade.count == made.count && remade.bytes == made.bytes && remade.waiting == 0);
+    EXPECT(aliases.shader_va(freed_va) != freed_va);
+    EXPECT(submit_read(s, kept_va) == 0);
+    std::printf("window retire: %u/%u of the GPU's words over the new bytes came back\n",
+                came_back(freed, 0x30000000u), kElements);
+    EXPECT(came_back(freed, 0x30000000u) == kElements);
+    EXPECT(came_back(kept, 0x20000000u) == kElements);
+
+    aliases.remove_title_memory(freed_va);
+    aliases.remove_title_memory(kept_va);
+    VirtualFree(freed, 0, MEM_RELEASE);
+    VirtualFree(kept, 0, MEM_RELEASE);
+    return 0;
+}
+
 void remove_test_pair(std::uintptr_t gpu, std::uintptr_t cpu) {
     auto& state = leonida::title_gpu_views::state();
     std::unique_lock lock(state.mutex);
@@ -1228,6 +1338,7 @@ int main(int argc, char** argv) {
     const bool rebind = api_copy || mirror_off || second_device || (argc == 2 && std::strcmp(argv[1], "--rebound-tables") == 0);
     const bool window_cap = argc == 2 && std::strcmp(argv[1], "--window-cap") == 0;
     const bool window_write_back = argc == 2 && std::strcmp(argv[1], "--window-writeback") == 0;
+    const bool window_retire = argc == 2 && std::strcmp(argv[1], "--window-retire") == 0;
     const bool placed_write_back = argc == 2 && std::strcmp(argv[1], "--placed-writeback") == 0;
     const bool keep_refill = argc == 2 && std::strcmp(argv[1], "--shadow-keep-refill") == 0;
     if (window_cap) {
@@ -1369,6 +1480,15 @@ int main(int argc, char** argv) {
             }
             std::printf("title window write back: the GPU's writes reached the title's pages and the title's own "
                         "words won\n");
+            return 0;
+        }
+        if (window_retire) {
+            if (check_window_retire(c)) return 1;
+            if (d.validation_errors()) {
+                std::fprintf(stderr, "%u validation errors\n", d.validation_errors());
+                return 1;
+            }
+            std::printf("title window retire: a window went with its released pages and came back over the new ones\n");
             return 0;
         }
         if (geometry && check_declined_imports(c)) return 1;

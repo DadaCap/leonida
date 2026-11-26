@@ -1707,8 +1707,16 @@ The copies:
   (logged once otherwise).
 - Any **other address in the title's memory** gets a window: the 64 KiB-aligned pages it covers, clipped to the
   title's range, copied into the arena now and before every submission, through the same shadow refresh as slot 133
-  (so dirty-page tracking for that refresh applies to both). Windows stay until the device goes, up to
-  `LEONIDA_TITLE_WINDOWS_MB` (64 MiB by default). A window that
+  (so dirty-page tracking for that refresh applies to both). Windows stay while their pages do, up to
+  `LEONIDA_TITLE_WINDOWS_MB` (64 MiB by default). A window (a stream-pool extent's included) whose pages the title
+  releases, decommits or unmaps is **retired** after the next submission's refresh: xmem reports those ranges through
+  the release feed the geometry copies take (`geometry_writes::note_released`; the window's pages, and a pool extent's
+  other address, are watched with `watch_pages`), and the window's tracker, its address aliases and its bytes of the
+  budget go at once. Its memory is freed as a retired geometry copy's is, once every `ExecuteCommandLists` replay in
+  progress then has recorded its submissions and those have completed. The next view of those pages gets a new window
+  over the bytes there then. A remap or a protection change is no release, and neither is a freed heap block whose
+  pages stay committed: the window stays and its tracker follows the pages. `d3d12_title_window_retire` covers it.
+  A tracker that a window shares with a copy still live keeps its extent (a release never splits one). A window that
   cannot fit between the title's address reservations can use a separate mapped buffer. The buffer's device address
   must fit as a positive 47-bit offset from the arena base. The same window cap and dirty-page refresh apply.
   `LEONIDA_STREAM_BUFFER_WINDOWS=0` requires the window to fit in the arena.

@@ -150,7 +150,10 @@ void free_title_block(void* p) {
         const auto from = reinterpret_cast<uintptr_t>(p);
         const size_t bytes = size ? size : 1;
         leonida::title_memory_map::changed(p, bytes);
-        leonida::geometry_writes::note_released(from, from + bytes);
+        // The heap keeps a block's pages committed, unless the block was big enough to get pages of its own.
+        MEMORY_BASIC_INFORMATION info{};
+        const bool pages = bytes >= 0x10000 && VirtualQuery(p, &info, sizeof(info)) && info.State != MEM_COMMIT;
+        leonida::geometry_writes::note_released(from, from + bytes, pages);
     }
 }
 

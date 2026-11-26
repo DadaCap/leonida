@@ -21,6 +21,8 @@ struct ReleaseQueue {
     std::mutex mutex;
     host_heap::vector<std::pair<std::uintptr_t, std::uintptr_t>> ranges;
     std::atomic<bool> pending{false};
+    // Pages released or unmapped in [lo, hi) are queued here too, outside the geometry watch (watch_pages).
+    std::atomic<std::uintptr_t> lo{UINTPTR_MAX}, hi{0};
 };
 struct State {
     std::mutex mutex;
@@ -32,6 +34,8 @@ struct State {
     std::atomic<std::uintptr_t> watched_hi{0};
     std::mutex subscribers_mutex;
     host_heap::vector<ReleaseQueue*> subscribers;
+    // Union of every subscriber's own [lo, hi). Monotonic; updated under subscribers_mutex.
+    std::atomic<std::uintptr_t> pages_lo{UINTPTR_MAX}, pages_hi{0};
 };
 inline State& state() { static State s; return s; }
 
@@ -48,16 +52,26 @@ inline void unsubscribe(ReleaseQueue& queue) {
     std::erase(s.subscribers, &queue);
 }
 
+// The queue also takes the page releases and unmaps that reach [begin, end) (a title window's pages: the D3D12 layer
+// retires the window), whether or not a geometry view watches them. Monotonic, as the geometry watch's union is.
+inline void watch_pages(ReleaseQueue& queue, std::uintptr_t begin, std::uintptr_t end) {
+    if (end <= begin) return;
+    auto& s = state();
+    std::lock_guard lock(s.subscribers_mutex);
+    for (auto* lo : {&queue.lo, &s.pages_lo})
+        if (begin < lo->load(std::memory_order_relaxed)) lo->store(begin, std::memory_order_release);
+    for (auto* hi : {&queue.hi, &s.pages_hi})
+        if (end > hi->load(std::memory_order_relaxed)) hi->store(end, std::memory_order_release);
+}
+
 inline bool has_released(const ReleaseQueue& queue) {
     return queue.pending.load(std::memory_order_acquire);
 }
 
-// Records a title address range [begin, end) that was released or unmapped so every subscribed GeometryViews can
-// evict its views. Uses host_heap and separate leaf locks so xmem does not contend with the write-fault handler.
-// Lock order: subscribers_mutex -> queue.mutex; take_released takes only queue.mutex.
-inline void note_released(std::uintptr_t begin, std::uintptr_t end) {
+// Whether [begin, end) reaches a tile the geometry watch holds.
+inline bool geometry_watched(std::uintptr_t begin, std::uintptr_t end) {
     auto& s = state();
-    if (end <= begin || !s.count.load(std::memory_order_acquire)) return;
+    if (!s.count.load(std::memory_order_acquire)) return false;
     const std::uintptr_t lo = s.watched_lo.load(std::memory_order_acquire);
     const std::uintptr_t hi = s.watched_hi.load(std::memory_order_acquire);
     if (end <= lo || begin >= hi) {
@@ -65,13 +79,30 @@ inline void note_released(std::uintptr_t begin, std::uintptr_t end) {
         // CPU view (GeometryViews::drain_released maps it there).
         leonida::title_gpu_views::Range pair{};
         if (!leonida::title_gpu_views::view_at(begin, 1, pair) || begin < pair.gpu || begin - pair.gpu >= pair.size)
-            return;
+            return false;
         const std::uintptr_t cpu = pair.cpu + (begin - pair.gpu);
         const std::uintptr_t span = (std::min)(end - begin, pair.size - (begin - pair.gpu));
-        if (cpu + span <= lo || cpu >= hi) return;
+        if (cpu + span <= lo || cpu >= hi) return false;
     }
+    return true;
+}
+
+// Records a title address range [begin, end) that was released or unmapped so every subscribed GeometryViews can
+// evict its views, and a queue that watches those pages (watch_pages) retire what it made over them. `pages`: false
+// for a freed heap block, whose pages stay committed (only the geometry views take it). Uses host_heap and separate
+// leaf locks so xmem does not contend with the write-fault handler.
+// Lock order: subscribers_mutex -> queue.mutex; take_released takes only queue.mutex.
+inline void note_released(std::uintptr_t begin, std::uintptr_t end, bool pages = true) {
+    auto& s = state();
+    if (end <= begin) return;
+    const auto reaches = [&](const std::atomic<std::uintptr_t>& lo, const std::atomic<std::uintptr_t>& hi) {
+        return pages && begin < hi.load(std::memory_order_acquire) && lo.load(std::memory_order_acquire) < end;
+    };
+    const bool geometry = geometry_watched(begin, end);
+    if (!geometry && !reaches(s.pages_lo, s.pages_hi)) return;
     std::lock_guard subscribers_lock(s.subscribers_mutex);
     for (ReleaseQueue* q : s.subscribers) {
+        if (!geometry && !reaches(q->lo, q->hi)) continue;
         std::lock_guard lock(q->mutex);
         bool room = q->ranges.size() < 65536;
         if (!room) {

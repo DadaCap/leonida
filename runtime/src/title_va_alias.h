@@ -97,6 +97,21 @@ public:
         generation_.fetch_add(1, std::memory_order_release);
     }
 
+    // Forgets every range answered from inside one of `copies` ((shader VA, bytes), sorted by VA and apart): those
+    // copies went (title windows whose pages the title released), and with them every address entered to reach them.
+    void remove_copies(const std::vector<std::pair<std::uint64_t, std::uint64_t>>& copies) {
+        if (copies.empty() || !count_.load(std::memory_order_acquire)) return;
+        std::unique_lock lock(mutex_);
+        for (auto it = ranges_.begin(); it != ranges_.end();) {
+            const std::uint64_t va = it->second.shader_va;
+            auto at = std::upper_bound(copies.begin(), copies.end(), std::pair{va, UINT64_MAX});
+            if (at != copies.begin() && va - std::prev(at)->first < std::prev(at)->second) it = erase_at(it);
+            else ++it;
+        }
+        count_.store(ranges_.size(), std::memory_order_release);
+        generation_.fetch_add(1, std::memory_order_release);
+    }
+
     // The address a shader must be given for `va` from the ranges added so far: translated inside one, unchanged
     // elsewhere. No copy is made here.
     std::uint64_t shader_va(std::uint64_t va, std::uint64_t bytes = 1) const {
@@ -429,12 +444,14 @@ private:
             auto previous = std::prev(it);
             if (previous->second.end > begin) it = previous;
         }
-        while (it != ranges_.end() && it->first < end) {
-            notify(Change::removed, it->first, it->second.end - it->first, it->second.shader_va);
-            by_shader_.erase(it->second.shader_va, it->first);
-            note_removed(it->second.shader_va, it->second.end - it->first);
-            it = ranges_.erase(it);
-        }
+        while (it != ranges_.end() && it->first < end) it = erase_at(it);
+    }
+    // mutex_ held exclusively: the range goes, told as a removal.
+    std::map<std::uint64_t, Range>::iterator erase_at(std::map<std::uint64_t, Range>::iterator it) {
+        notify(Change::removed, it->first, it->second.end - it->first, it->second.shader_va);
+        by_shader_.erase(it->second.shader_va, it->first);
+        note_removed(it->second.shader_va, it->second.end - it->first);
+        return ranges_.erase(it);
     }
 
     // mutex_ held exclusively.
