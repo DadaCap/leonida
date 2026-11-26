@@ -6167,7 +6167,10 @@ HRESULT proxy_create_derived_pso(DeviceProxy* self, ID3D12PipelineState* base, s
     }
     auto record = PsoStreamRecord::derived(*base_record, std::move(patched));
     const auto desc = record->desc();
-    return create_pso_from_stream(self, &desc, riid, out, std::move(record));
+    creating_derived = true;
+    const HRESULT hr = create_pso_from_stream(self, &desc, riid, out, std::move(record));
+    creating_derived = false;
+    return hr;
 }
 
 // Xbox slot 101: CreateStateObject(desc, riid, out), forwarded to PC ID3D12Device5::CreateStateObject (PC slot 62,

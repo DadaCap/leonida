@@ -5,6 +5,9 @@
 // CPU and what the GPU address arena holds at the same VA (the shader's heap_base + VA), which T#s have a bindless
 // entry, and which render targets the present-probe should read back as well.
 
+#ifdef _WIN32
+#include "guarded_copy.h"
+#endif
 #include "title_va_alias.h"
 
 #include <array>
@@ -32,6 +35,22 @@ struct State {
     std::unordered_map<std::uint64_t, std::uint64_t> table_origin;  // translated table VA -> title VA
     std::unordered_map<std::uint64_t, std::pair<std::uint64_t, std::uint32_t>> cbv_origin;  // V# base -> location, size
 };
+
+// A title page can be guarded or released between the range check and the read, so the probe reads title bytes
+// through a fault guard: an unreadable page is reported as such, not fatal.
+inline bool read_title(void* to, std::uint64_t from, std::size_t bytes) {
+#ifdef _WIN32
+    __try {
+        guarded::copy(to, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(from)), bytes);
+        return true;
+    } __except (1) {
+        return false;
+    }
+#else
+    std::memcpy(to, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(from)), bytes);
+    return true;
+#endif
+}
 
 inline State& state() {
     static State s;
@@ -227,10 +246,8 @@ inline void describe_table(const char* tag, std::uint64_t va, std::uint32_t slot
                 std::uint64_t lo = 0, hi = 0;
                 std::uint32_t title_words[16]{};
                 const bool title_readable =
-                    title_va_aliases().title_memory(source, lo, hi) && hi - source >= sizeof title_words;
-                if (title_readable)
-                    std::memcpy(title_words, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(source)),
-                                sizeof title_words);
+                    title_va_aliases().title_memory(source, lo, hi) && hi - source >= sizeof title_words &&
+                    read_title(title_words, source, sizeof title_words);
                 const auto hook = backing_hook().load(std::memory_order_acquire);
                 std::fprintf(stderr, "[rt] fsdraw: %s   slot %u arena 0x%llx comes from title 0x%llx (alias range 0x%llx, "
                                      "%llu bytes; backing %s): title [%s]%s\n",

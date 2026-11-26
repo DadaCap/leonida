@@ -28,6 +28,8 @@ namespace rt::d3d12_xs {
 
 // The Vulkan parser selects the layout. Slot 55 keeps its canonical tags for subsequent derivation.
 inline thread_local bool used_console_stream = false;
+// LOCAL DIAGNOSTIC (fsdraw): set while a slot-55 derived PSO is created, so its description says so.
+inline thread_local bool creating_derived = false;
 constexpr unsigned pc_stream_type(unsigned raw, bool console) {
     return console && raw >= 23 && raw < 63 ? raw + 1 : raw;
 }
@@ -59,6 +61,7 @@ public:
 
     // The stream bytes. Its pointers refer to this record's copies, so the record must outlive any use of the desc.
     const std::vector<unsigned char>& bytes() const { return bytes_; }
+    bool is_derived() const { return derived_; }  // made by slot 55 (derived)
     // The PC runtime reads the stream and never writes it; the const_cast only meets the desc's void* member.
     D3D12_PIPELINE_STATE_STREAM_DESC desc() const {
         D3D12_PIPELINE_STATE_STREAM_DESC d{};
@@ -72,6 +75,7 @@ private:
     bool copy_pointed_data(std::size_t type, std::size_t payload_offset);
 
     std::vector<unsigned char> bytes_;
+    bool derived_ = false;
     struct Payloads {
         std::vector<std::vector<unsigned char>> blobs;  // owned copies; their buffers do not move when this grows
         std::vector<ShaderData> shaders;

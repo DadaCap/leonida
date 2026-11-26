@@ -2067,6 +2067,7 @@ private:
             note_direct_heap_indexing(graphics_.layout);
             draw.mesh = true;
             draw.depth_bounds = depth_bounds_;
+            fsdraw_indirect(true, args.max_count);
             request_draw_pipeline();
             const bool recorded = list_.draw_indirect(std::move(draw), args);
             if (recorded) stats::note(stats::Event::recorded);
@@ -2153,10 +2154,12 @@ private:
             const bool fullscreen = render_target_count_ >= 1 && count == 3 && viewport_.width >= 1000;
             if (fullscreen) leonida::fsdraw::note_target(render_targets_[0].resource);
             if (fsdraw && (first_seen || (n - 1) % 600 < 2 || (n > 2 && n < 9))) {
-                std::fprintf(stderr, "[rt] fsdraw: draw #%llu pso %p%s rt0 0x%llx rts %u depth 0x%llx count %u x%u: %s\n",
+                std::fprintf(stderr, "[rt] fsdraw: draw #%llu pso %p%s rt0 0x%llx rts %u depth 0x%llx mip %u layer %u "
+                                     "stencil ref %u/%u count %u x%u: %s\n",
                              static_cast<unsigned long long>(n), reinterpret_cast<const void*>(graphics_pipeline_),
                              first_seen ? " (first use)" : "", static_cast<unsigned long long>(render_targets_[0].resource),
-                             render_target_count_, static_cast<unsigned long long>(depth_.resource), count, instances,
+                             render_target_count_, static_cast<unsigned long long>(depth_.resource), depth_.mip,
+                             depth_.first_layer, front_stencil_ref_, back_stencil_ref_, count, instances,
                              leonida::fsdraw::pipeline(graphics_pipeline_).c_str());
                 std::fprintf(stderr, "[rt] fsdraw: draw #%llu layout %p user data [%s] cbv heap %p base 0x%llx sampler "
                                      "base 0x%llx tables %zu\n",
@@ -2212,6 +2215,30 @@ private:
         record_raster_draw(indexed, count, instances, first, base_vertex, first_instance);
     }
 
+    // LOCAL DIAGNOSTIC (fsdraw): record_draw's line misses indirect draws and mesh draws, so they get their own at a
+    // pipeline's first use and every 600th call.
+    void fsdraw_indirect(bool mesh, std::uint32_t max_count) {
+        if (!leonida::fsdraw::enabled()) return;
+        static std::mutex seen_mutex;
+        static std::set<std::uintptr_t> seen;
+        static std::atomic<std::uint64_t> calls{0};
+        const std::uint64_t n = ++calls;
+        bool first_seen;
+        {
+            std::lock_guard lock(seen_mutex);
+            first_seen = seen.insert(graphics_pipeline_).second;
+        }
+        if (!first_seen && n % 600) return;
+        std::fprintf(stderr, "[rt] fsdraw: indirect %s #%llu pso %p%s rt0 0x%llx rts %u depth 0x%llx mip %u "
+                             "stencil ref %u/%u max %u viewport %.0fx%.0f: %s\n",
+                     mesh ? "mesh" : "draw", static_cast<unsigned long long>(n),
+                     reinterpret_cast<const void*>(graphics_pipeline_), first_seen ? " (first use)" : "",
+                     static_cast<unsigned long long>(render_targets_[0].resource), render_target_count_,
+                     static_cast<unsigned long long>(depth_.resource), depth_.mip, front_stencil_ref_, back_stencil_ref_,
+                     unsigned(max_count), viewport_.width, viewport_.height,
+                     leonida::fsdraw::pipeline(graphics_pipeline_).c_str());
+    }
+
     // The same bindings and dynamic state must be frozen at the call for both APIs. Only the source of the
     // draw arguments differs: values here for a direct draw, or a GPU buffer read later at execution.
     void record_raster_draw(bool indexed, UINT count, UINT instances, UINT first, INT base_vertex, UINT first_instance,
@@ -2219,6 +2246,7 @@ private:
         leonida::Draw draw{graphics_pipeline_, graphics_user_data(), draw_views(), depth_, index_, topology_, viewport_,
                            scissor_, blend_factor_, front_stencil_ref_, back_stencil_ref_, indexed, count, instances,
                            first, base_vertex, first_instance};
+        if (indirect) fsdraw_indirect(false, indirect->max_count);
         draw.viewports = draw_viewports();
         draw.depth_bounds = depth_bounds_;
         request_draw_pipeline();

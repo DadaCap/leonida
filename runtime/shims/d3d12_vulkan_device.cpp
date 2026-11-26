@@ -11319,7 +11319,9 @@ public:
                 const auto* record=rt::d3d12_xs::find_pso_record(this);
                 PipelineStream stream{};
                 HRESULT hr=record?parse_pipeline_stream(record->desc(),stream):E_INVALIDARG;
+                rt::d3d12_xs::creating_derived=record && record->is_derived();  // fsdraw's description says so
                 if(SUCCEEDED(hr))hr=stream.has_cs?create_compute(stream.compute):create_graphics(stream.graphics,&stream.ms,&stream.as);
+                rt::d3d12_xs::creating_derived=false;
             });
         }
         return registered_ && (is_graphics_==graphics);
@@ -12119,11 +12121,13 @@ public:
         }
         if (leonida::fsdraw::enabled()) {  // LOCAL DIAGNOSTIC: what this pipeline is, for the fsdraw probe's draw lines
             const auto& rt0 = desc.BlendState.RenderTarget[0];
-            char text[640];
+            char text[1024];
             std::snprintf(text, sizeof text,
                           "vs %s (fssm %.16s) ps %s (fssm %.16s) rootsig %p rts %u fmt0 %d fmt1 %d dsv %d depth %d "
                           "blend0 en %d src %d dst %d op %d srcA %d dstA %d opA %d logic %d wm 0x%x alpha2cov %d "
-                          "independent %d sample_mask 0x%x cull %d fill %d topo %d samples %u",
+                          "independent %d sample_mask 0x%x cull %d fill %d topo %d samples %u "
+                          "dfunc %d dwrite %d stencil %d sfunc %d/%d spass %d/%d smask 0x%x/0x%x "
+                          "back smask 0x%x/0x%x dbounds %d derived %d lazy %d",
                           stages[0].entry ? stages[0].entry->name.c_str() : "-",
                           stages[0].entry ? stages[0].entry->fssm_sha256.c_str() : "-",
                           stages[2].entry ? stages[2].entry->name.c_str() : "-",
@@ -12135,7 +12139,17 @@ public:
                           unsigned(rt0.RenderTargetWriteMask), int(desc.BlendState.AlphaToCoverageEnable),
                           int(desc.BlendState.IndependentBlendEnable), unsigned(desc.SampleMask),
                           int(desc.RasterizerState.CullMode), int(desc.RasterizerState.FillMode),
-                          int(desc.PrimitiveTopologyType), desc.SampleDesc.Count);
+                          int(desc.PrimitiveTopologyType), desc.SampleDesc.Count,
+                          int(desc.DepthStencilState.DepthFunc), int(desc.DepthStencilState.DepthWriteMask),
+                          int(desc.DepthStencilState.StencilEnable), int(desc.DepthStencilState.FrontFace.StencilFunc),
+                          int(desc.DepthStencilState.BackFace.StencilFunc),
+                          int(desc.DepthStencilState.FrontFace.StencilPassOp),
+                          int(desc.DepthStencilState.BackFace.StencilPassOp),
+                          unsigned(desc.DepthStencilState.StencilReadMask),
+                          unsigned(desc.DepthStencilState.StencilWriteMask),
+                          back_masks ? unsigned(back_masks->read) : unsigned(desc.DepthStencilState.StencilReadMask),
+                          back_masks ? unsigned(back_masks->write) : unsigned(desc.DepthStencilState.StencilWriteMask),
+                          int(depth_bounds), int(rt::d3d12_xs::creating_derived), int(lazy_));
             leonida::fsdraw::note_pipeline(id(), text);
         }
         if (device_.info.device_checkpoints) {
@@ -12846,6 +12860,9 @@ private:
             return VK_NULL_HANDLE;
         }
         variants_.emplace(unbound, pipeline);
+        if (leonida::fsdraw::enabled())  // LOCAL DIAGNOSTIC: each variant with the description it was built from
+            std::fprintf(stderr, "[rt] fsdraw: pso %p variant %u (%s) built: %s\n",
+                         reinterpret_cast<const void*>(id()), unbound, trigger, leonida::fsdraw::pipeline(id()).c_str());
         return pipeline;
     }
 

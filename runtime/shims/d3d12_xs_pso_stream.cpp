@@ -274,6 +274,7 @@ std::unique_ptr<PsoStreamRecord> PsoStreamRecord::derived(const PsoStreamRecord&
     std::unique_ptr<PsoStreamRecord> record(new PsoStreamRecord());
     record->bytes_ = std::move(stream);
     record->payloads_ = base.payloads_;
+    record->derived_ = true;
     return record;
 }
 

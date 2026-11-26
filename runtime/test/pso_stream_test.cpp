@@ -154,6 +154,8 @@ void test_derive_single_and_all_tags() {
     const std::size_t bp = payload_of_type(out, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND);
     check(std::memcmp(out.data() + bp, &blend, sizeof(blend)) == 0, "tag 2 payload lands in the BLEND subobject");
     check(out.size() == rec->bytes().size(), "derived stream keeps the base size");
+    check(!rec->is_derived() && rt::d3d12_xs::PsoStreamRecord::derived(*rec, out)->is_derived(),
+          "a slot-55 record says it is derived, a captured one does not");
 
     D3D12_RASTERIZER_DESC raster{};
     raster.FillMode = D3D12_FILL_MODE_WIREFRAME;
