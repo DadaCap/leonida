@@ -109,6 +109,51 @@ class RunnerTest(unittest.TestCase):
                 self.assertIn("1 files, 1 tests, 0 files failed", result.stdout)
                 self.assertNotIn("no tests ran", result.stdout)
 
+    def test_a_successful_exit_without_a_unittest_result_fails_the_run(self):
+        # A module aborts the child before unittest can run the suite or report a result.
+        early_exit = "import os\nprint('before-exit', flush=True)\nos._exit(0)\n"
+        for jobs in (1, 2):
+            with self.subTest(jobs=jobs), tempfile.TemporaryDirectory() as tmp:
+                suite(tmp, {"helper.py": "X = 1\n", "test_abort.py": early_exit, "test_ok.py": PASS})
+                result = cli(tmp, "-j", str(jobs))
+                out = result.stdout + result.stderr
+                self.assertEqual(result.returncode, 1, out)
+                self.assertIn("before-exit", out)
+                self.assertIn("exited without a unittest result", out)
+                if jobs == 2:
+                    self.assertIn("==== FAILED: test_abort", out)
+                    self.assertIn("2 files, 2 tests, 1 files failed", out)
+
+    def test_parallel_worker_exit_mid_test_fails_even_when_another_module_passes(self):
+        abort_mid_test = (
+            "import os, unittest\n"
+            "class AbruptExit(unittest.TestCase):\n"
+            "    def test_exits_after_starting(self):\n"
+            "        print('mid-test-exit', flush=True)\n"
+            "        os._exit(0)\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            suite(tmp, {"helper.py": "X = 1\n", "test_abort.py": abort_mid_test, "test_ok.py": PASS})
+            result = cli(tmp, "-j", "2")
+            out = result.stdout + result.stderr
+            self.assertEqual(result.returncode, 1, out)
+            self.assertIn("mid-test-exit", out)
+            self.assertIn("==== FAILED: test_abort", out)
+            self.assertIn("exited without a unittest result", out)
+            self.assertIn("2 files, 2 tests, 1 files failed", out)
+
+    def test_successful_process_exit_does_not_hide_a_failed_unittest_result(self):
+        # This module fails a test; its teardown of the process must not erase the result.
+        late_exit = "import atexit, os\natexit.register(lambda: os._exit(0))\n" + FAIL
+        for jobs in (1, 2):
+            with self.subTest(jobs=jobs), tempfile.TemporaryDirectory() as tmp:
+                suite(tmp, {"helper.py": "X = 1\n", "test_ok.py": PASS, "test_wrong.py": late_exit})
+                result = cli(tmp, "-j", str(jobs))
+                out = result.stdout + result.stderr
+                self.assertEqual(result.returncode, 1, out)
+                self.assertIn("boom-msg", out)
+                self.assertIn("exited with status 0 but unittest reported 1", out)
+
     def test_serial_timeout_keeps_discover_output_and_names_the_suite(self):
         with tempfile.TemporaryDirectory() as tmp:
             suite(tmp, {"test_hang.py": HANG})
