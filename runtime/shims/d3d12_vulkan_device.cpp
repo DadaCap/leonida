@@ -7682,7 +7682,8 @@ struct DeviceState {
     VkDeviceMemory allocate(const VkMemoryRequirements& requirements, VkMemoryPropertyFlags required,
                             VkMemoryPropertyFlags preferred, VkMemoryPropertyFlags* chosen = nullptr,
                             bool device_address = false, std::uint32_t* chosen_type = nullptr,
-                            VkImage dedicated_image = VK_NULL_HANDLE) const {
+                            VkImage dedicated_image = VK_NULL_HANDLE,
+                            float priority = leonida::kMemoryPriorityDefault) const {
         VkMemoryAllocateFlagsInfo flags_info{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
         flags_info.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
         for (const std::uint32_t i :
@@ -7694,6 +7695,12 @@ struct DeviceState {
                 dedicated.image = dedicated_image;
                 dedicated.pNext = allocate.pNext;
                 allocate.pNext = &dedicated;
+            }
+            VkMemoryPriorityAllocateInfoEXT order{VK_STRUCTURE_TYPE_MEMORY_PRIORITY_ALLOCATE_INFO_EXT};
+            if (info.memory_priority) {
+                order.priority = priority;
+                order.pNext = allocate.pNext;
+                allocate.pNext = &order;
             }
             allocate.allocationSize = requirements.size;
             allocate.memoryTypeIndex = i;
@@ -9248,7 +9255,8 @@ public:
                     return E_OUTOFMEMORY;
                 }
                 if (!retry) {
-                    memory_ = device_.allocate(requirements, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &memory_flags_);
+                    memory_ = device_.allocate(requirements, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &memory_flags_, false,
+                                               nullptr, VK_NULL_HANDLE, memory_priority());
                     if (memory_ && vk.vkBindImageMemory(device_.info.device, image_, memory_, 0) == VK_SUCCESS) break;
                     if (memory_) { vk.vkFreeMemory(device_.info.device, memory_, nullptr); memory_ = VK_NULL_HANDLE; }
                     retry = host_transfer_;  // a failed allocation/bind retries on the staging path too
@@ -9389,6 +9397,13 @@ private:
         return true;
     }
 
+    float memory_priority() const {
+        constexpr D3D12_RESOURCE_FLAGS written = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
+                                                 D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
+                                                 D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        return desc_.Flags & written ? leonida::kMemoryPriorityAttachment : leonida::kMemoryPriorityTexture;
+    }
+
     bool bind_texture_memory(bool stream, std::uint32_t allowed_types, VkMemoryRequirements& requirements,
                              std::uint32_t& type) {
         auto& vk = device_.context->vk;
@@ -9412,7 +9427,8 @@ private:
                         auto page = pool_requirements;
                         page.size = size;
                         leonida::memory_breakdown::Owner owner(leonida::memory_breakdown::Consumer::image_blocks);
-                        return device_.allocate(page, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, nullptr, false, &type);
+                        return device_.allocate(page, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, nullptr, false, &type,
+                                                VK_NULL_HANDLE, leonida::kMemoryPriorityTexture);
                     });
                 if (pooled_image_) memory_flags_ = device_.memory.memoryTypes[pooled_image_->page->type].propertyFlags;
             }
@@ -9424,7 +9440,8 @@ private:
             auto selected = requirements;
             selected.memoryTypeBits &= allowed_types;
             memory_ = device_.allocate(selected, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &memory_flags_, false,
-                                       &type, dedicated.requiresDedicatedAllocation ? image_ : VK_NULL_HANDLE);
+                                       &type, dedicated.requiresDedicatedAllocation ? image_ : VK_NULL_HANDLE,
+                                       memory_priority());
         }
         if (!pooled_image_ && (!memory_ || vk.vkBindImageMemory(device_.info.device, image_, memory_, 0) != VK_SUCCESS)) {
             if (memory_) vk.vkFreeMemory(device_.info.device, memory_, nullptr);
@@ -15127,7 +15144,8 @@ public:
         {
             leonida::memory_breakdown::Owner owner(leonida::memory_breakdown::Consumer::arena);
             arena.memory = state_.allocate(requirements, leonida::kArenaRequiredMemory,
-                                           leonida::kArenaPreferredMemory, nullptr, true, &arena.memory_type);
+                                           leonida::kArenaPreferredMemory, nullptr, true, &arena.memory_type,
+                                           VK_NULL_HANDLE, leonida::kMemoryPriorityArena);
         }
         void* mapped = nullptr;
         if (!arena.memory || vk.vkBindBufferMemory(state_.info.device, arena.buffer, arena.memory, 0) != VK_SUCCESS ||
@@ -21983,6 +22001,37 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
             *v13.next() = &min_lod;
         }
     }
+    // LEONIDA_MEMORY_PRIORITY=0 leaves both off. Pageable memory is what lets NVIDIA's and AMD's Windows drivers move
+    // single allocations out by priority.
+    const auto has_extension = [&](const char* name) {
+        return std::any_of(extensions.begin(), extensions.end(),
+                           [&](const auto& e) { return std::strcmp(e.extensionName, name) == 0; });
+    };
+    VkPhysicalDeviceMemoryPriorityFeaturesEXT priority_features{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PRIORITY_FEATURES_EXT};
+    VkPhysicalDevicePageableDeviceLocalMemoryFeaturesEXT pageable_features{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PAGEABLE_DEVICE_LOCAL_MEMORY_FEATURES_EXT};
+    const char* priority_setting = std::getenv("LEONIDA_MEMORY_PRIORITY");
+    bool pageable_memory = false;
+    if (!(priority_setting && *priority_setting == '0') && has_extension(VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME)) {
+        pageable_memory = has_extension(VK_EXT_PAGEABLE_DEVICE_LOCAL_MEMORY_EXTENSION_NAME);
+        if (pageable_memory) priority_features.pNext = &pageable_features;
+        VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &priority_features};
+        vkGetPhysicalDeviceFeatures2(info.physical, &query);
+        info.memory_priority = priority_features.memoryPriority == VK_TRUE;
+        pageable_memory = info.memory_priority && pageable_features.pageableDeviceLocalMemory;
+        priority_features.pNext = nullptr;
+        if (pageable_memory) {
+            pageable_features.pNext = *v13.next();
+            *v13.next() = &pageable_features;
+        }
+        if (info.memory_priority) {
+            priority_features.pNext = *v13.next();
+            *v13.next() = &priority_features;
+        }
+        std::fprintf(stderr, "[rt] d3d12: memory priority %s, pageable device-local memory %s\n",
+                     info.memory_priority ? "on" : "off", pageable_memory ? "on" : "off");
+    }
     const char* divisor_extension = nullptr;
     for (const char* name :
          {VK_KHR_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME, VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME}) {
@@ -22302,6 +22351,8 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     if (info.vertex_attribute_divisor) device_extensions.push_back(divisor_extension);
     if (info.conditional_rendering) device_extensions.push_back(conditional_extension);
     if (info.host_image_copy) device_extensions.push_back(host_image_copy_name);
+    if (info.memory_priority) device_extensions.push_back(VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME);
+    if (pageable_memory) device_extensions.push_back(VK_EXT_PAGEABLE_DEVICE_LOCAL_MEMORY_EXTENSION_NAME);
     if (info.sliced_3d_uav) device_extensions.push_back(sliced_name);
     if (info.fragment_shader_barycentric)
         device_extensions.push_back(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);

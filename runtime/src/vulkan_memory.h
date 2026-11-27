@@ -56,6 +56,13 @@ inline std::vector<std::uint32_t> memory_type_order(const VkPhysicalDeviceMemory
     return order;
 }
 
+// VK_EXT_memory_priority: what the driver moves to system memory first when VRAM is full. What the GPU writes stays
+// longest; a streamed texture, which has its bytes in the title's memory too, goes first.
+inline constexpr float kMemoryPriorityAttachment = 1.0f;
+inline constexpr float kMemoryPriorityArena = 0.75f;
+inline constexpr float kMemoryPriorityDefault = 0.5f;
+inline constexpr float kMemoryPriorityTexture = 0.25f;
+
 // The size of the blocks that textures share (image_memory.h): 64 MiB, or a sixteenth of a small heap, such as the BAR
 // window of a GPU without Resizable BAR. A texture larger than an eighth of a block has its own allocation.
 inline VkDeviceSize image_block_bytes(VkDeviceSize heap) {

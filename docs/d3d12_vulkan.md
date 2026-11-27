@@ -3357,6 +3357,9 @@ The console has two list topologies Vulkan lacks: rectangle list (`IASetPrimitiv
   `LEONIDA_TITLE_IMAGE_STAGING=0`
   restores the original placement policy. With `LEONIDA_MEM_PROBE`, each title image class logs its
   Vulkan memory type mask, mask without host transfer, and selected type.
+- With `VK_EXT_memory_priority` (and `VK_EXT_pageable_device_local_memory` where the driver has it) images the GPU
+  writes are allocated at priority 1, the arena at 0.75 and sampled title textures at 0.25, so the driver moves the
+  textures out of full VRAM first. `LEONIDA_MEMORY_PRIORITY=0` leaves both off.
 - `WriteToSubresource`/`ReadFromSubresource` (implemented in `d3d12_vulkan_device.cpp`) complete before they
   return, as D3D12 requires; a read cannot wait for a later submit. Textures in CPU-visible custom heaps are
   created with `VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT` when the device supports that usage with the requested

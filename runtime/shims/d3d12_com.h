@@ -168,6 +168,7 @@ struct VulkanDeviceInfo {
     // are only zero or non-zero; without pipelineStatisticsQuery, pipeline-statistics query heaps are refused.
     bool occlusion_query_precise = false;
     bool prepare_on_bind = false;
+    bool memory_priority = false;  // VK_EXT_memory_priority
     bool cold_graphics_compile = false;  // Driver supports a cache-only create and reports when compilation is pending.
     // pipelineCreationCacheControl is on for the heavy pipeline cache (src/heavy_pipeline_cache.h): a pipeline the
     // offline cache does not have is created against the cache of pipeline_cache.heavy.bin, written back as it grows.
