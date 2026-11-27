@@ -522,10 +522,12 @@ struct WriteBack {
     ID3D12Resource* out;
     ID3D12DescriptorHeap* heap;
     UINT64 gpu;
+    ID3D12CommandQueue* queue = nullptr;  // the context's when null
 };
 
-// One submission that dispatches through a root UAV at `va` and waits for it. False on a failed call.
-int submit_write(WriteBack& s, std::uint64_t va) {
+// One submission that dispatches through a root UAV at `va` and waits for it. With `wait` false it is only executed
+// (no signal: the caller knows when it is done). False on a failed call.
+int submit_write(WriteBack& s, std::uint64_t va, bool wait = true) {
     EXPECT(s.allocator->Reset() == S_OK);
     EXPECT(s.list->Reset(s.allocator, s.c->pso) == S_OK);
     ID3D12DescriptorHeap* heaps[] = {s.heap};
@@ -545,9 +547,11 @@ int submit_write(WriteBack& s, std::uint64_t va) {
     s.list->ResourceBarrier(1, &to_copy);
     EXPECT(s.list->Close() == S_OK);
     ID3D12CommandList* lists[] = {s.list};
-    s.c->queue->ExecuteCommandLists(1, lists);
-    EXPECT(rt::d3d12::last_execute_result(s.c->queue) == leonida::ReplayResult::success);
-    EXPECT(SUCCEEDED(s.c->queue->Signal(s.c->fence, ++s.c->fence_value)));
+    ID3D12CommandQueue* queue = s.queue ? s.queue : s.c->queue;
+    queue->ExecuteCommandLists(1, lists);
+    EXPECT(rt::d3d12::last_execute_result(queue) == leonida::ReplayResult::success);
+    if (!wait) return 0;
+    EXPECT(SUCCEEDED(queue->Signal(s.c->fence, ++s.c->fence_value)));
     s.c->fence->SetEventOnCompletion(s.c->fence_value, nullptr);  // a null event waits, as D3D12 does
     return 0;
 }
@@ -1048,6 +1052,99 @@ int read_root(Reader& r, std::uint64_t va, const std::uint32_t* words, UINT& mat
     return 0;
 }
 
+// What the GPU wrote in a window goes back to the title's pages when the window is retired before that submission
+// has run: its copy stays a target of its pages' tracker until the submissions that may name it have completed and
+// been copied back, and goes back only where the live copy over the same pages changed nothing. The writing
+// submission waits on a fence only the CPU signals, so it is still queued when the next one's refresh retires the
+// window (the title placed a slot-133 buffer over its pages meanwhile).
+int check_retired_window_write_back(Context& c) {
+    auto& aliases = leonida::title_va_aliases();
+    const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
+    const auto uav = buffer_desc(kBytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    Ref<ID3D12Resource> out;
+    EXPECT(SUCCEEDED(c.device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &uav,
+                                                       D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+                                                       IID_PPV_ARGS(&out.p))));
+    D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 8,
+                                         D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    Ref<ID3D12DescriptorHeap> heap;
+    EXPECT(SUCCEEDED(c.device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&heap.p))));
+    Ref<ID3D12CommandAllocator> allocators[2];
+    Ref<ID3D12GraphicsCommandList> lists[2];
+    for (int i = 0; i < 2; ++i) {
+        EXPECT(SUCCEEDED(c.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                          IID_PPV_ARGS(&allocators[i].p))));
+        EXPECT(SUCCEEDED(c.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocators[i].p, c.pso,
+                                                     IID_PPV_ARGS(&lists[i].p))));
+        EXPECT(lists[i]->Close() == S_OK);
+    }
+    Ref<ID3D12Fence> gate, held_done;
+    EXPECT(SUCCEEDED(c.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gate.p))));
+    EXPECT(SUCCEEDED(c.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&held_done.p))));
+    // The held submission's own queue: a queue holds what follows a Wait until it is signalled, so the next
+    // submission, whose refresh retires the window, runs on the context's.
+    const D3D12_COMMAND_QUEUE_DESC queue_desc{D3D12_COMMAND_LIST_TYPE_DIRECT};
+    Ref<ID3D12CommandQueue> gated;
+    EXPECT(SUCCEEDED(c.device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&gated.p))));
+    const UINT64 gpu = reinterpret_cast<XboxHeapHandleFn>(slot(heap.p, 10))(heap.p);
+    WriteBack held{&c, allocators[0].p, lists[0].p, out.p, heap.p, gpu, gated.p};
+    WriteBack next{&c, allocators[1].p, lists[1].p, out.p, heap.p, gpu};
+    const std::uint64_t arena_va = out->GetGPUVirtualAddress();  // not the title's memory: nothing to copy back
+    // Pages no range answers for yet: a range of a buffer the tests before this one placed can outlive the buffer at
+    // an address the ring might get again, so such pages are kept aside until the end.
+    constexpr UINT64 ring_bytes = 128 * 1024;
+    std::vector<void*> taken;
+    std::uint32_t* ring = nullptr;
+    for (int tries = 0; tries < 32 && !ring; ++tries) {
+        void* pages = VirtualAlloc(nullptr, ring_bytes, MEM_TOP_DOWN | MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        EXPECT(pages);
+        const auto at = reinterpret_cast<std::uint64_t>(pages);
+        if (aliases.shader_va(at) == at && aliases.shader_va(at + ring_bytes - 1) == at + ring_bytes - 1)
+            ring = static_cast<std::uint32_t*>(pages);
+        else
+            taken.push_back(pages);
+    }
+    EXPECT(ring);
+    const auto ring_va = reinterpret_cast<std::uint64_t>(ring);
+    for (UINT i = 0; i < ring_bytes / 4; ++i) ring[i] = 0;
+    aliases.add_title_memory(ring_va, ring_bytes);
+
+    // Held on the GPU: it writes the ring's window once the gate opens.
+    const auto empty = rt::d3d12::title_windows(c.inner);
+    EXPECT(SUCCEEDED(gated->Wait(gate.p, 1)));
+    EXPECT(submit_write(held, ring_va, false) == 0);
+    EXPECT(SUCCEEDED(gated->Signal(held_done.p, 1)));
+    const std::uint64_t window = aliases.shader_va(ring_va);
+    const auto before = rt::d3d12::title_windows(c.inner);
+    EXPECT(window != ring_va && before.count == empty.count + 1);
+    Ref<ID3D12Resource> placed;
+    EXPECT(SUCCEEDED(rt::d3d12::create_buffer_at_host_address(c.inner, ring, buffer_desc(ring_bytes), 0xFFFFFFFFu,
+                                                              IID_PPV_ARGS(&placed.p))));
+    EXPECT(!aliases.answers_into(window, 1));
+    EXPECT(submit_write(next, arena_va, false) == 0);  // its refresh retires the window, its write still queued
+    const auto retired = rt::d3d12::title_windows(c.inner);
+    EXPECT(retired.retired == before.retired + 1 && retired.waiting >= 1);
+    EXPECT(held_done->GetCompletedValue() == 0);  // the write has not run yet
+    EXPECT(SUCCEEDED(gate->Signal(1)));
+    EXPECT(SUCCEEDED(held_done->SetEventOnCompletion(1, nullptr)));
+    EXPECT(submit_write(next, arena_va) == 0);  // its refresh copies back what the held one wrote
+    UINT written = 0;
+    for (UINT i = 0; i < kElements; ++i) written += ring[i] != 0;
+    EXPECT(submit_write(next, arena_va) == 0);
+    const auto freed = rt::d3d12::title_windows(c.inner);
+    std::printf("retired window write back: %u of %u words the held submission wrote reached the title's pages; %llu "
+                "retired windows wait for the GPU\n",
+                written, kElements, static_cast<unsigned long long>(freed.waiting));
+    EXPECT(written > 0);
+    EXPECT(freed.waiting == 0);
+
+    placed.reset();
+    aliases.remove_title_memory(ring_va);
+    VirtualFree(ring, 0, MEM_RELEASE);
+    for (void* pages : taken) VirtualFree(pages, 0, MEM_RELEASE);
+    return 0;
+}
+
 // No window is left that nothing reaches (RT-TITLE-WINDOW-RETIRE). A range entered over a live one replaces it whole,
 // so a mapping made over bytes another one serves left that one's copy answered by nothing, still refreshed and
 // charged to LEONIDA_TITLE_WINDOWS_MB. First a stream pool: a request just before an extent the pool already has gets
@@ -1122,6 +1219,35 @@ int check_window_orphans(Context& c) {
     EXPECT(matched == kElements);
     EXPECT(rt::d3d12::title_windows(c.inner).count == pooled.count);
 
+    // A view whose bytes run from the second extent into the first gets one mapping for all of them, over both, never
+    // one that stops at the first one's start: a V# with too few bytes is refused, and a root view would reach past
+    // its copy into whatever the arena holds next. Both extents are retired at the next submission, and the GPU
+    // reads the title's bytes across the seam.
+    const UINT inc = c.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    const std::uint64_t cbv = reinterpret_cast<XboxHeapHandleFn>(slot(heap.p, 9))(heap.p) + inc;
+    constexpr UINT64 seam = later - 0x8000, seam_bytes = 0x10000;  // 32 KiB on each side of the first extent's start
+    const D3D12_CONSTANT_BUFFER_VIEW_DESC crossing{gpu_va + seam, UINT(seam_bytes)};
+    c.device->CreateConstantBufferView(&crossing, D3D12_CPU_DESCRIPTOR_HANDLE{cbv});
+    const std::uint64_t covered = aliases.shader_va(gpu_va + seam, seam_bytes);
+    const auto merged = rt::d3d12::title_windows(c.inner);
+    std::printf("window orphans: a 64 KiB view across the two extents' seam got V# base 0x%llx (%s), one mapping of "
+                "%llu KiB over both\n",
+                static_cast<unsigned long long>(vsharp_base(cbv)),
+                covered != gpu_va + seam ? "all its bytes in one copy" : "no copy holds them all",
+                static_cast<unsigned long long>((merged.bytes - pooled.bytes) >> 10));
+    EXPECT(covered != gpu_va + seam && vsharp_base(cbv) == (covered & 0xFFFFFFFFFFFFull));
+    EXPECT(aliases.shader_va(cpu_va + seam, seam_bytes) == covered);
+    EXPECT(merged.count == pooled.count + 1 && merged.bytes - pooled.bytes == pool_bytes - earlier);
+    EXPECT(aliases.shader_va(cpu_va + later) == covered + (later - seam));
+    EXPECT(aliases.shader_va(gpu_va + earlier) == covered - (seam - earlier));
+    EXPECT(read_root(r, gpu_va + later - 0x180, pool + (later - 0x180) / 4, matched) == 0);  // 512 bytes over it
+    EXPECT(matched == kElements);
+    const auto settled = rt::d3d12::title_windows(c.inner);
+    EXPECT(settled.retired == merged.retired + 2 && settled.count == merged.count - 2);
+    EXPECT(settled.bytes == pooled.bytes);
+    EXPECT(read_root(r, cpu_va + earlier, pool + earlier / 4, matched) == 0);
+    EXPECT(matched == kElements);
+
     // A 128 KiB constant ring: a window for its first page, then a buffer the title places over the whole ring.
     constexpr UINT64 ring_bytes = 128 * 1024;
     auto* ring = static_cast<std::uint32_t*>(
@@ -1134,8 +1260,8 @@ int check_window_orphans(Context& c) {
     EXPECT(matched == kElements);
     const auto windowed = rt::d3d12::title_windows(c.inner);
     const std::uint64_t window = aliases.shader_va(ring_va);
-    EXPECT(windowed.count == pooled.count + 1 && window != ring_va);
-    const std::uint64_t window_bytes = windowed.bytes - pooled.bytes;
+    EXPECT(windowed.count == settled.count + 1 && window != ring_va);
+    const std::uint64_t window_bytes = windowed.bytes - settled.bytes;
     Ref<ID3D12Resource> placed;
     EXPECT(SUCCEEDED(rt::d3d12::create_buffer_at_host_address(c.inner, ring, buffer_desc(ring_bytes), 0xFFFFFFFFu,
                                                               IID_PPV_ARGS(&placed.p))));
@@ -1548,6 +1674,7 @@ int main(int argc, char** argv) {
         }
         if (window_orphans) {
             if (check_window_orphans(c)) return 1;
+            if (check_retired_window_write_back(c)) return 1;
             if (d.validation_errors()) {
                 std::fprintf(stderr, "%u validation errors\n", d.validation_errors());
                 return 1;

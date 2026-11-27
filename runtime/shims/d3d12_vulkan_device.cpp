@@ -454,22 +454,39 @@ public:
             if (!held((at - first_) / kPage)) {
                 const std::uintptr_t a = std::max(at, from), b = std::min(at + pages * kPage, to);
                 bool opened = false;
-                for (const Target& t : targets_) {
-                    const std::uintptr_t x = std::max(a, t.begin), y = std::min(b, t.end);
-                    if (x >= y || !t.shadow) continue;
-                    for (std::uintptr_t c = x; c < y;) {
-                        const std::uintptr_t e = std::min(y, (c + kPiece) & ~(kPiece - 1));
-                        const std::uint8_t* copy = t.shadow + (c - t.begin);
-                        if (std::memcmp(reinterpret_cast<const void*>(c), copy, e - c) != 0) {
+                std::vector<const Target*> over;  // the targets with bytes in [a, b)
+                for (const Target& t : targets_)
+                    if (t.shadow && std::max(a, t.begin) < std::min(b, t.end)) over.push_back(&t);
+                // Piece by piece, against the title's bytes as they were before any copy went back here: a copy that
+                // still holds them is not written over another's result. A retired window's copy (retire_target)
+                // goes back only where no live copy changed the piece: what a submission wrote in it is older than
+                // what a live copy holds (the range that replaced it serves every submission recorded since).
+                for (std::uintptr_t c = a; c < b && !over.empty();) {
+                    const std::uintptr_t e = std::min(b, (c + kPiece) & ~(kPiece - 1));
+                    std::uint8_t before[kPiece];
+                    bool saved = false, live = false;
+                    for (int pass = 0; pass < 2 && !live; ++pass)
+                        for (const Target* t : over) {
+                            if (t->retired != (pass == 1)) continue;
+                            const std::uintptr_t x = std::max(c, t->begin), y = std::min(e, t->end);
+                            if (x >= y) continue;
+                            const std::uint8_t* copy = t->shadow + (x - t->begin);
+                            const void* now = saved ? static_cast<const void*>(before + (x - c))
+                                                    : reinterpret_cast<const void*>(x);
+                            if (std::memcmp(now, copy, y - x) == 0) continue;
+                            if (!saved) {
+                                std::memcpy(before, reinterpret_cast<const void*>(c), e - c);
+                                saved = true;
+                            }
                             if (!opened) {
                                 reopen_locked(at, at + pages * kPage);
                                 opened = true;
                             }
-                            std::memcpy(reinterpret_cast<void*>(c), copy, e - c);
-                            written += e - c;
+                            std::memcpy(reinterpret_cast<void*>(x), copy, y - x);
+                            written += y - x;
+                            live = live || pass == 0;
                         }
-                        c = e;
-                    }
+                    c = e;
                 }
             }
             at += pages * kPage;
@@ -835,6 +852,18 @@ public:
                 });
             va += n;
         }
+    }
+
+    // Under shadow_mutex: `shadow` is a retired window's copy (retire_orphan_windows). It is still refreshed, so it
+    // never holds bytes older than the title's but what the GPU wrote in it, and what it holds goes back only where
+    // no live copy changed the bytes (write_back). False when it isn't one of this tracker's.
+    bool retire_target(const std::uint8_t* shadow) {
+        AcquireSRWLockExclusive(&lock_);
+        bool found = false;
+        for (Target& t : targets_)
+            if (t.shadow == shadow) t.retired = found = true;
+        ReleaseSRWLockExclusive(&lock_);
+        return found;
     }
 
     // Under shadow_mutex: `shadow` is no longer a target. Pages no other target covers are made writable again and
@@ -1237,6 +1266,7 @@ private:
     struct Target {
         std::uintptr_t begin, end;  // the title's bytes
         std::uint8_t* shadow;       // where begin's byte goes
+        bool retired = false;       // a window nothing answers from, kept until its submissions are copied back
     };
 
     static Kind classify(const MEMORY_BASIC_INFORMATION& region) {
@@ -2893,6 +2923,11 @@ struct DeviceState {
         for (std::size_t k = hits.size(); k-- > 1;) shadows.erase(shadows.begin() + std::ptrdiff_t(hits[k]));
         keep.fill(begin, end, shadow);
     }
+    void retire_shadow(const std::uint8_t* mapped) {
+        std::lock_guard lock(shadow_mutex);
+        for (const ShadowPagesPtr& s : shadows)
+            if (s->retire_target(mapped)) return;
+    }
     void remove_shadow(const std::uint8_t* mapped) {
         std::lock_guard lock(shadow_mutex);
         for (auto it = shadows.begin(); it != shadows.end(); ++it)
@@ -3060,6 +3095,7 @@ struct DeviceState {
     std::uint64_t title_write_back_total = 0;                 // copied back, all submissions
     std::uint64_t title_write_back_calls = 0;                 // log line count
     std::uint64_t title_write_back_unfenced = 0;
+    std::atomic<std::uint64_t> title_write_back_done{0};  // the completed ticket the last write_back_titles copied up to
     static constexpr std::size_t kTitleWriteBackBatches = 64; // pending batches before the oldest goes back unfenced
     static constexpr std::size_t kTitleWriteBackRanges = 8192;         // ranges kept per submission
     static constexpr std::uint64_t kTitleWriteBackBytes = 64ull << 20; // bytes copied back per submission
@@ -3080,13 +3116,17 @@ struct DeviceState {
     std::uint64_t pool_spans_retired = 0;  // extents gone with their copy (forget_pool_span, retire_orphan_windows)
     std::uint64_t title_window_refusals = 0;  // windows neither the budget nor the arena allowed
     std::uint64_t unbacked_requests = 0;      // title addresses no backing could be made for (zero-size views)
+    std::uint64_t pool_covers = 0;            // stream-pool requests given one mapping over windows they ran into
 
     // Title windows no address range answers from any more (retire_orphan_windows): the removed ranges' copies, as the
     // alias table's listener records them, and the retired windows whose memory waits for the GPU: freed as a retired
     // geometry view's is, once every replay in progress at the retirement has recorded its submissions (ticket
-    // kAfterExecutes until then, see stamp_retired_windows) and those have completed.
+    // kAfterExecutes until then, see stamp_retired_windows) and those have completed. Its copy stays a target of its
+    // pages' tracker until then: what those submissions wrote in it goes back to the title's pages (write_back_titles)
+    // before the copy goes, not dropped with it.
     struct RetiredWindow {
         std::uint64_t start, shader_va, size, ticket, epoch;
+        std::uint8_t* mapped;
     };
     static constexpr std::size_t kWindowAliasRemovals = 4096;  // kept before every window is looked at instead
     std::mutex window_alias_removal_mutex;  // a leaf: taken in alias_changed, under the alias table's lock
@@ -3145,7 +3185,7 @@ struct DeviceState {
     // answers from any more leaves the refresh. Its ranges went because a newer range was entered over them (a
     // slot-133 buffer placed over the pages, a BVH input's exact copy, src/title_va_alias.h add), and a window nothing
     // reaches is only cost: its tracker walks its pages at every refresh and its bytes count against
-    // LEONIDA_TITLE_WINDOWS_MB. Its copy leaves its tracker, its stream-pool extent and its budget go at once; its
+    // LEONIDA_TITLE_WINDOWS_MB. Its stream-pool extent and its budget go at once; its copy leaves its tracker and its
     // memory is freed later (retired_windows), and the retired windows due are freed here. Only windows whose copy a
     // removed range answered from are looked at (alias_changed records those).
     void retire_orphan_windows() {
@@ -3200,9 +3240,9 @@ struct DeviceState {
         std::uint64_t bytes = 0;
         std::erase_if(title_windows, [&](const TitleWindow& window) {
             if (!is_gone(window.shader_va)) return false;
-            remove_shadow(window.mapped);
+            retire_shadow(window.mapped);
             retiring.push_back({window.start, window.shader_va, window.size, rt::d3d12::GeometryViews::kAfterExecutes,
-                                epoch});
+                                epoch, window.mapped});
             title_window_bytes -= window.size;
             bytes += window.size;
             return true;
@@ -3225,8 +3265,11 @@ struct DeviceState {
                          static_cast<unsigned long long>(title_windows_retired),
                          static_cast<unsigned long long>(title_window_bytes_retired >> 10));
     }
-    // The memory of retired windows whose submissions have completed by `completed`. title_window_mutex held.
+    // The memory of retired windows whose submissions have completed by `completed` and been copied back: a batch of
+    // reached ranges goes back only at a refresh that saw its ticket done (title_write_back_done), so a window
+    // completed after that refresh keeps its copy until the next one. title_window_mutex held.
     void free_retired_windows(std::uint64_t completed) {
+        completed = std::min(completed, title_write_back_done.load(std::memory_order_acquire));
         std::vector<RetiredWindow> due;
         {
             std::lock_guard retired(retired_window_mutex);
@@ -3239,6 +3282,7 @@ struct DeviceState {
             retired_window_count.store(retired_windows.size(), std::memory_order_release);
         }
         for (const RetiredWindow& window : due) {
+            remove_shadow(window.mapped);
             if (window.shader_va < arena.size) {
                 arena_release(window.shader_va, window.size, arena_buffer);
             } else {
@@ -3378,9 +3422,11 @@ struct DeviceState {
 
     // A window for [start, start + size): an arena range or a block outside the arena, charged to
     // LEONIDA_TITLE_WINDOWS_MB and refreshed before every submission by the tracker of its pages. 0 when neither the
-    // budget nor the arena has room. title_window_mutex held.
-    std::uint64_t make_title_window(std::uint64_t start, std::uint64_t size) {
-        if (!leonida::title_window_fits(title_window_cap, title_window_bytes, size)) {
+    // budget nor the arena has room. `credit`: bytes of windows this one replaces, retired at the next submission
+    // (cover_pool_request), not counted against it. title_window_mutex held.
+    std::uint64_t make_title_window(std::uint64_t start, std::uint64_t size, std::uint64_t credit = 0) {
+        if (!leonida::title_window_fits(title_window_cap, title_window_bytes - std::min(credit, title_window_bytes),
+                                        size)) {
             ++title_window_refusals;
             log_once("title memory named by a shader address is past LEONIDA_TITLE_WINDOWS_MB, no window; MiB copied "
                      "so far:",
@@ -3458,6 +3504,9 @@ struct DeviceState {
     void write_back_titles() {
         if (!&context) return;
         const std::uint64_t done = context->completed_retire_ticket();
+        // The batches done by `done` go back below, under shadow_mutex, which remove_shadow waits for: a retired window
+        // freed by this ticket (free_retired_windows) keeps its copy until they have.
+        title_write_back_done.store(done, std::memory_order_release);
         std::vector<std::pair<uint64_t, std::uint64_t>> finished;  // one entry per range, collected under the lock
         {
             std::lock_guard lock(title_write_back_mutex);
@@ -3524,13 +3573,18 @@ struct DeviceState {
         const std::uint64_t pool_end = (source >= view.gpu && source - view.gpu < view.size ? view.gpu : view.cpu) +
                                        view.size;
         auto& aliases = leonida::title_va_aliases();
+        const std::uint64_t request_end = source + std::min(std::max<std::uint64_t>(bytes, 1), pool_end - source);
         // A mapping that already holds the request's byte in either view (a buffer made over these pages, or an
         // extent from another request) serves it. The other view is entered as far as that mapping reaches, the pool
         // goes and its own free span allows: a range entered over a live one replaces it whole, and the copy it
-        // answered from would be answered by nothing.
+        // answered from would be answered by nothing. One that ends before the request does gives way to a mapping
+        // for all of it when it is a window (cover_pool_request): a view never reaches past the copy it is given.
         std::uint64_t shader = 0, available = 0;
         if (aliases.range_of(source, shader, available) || aliases.range_of(twin_view, shader, available)) {
             available = std::min(available, pool_end - source);  // the same offset in both views
+            if (source + available < request_end &&
+                cover_pool_request(source, twin_view, source, request_end, source - offset, pool_end, out))
+                return true;
             for (const std::uint64_t at : {source, twin_view}) {
                 std::uint64_t lo = 0, hi = 0;
                 aliases.gap(at, lo, hi);
@@ -3556,19 +3610,52 @@ struct DeviceState {
             note_unbacked("stream pool", va, bytes);
             return true;
         }
-        const std::uint64_t twin_start = twin_view - (source - extent.start);  // the same pages in the other view
-        bool geometry_copy = false;
-        if (geometry.cap() && watch_shadow_writes() && !context->knows_buffer_va(extent.start, extent.size)) {
-            shader = geometry.resolve(*this, extent.start, extent.size, copy_geometry);
-            geometry_copy = shader != 0;
+        // The next mapping starts before the request ends: one mapping over the windows it reaches, or none. A short
+        // extent would leave the view reaching past its copy, into whatever the arena holds after it (and a V# with
+        // too few bytes is refused, every time it is looked up). Covered as far as an extent with no mapping in the
+        // way reaches (the readable run, kPoolExtentMax), as before the extents stopped at the next mapping.
+        leonida::TitleWindowRange open{};
+        const std::uint64_t extent_end = extent.start + extent.size;
+        const std::uint64_t open_end =
+            leonida::title_pool_extent(source - offset, pool_end, source, run_end, kTitleWindowAlign, kPoolExtentMax,
+                                       open)
+                ? open.start + open.size
+                : extent_end;
+        if (extent_end < std::min(request_end, open_end)) {
+            if (cover_pool_request(source, twin_view, extent.start, std::min(request_end, open_end),
+                                   source - offset, pool_end, out))
+                return true;
+            out = 0;
+            ++unbacked_requests;
+            note_unbacked("stream pool (crosses a mapping that is not a window)", va, bytes);
+            return true;
         }
-        if (!shader) shader = make_title_window(extent.start, extent.size);
+        shader = map_pool_extent(extent, source, twin_view, 0);
         if (!shader) {
             out = 0;
             ++unbacked_requests;
             note_unbacked("stream pool", va, bytes);
             return true;
         }
+        out = shader + (source - extent.start);
+        return true;
+    }
+
+    // A mapping for a stream pool's extent (at `source`'s view, `twin_view` the same byte in the other one): a geometry
+    // copy or a window, entered at both addresses and kept in pool_spans. 0 when neither could be made. `credit`:
+    // see make_title_window. title_window_mutex held.
+    std::uint64_t map_pool_extent(const leonida::TitleWindowRange& extent, std::uint64_t source,
+                                  std::uint64_t twin_view, std::uint64_t credit) {
+        auto& aliases = leonida::title_va_aliases();
+        const std::uint64_t twin_start = twin_view - (source - extent.start);  // the same pages in the other view
+        std::uint64_t shader = 0;
+        bool geometry_copy = false;
+        if (geometry.cap() && watch_shadow_writes() && !context->knows_buffer_va(extent.start, extent.size)) {
+            shader = geometry.resolve(*this, extent.start, extent.size, copy_geometry);
+            geometry_copy = shader != 0;
+        }
+        if (!shader) shader = make_title_window(extent.start, extent.size, credit);
+        if (!shader) return 0;
         aliases.add_twin(extent.start, twin_start, extent.size, shader);
         pool_spans.push_back({extent.start, twin_start, shader, extent.size, geometry_copy});
         pool_span_count.store(pool_spans.size(), std::memory_order_relaxed);
@@ -3581,7 +3668,46 @@ struct DeviceState {
                          geometry_copy ? "geometry-copy" : "window", static_cast<unsigned long long>(twin_view),
                          static_cast<unsigned long long>(source), static_cast<unsigned long long>(shader),
                          pool_spans.size(), static_cast<unsigned long long>(pool_span_bytes >> 10));
-        out = shader + (source - extent.start);
+        return shader;
+    }
+
+    // One mapping for a stream-pool request [source, end) that what would serve it stops short of: the free extent
+    // from `start` ends at the next mapping, or the mapping holding `source` ends first (title_pool_cover). It covers
+    // the request and, whole, the windows it reaches in either view; a range entered over theirs replaces them, and
+    // they are retired at the next submission like any window nothing answers from (retire_orphan_windows), what the
+    // GPU wrote in them copied back first. Their bytes are not charged twice meanwhile. False when another kind of
+    // range is in the way (a slot-133 buffer, a geometry copy) or the mapping cannot be made. title_window_mutex held.
+    bool cover_pool_request(std::uint64_t source, std::uint64_t twin_view, std::uint64_t start, std::uint64_t end,
+                            std::uint64_t pool_lo, std::uint64_t pool_end, std::uint64_t& out) {
+        std::vector<std::size_t> replaced;  // title_windows entries the ranges in the way answer from
+        const auto owned = [&](std::uint64_t shader_va) {
+            for (std::size_t i = 0; i < title_windows.size(); ++i) {
+                const TitleWindow& window = title_windows[i];
+                if (shader_va < window.shader_va || shader_va - window.shader_va >= window.size) continue;
+                if (std::find(replaced.begin(), replaced.end(), i) == replaced.end()) replaced.push_back(i);
+                return true;
+            }
+            return false;
+        };
+        leonida::TitleWindowRange cover{};
+        if (!leonida::title_pool_cover(leonida::title_va_aliases(), pool_lo, pool_end, source, twin_view, start, end,
+                                       kTitleWindowAlign, kTitleWindowMax, owned, cover))
+            return false;
+        const std::uint64_t cover_end = cover.start + cover.size;
+        if (readable_run_end(cover.start & ~(kTitleWindowAlign - 1), cover_end) < cover_end) return false;
+        std::uint64_t credit = 0;
+        for (const std::size_t i : replaced) credit += title_windows[i].size;
+        const std::uint64_t shader = map_pool_extent(cover, source, twin_view, credit);
+        if (!shader) return false;
+        ++pool_covers;
+        if (pool_covers <= 4 || !(pool_covers & (pool_covers - 1)))
+            std::fprintf(stderr,
+                         "[rt] d3d12: a stream-pool request ran past the mapping that would serve it: one %llu KiB "
+                         "mapping covers it and the %zu window(s) it reached, retired at the next submission (%llu so "
+                         "far)\n",
+                         static_cast<unsigned long long>(cover.size >> 10), replaced.size(),
+                         static_cast<unsigned long long>(pool_covers));
+        out = shader + (source - cover.start);
         return true;
     }
 
@@ -3650,9 +3776,23 @@ struct DeviceState {
             return true;
         }
         const std::uint64_t want = std::max<std::uint64_t>(bytes, 1);
-        std::lock_guard lock(title_window_mutex);
-        if (const std::uint64_t made = aliases.shader_va(va); made != va) {  // another thread made it meanwhile
+        // A range holds `va` (another thread made it meanwhile, or TitleVaAliases::resolve asks again because the
+        // range ends before the view does): it answers, unless the view is a stream pool's and runs past it.
+        leonida::title_gpu_views::Range pool{};
+        const auto answered = [&] {
+            out = va;
+            const std::uint64_t made = aliases.shader_va(va);
+            if (made == va) return false;
             out = made;
+            return aliases.shader_va(va, want) == made ||
+                   !leonida::title_gpu_views::view_at(static_cast<std::uintptr_t>(va), 1, pool);
+        };
+        if (answered()) return true;
+        std::lock_guard lock(title_window_mutex);
+        if (answered()) return true;
+        if (out != va) {
+            const std::uint64_t made = out;
+            if (!resolve_pool_memory(va, bytes, out)) out = made;
             return true;
         }
         // A stream pool's address: one mapping for its readable run, shared by both of its views.
@@ -4254,6 +4394,10 @@ struct DeviceState {
         const auto path = [this](unsigned p) { vsharp_paths[p].fetch_add(1, std::memory_order_relaxed); };
         uint64_t to{}, room{};
         if (aliases.range_of(base, to, room)) {
+            // A range that ends before the V# does: a stream pool's gets one mapping for all of it (resolve_pool_memory).
+            uint64_t whole{};
+            if (to && room < bytes && make_window && resolve_title_memory(base, bytes, whole) && whole)
+                aliases.range_of(base, to, room);
             if (!to || room < bytes || !backed(to)) {
                 if (refused) *refused = to;
                 return path(1), 0;

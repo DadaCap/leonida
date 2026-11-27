@@ -137,6 +137,16 @@ public:
         out.reserve(ranges_.size());
         for (const auto& [start, range] : ranges_) out.push_back({start, range.end, range.shader_va});
     }
+    // The ranges that overlap [begin, end), in title-VA order.
+    void overlapping(std::uint64_t begin, std::uint64_t end, std::vector<Mapping>& out) const {
+        out.clear();
+        if (begin >= end || !count_.load(std::memory_order_acquire)) return;
+        std::shared_lock lock(mutex_);
+        auto it = ranges_.lower_bound(begin);
+        if (it != ranges_.begin() && std::prev(it)->second.end > begin) --it;
+        for (; it != ranges_.end() && it->first < end; ++it)
+            out.push_back({it->first, it->second.end, it->second.shader_va});
+    }
 
     // Whether `shader_va` lies in the copy of a range added so far: an address the layer itself wrote for the title
     // (a window, a geometry copy, a slot-133 shadow or import), which a later scan of the same descriptor sees again.
@@ -185,20 +195,25 @@ public:
     // A resolver that cannot back the address (no window or geometry copy fits) answers 0: the view is then written
     // with a zero-size range, never with the raw title address (heap_base + a raw VA is no allocation a shader can
     // read or write). Counted by kind: translated, or in the title's memory and left as it was.
+    // A range that holds `va` but ends before the view does goes to the resolver too, which can give a stream pool's
+    // request one mapping for all of its bytes (DeviceState::resolve_pool_memory); otherwise it answers as before.
     std::uint64_t resolve(std::uint64_t va, std::uint64_t bytes, Kind kind) {
         if (!va) return va;
         std::uint64_t to = shader_va(va);
-        if (to != va) {
-            translated_[kind].fetch_add(1, std::memory_order_relaxed);
-            note_reached(va, bytes);
-            return to;
-        }
         Resolver resolver;
         void* context;
         {
             std::lock_guard lock(hook_mutex_);
             resolver = resolver_;
             context = hook_context_;
+        }
+        if (to != va) {
+            std::uint64_t whole = 0;
+            if (bytes > 1 && shader_va(va, bytes) != to && resolver && resolver(context, va, bytes, whole) && whole)
+                to = whole;
+            translated_[kind].fetch_add(1, std::memory_order_relaxed);
+            note_reached(va, bytes);
+            return to;
         }
         if (!resolver || !resolver(context, va, bytes, to)) return va;
         (to != va ? translated_ : untranslated_)[kind].fetch_add(1, std::memory_order_relaxed);
