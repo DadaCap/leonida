@@ -52,6 +52,7 @@
 #include <vector>
 
 #include "gameinput.h"
+#include "gameinput_clip.h"
 #include "gameinput_abi.h"
 #include "gameinput_script.h"
 #include "keyboard_pad_connection.h"
@@ -1783,11 +1784,29 @@ bool is_keyboard_pad(SDL_JoystickID jid) { return jid != 0 && jid == g_keyboard.
 // Keeps the cursor inside the game window while it has focus, so a click cannot land on another window, and releases
 // it on focus loss. Only with raw input (a clipped plain cursor would stop the stick at the window edge) and only for
 // a real foreground window of this process: not KeyboardPadMode::Always over a terminal, nor a test's fake focus.
-// Re-applied every 100 ms, because Windows drops the clip on some focus and resize changes.
+// Re-applied every 100 ms, because Windows drops the clip on some focus and resize changes. Never while the window is
+// dragged or sized, or a press that began on its title bar or border is held (gameinput_clip.h has why).
 bool g_clipped = false;
 uint64_t g_clip_at = 0;
+rt::gameinput::detail::CursorClipGate g_clip_gate;
 
 void clip_cursor(bool want) {
+    const HWND w = want ? GetForegroundWindow() : nullptr;
+    if (w) {
+        GUITHREADINFO gui{};
+        gui.cbSize = sizeof(gui);
+        const bool modal_loop = GetGUIThreadInfo(GetWindowThreadProcessId(w, nullptr), &gui) &&
+                                (gui.flags & (GUI_INMOVESIZE | GUI_INMENUMODE | GUI_SYSTEMMENUMODE));
+        const bool button_down = ((GetAsyncKeyState(VK_LBUTTON) | GetAsyncKeyState(VK_RBUTTON) |
+                                   GetAsyncKeyState(VK_MBUTTON)) & 0x8000) != 0;
+        POINT cursor;
+        RECT client;
+        const bool in_client = GetCursorPos(&cursor) && ScreenToClient(w, &cursor) && GetClientRect(w, &client) &&
+                               PtInRect(&client, cursor);
+        want = g_clip_gate.update(true, modal_loop, button_down, in_client);
+    } else {
+        want = g_clip_gate.update(false, false, false, false);
+    }
     if (!want) {
         if (g_clipped) ClipCursor(nullptr);
         g_clipped = false;
@@ -1795,9 +1814,8 @@ void clip_cursor(bool want) {
     }
     const uint64_t now = now_us();
     if (g_clipped && now - g_clip_at < 100'000) return;
-    const HWND w = GetForegroundWindow();
     RECT r;
-    if (!w || !GetClientRect(w, &r)) return;
+    if (!GetClientRect(w, &r)) return;
     POINT top_left{r.left, r.top}, bottom_right{r.right, r.bottom};
     if (!ClientToScreen(w, &top_left) || !ClientToScreen(w, &bottom_right)) return;
     const RECT screen{top_left.x, top_left.y, bottom_right.x, bottom_right.y};
