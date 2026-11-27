@@ -999,6 +999,180 @@ int check_stream_pool(Context& c, int& checks) {
     return 0;
 }
 
+// One submission that reads 64 title words through a root view at `va`, 256 bytes past it, into an arena buffer
+// (cs_user_data's mode 0xFFFFFFFD: the table entry is the buffer's raw VA), then copies them to a READBACK buffer.
+// `matched`: how many are words[64 + i] + kRootAdd, the bytes at `va` as the title wrote them.
+struct Reader {
+    Context* c;
+    ID3D12CommandAllocator* allocator;
+    ID3D12GraphicsCommandList* list;
+    ID3D12Resource* out;
+    ID3D12Resource* readback;
+    ID3D12DescriptorHeap* heap;
+    UINT64 gpu;
+};
+int read_root(Reader& r, std::uint64_t va, const std::uint32_t* words, UINT& matched) {
+    EXPECT(r.allocator->Reset() == S_OK);
+    EXPECT(r.list->Reset(r.allocator, r.c->pso) == S_OK);
+    ID3D12DescriptorHeap* heaps[] = {r.heap};
+    r.list->SetDescriptorHeaps(1, heaps);
+    r.list->SetComputeRootSignature(r.c->root);
+    r.list->SetComputeRoot32BitConstant(0, kRootAdd, 0);
+    r.list->SetComputeRoot32BitConstant(0, 0xFFFFFFFDu, 1);
+    r.list->SetComputeRootUnorderedAccessView(1, va);
+    r.list->SetComputeRootDescriptorTable(2, D3D12_GPU_DESCRIPTOR_HANDLE{r.gpu});
+    r.list->Dispatch(1, 1, 1);
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = r.out;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    r.list->ResourceBarrier(1, &barrier);
+    r.list->CopyBufferRegion(r.readback, 0, r.out, 0, kBytes);
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    r.list->ResourceBarrier(1, &barrier);
+    EXPECT(r.list->Close() == S_OK);
+    ID3D12CommandList* lists[] = {r.list};
+    r.c->queue->ExecuteCommandLists(1, lists);
+    EXPECT(rt::d3d12::last_execute_result(r.c->queue) == leonida::ReplayResult::success);
+    EXPECT(SUCCEEDED(r.c->queue->Signal(r.c->fence, ++r.c->fence_value)));
+    EXPECT(SUCCEEDED(r.c->fence->SetEventOnCompletion(r.c->fence_value, nullptr)));
+    void* mapped = nullptr;
+    EXPECT(SUCCEEDED(r.readback->Map(0, nullptr, &mapped)));
+    const auto* got = static_cast<const std::uint32_t*>(mapped);
+    matched = 0;
+    for (UINT i = 0; i < kElements; ++i) matched += got[i] == words[64 + i] + kRootAdd;
+    r.readback->Unmap(0, nullptr);
+    return 0;
+}
+
+// No window is left that nothing reaches (RT-TITLE-WINDOW-RETIRE). A range entered over a live one replaces it whole,
+// so a mapping made over bytes another one serves left that one's copy answered by nothing, still refreshed and
+// charged to LEONIDA_TITLE_WINDOWS_MB. First a stream pool: a request just before an extent the pool already has gets
+// an extent that stops where that one starts, and both keep answering. Then a slot-133 buffer the title places over a
+// window's pages: the window, now reached by nothing, is retired at the next submission, its bytes returned and its
+// memory freed after the submission completes, and the GPU reads the title's bytes through the buffer.
+int check_window_orphans(Context& c) {
+    const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT}, readback_heap{D3D12_HEAP_TYPE_READBACK};
+    const auto uav = buffer_desc(kBytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    const auto readback_desc = buffer_desc(kBytes);
+    Ref<ID3D12Resource> out, readback;
+    EXPECT(SUCCEEDED(c.device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &uav,
+                                                       D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+                                                       IID_PPV_ARGS(&out.p))));
+    EXPECT(SUCCEEDED(c.device->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &readback_desc,
+                                                       D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                       IID_PPV_ARGS(&readback.p))));
+    D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 8,
+                                         D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    Ref<ID3D12DescriptorHeap> heap;
+    EXPECT(SUCCEEDED(c.device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&heap.p))));
+    const std::uint64_t out_va = out->GetGPUVirtualAddress();
+    std::memcpy(reinterpret_cast<void*>(reinterpret_cast<XboxHeapHandleFn>(slot(heap.p, 9))(heap.p)), &out_va,
+                sizeof(out_va));
+    Ref<ID3D12CommandAllocator> allocator;
+    Ref<ID3D12GraphicsCommandList> list;
+    EXPECT(SUCCEEDED(c.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.p))));
+    EXPECT(SUCCEEDED(c.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, c.pso,
+                                                 IID_PPV_ARGS(&list.p))));
+    EXPECT(list->Close() == S_OK);
+    Reader r{&c, allocator.p, list.p, out.p, readback.p, heap.p,
+             reinterpret_cast<XboxHeapHandleFn>(slot(heap.p, 10))(heap.p)};
+    auto& aliases = leonida::title_va_aliases();
+    UINT matched = 0;
+
+    // A 512 KiB stream pool: its CPU view committed, its GPU-only alias reserved.
+    constexpr UINT64 pool_bytes = 512 * 1024;
+    auto* pool = static_cast<std::uint32_t*>(
+        VirtualAlloc(nullptr, pool_bytes, MEM_TOP_DOWN | MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    void* gpu_alias = VirtualAlloc(nullptr, pool_bytes, MEM_TOP_DOWN | MEM_RESERVE, PAGE_NOACCESS);
+    EXPECT(pool && gpu_alias);
+    const auto cpu_va = reinterpret_cast<std::uint64_t>(pool), gpu_va = reinterpret_cast<std::uint64_t>(gpu_alias);
+    EXPECT(!leonida::title_gpu_views::note_reservation(cpu_va, pool_bytes, false));
+    EXPECT(leonida::title_gpu_views::note_reservation(gpu_va, pool_bytes, true));
+    aliases.add_title_memory(cpu_va, pool_bytes);
+    aliases.add_title_memory(gpu_va, pool_bytes);
+    for (UINT i = 0; i < pool_bytes / 4; ++i) pool[i] = 0xD0000000u + i * 3u;
+    constexpr UINT64 later = 0x40000, earlier = 0x10000;  // the second request lands 192 KiB before the first's extent
+    const auto before = rt::d3d12::title_windows(c.inner);
+    EXPECT(read_root(r, gpu_va + later, pool + later / 4, matched) == 0);
+    EXPECT(matched == kElements);
+    const std::uint64_t first = aliases.shader_va(cpu_va + later);
+    EXPECT(first != cpu_va + later && aliases.shader_va(gpu_va + later) == first);
+    EXPECT(read_root(r, gpu_va + earlier, pool + earlier / 4, matched) == 0);
+    EXPECT(matched == kElements);
+    const auto pooled = rt::d3d12::title_windows(c.inner);
+    std::printf("window orphans: two pool requests made %llu windows of %llu KiB; the first extent is answered at its "
+                "CPU view %s and its alias %s\n",
+                static_cast<unsigned long long>(pooled.count - before.count),
+                static_cast<unsigned long long>((pooled.bytes - before.bytes) >> 10),
+                aliases.shader_va(cpu_va + later) == first ? "yes" : "no",
+                aliases.shader_va(gpu_va + later) == first ? "yes" : "no");
+    EXPECT(pooled.count == before.count + 2);
+    // [earlier, later) and [later, pool end): no byte twice.
+    EXPECT(pooled.bytes - before.bytes == pool_bytes - earlier);
+    EXPECT(aliases.shader_va(cpu_va + later) == first && aliases.shader_va(gpu_va + later) == first);
+    EXPECT(aliases.shader_va(gpu_va + earlier) == aliases.shader_va(cpu_va + earlier));
+    // Both still read the title's bytes, the first through its own extent; and neither window is retired.
+    EXPECT(read_root(r, cpu_va + later, pool + later / 4, matched) == 0);
+    EXPECT(matched == kElements);
+    EXPECT(read_root(r, gpu_va + earlier, pool + earlier / 4, matched) == 0);
+    EXPECT(matched == kElements);
+    EXPECT(rt::d3d12::title_windows(c.inner).count == pooled.count);
+
+    // A 128 KiB constant ring: a window for its first page, then a buffer the title places over the whole ring.
+    constexpr UINT64 ring_bytes = 128 * 1024;
+    auto* ring = static_cast<std::uint32_t*>(
+        VirtualAlloc(nullptr, ring_bytes, MEM_TOP_DOWN | MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    EXPECT(ring);
+    const auto ring_va = reinterpret_cast<std::uint64_t>(ring);
+    aliases.add_title_memory(ring_va, ring_bytes);
+    for (UINT i = 0; i < ring_bytes / 4; ++i) ring[i] = 0xE0000000u + i * 5u;
+    EXPECT(read_root(r, ring_va, ring, matched) == 0);
+    EXPECT(matched == kElements);
+    const auto windowed = rt::d3d12::title_windows(c.inner);
+    const std::uint64_t window = aliases.shader_va(ring_va);
+    EXPECT(windowed.count == pooled.count + 1 && window != ring_va);
+    const std::uint64_t window_bytes = windowed.bytes - pooled.bytes;
+    Ref<ID3D12Resource> placed;
+    EXPECT(SUCCEEDED(rt::d3d12::create_buffer_at_host_address(c.inner, ring, buffer_desc(ring_bytes), 0xFFFFFFFFu,
+                                                              IID_PPV_ARGS(&placed.p))));
+    EXPECT(aliases.shader_va(ring_va) != window && aliases.shader_va(ring_va) != ring_va);
+    EXPECT(!aliases.answers_into(window, window_bytes));  // nothing reaches the window now
+    for (UINT i = 0; i < ring_bytes / 4; ++i) ring[i] = 0xF0000000u + i * 7u;  // new bytes, after the buffer exists
+    EXPECT(read_root(r, ring_va, ring, matched) == 0);  // through the buffer; the window is retired after the refresh
+    const auto retired = rt::d3d12::title_windows(c.inner);
+    std::printf("window orphans: a buffer over the ring's window: %u/%u words read through it; %llu -> %llu windows, "
+                "%llu -> %llu KiB (%llu retired, %llu waiting for the GPU)\n",
+                matched, kElements, static_cast<unsigned long long>(windowed.count),
+                static_cast<unsigned long long>(retired.count), static_cast<unsigned long long>(windowed.bytes >> 10),
+                static_cast<unsigned long long>(retired.bytes >> 10),
+                static_cast<unsigned long long>(retired.retired - windowed.retired),
+                static_cast<unsigned long long>(retired.waiting));
+    EXPECT(matched == kElements);
+    EXPECT(retired.count == windowed.count - 1 && retired.bytes == windowed.bytes - window_bytes);
+    EXPECT(retired.retired == windowed.retired + 1);
+    // Its memory goes once the submission that retired it has completed; the pool's windows stay.
+    EXPECT(read_root(r, ring_va, ring, matched) == 0);
+    EXPECT(matched == kElements);
+    const auto freed = rt::d3d12::title_windows(c.inner);
+    EXPECT(freed.waiting == 0 && freed.count == retired.count);
+    EXPECT(read_root(r, gpu_va + later, pool + later / 4, matched) == 0);
+    EXPECT(matched == kElements);
+
+    placed.reset();
+    aliases.remove_title_memory(ring_va);
+    aliases.remove_title_memory(gpu_va);
+    aliases.remove_title_memory(cpu_va);
+    remove_test_pair(gpu_va, cpu_va);
+    VirtualFree(ring, 0, MEM_RELEASE);
+    VirtualFree(gpu_alias, 0, MEM_RELEASE);
+    VirtualFree(pool, 0, MEM_RELEASE);
+    return 0;
+}
+
 // Four 4 MiB slabs fill the 16 MiB fixture budget. A final 1 MiB view still fits
 // immediately after the 3 MiB view in the second slab.
 int check_geometry_slab_tails(Context& c) {
@@ -1228,6 +1402,7 @@ int main(int argc, char** argv) {
     const bool rebind = api_copy || mirror_off || second_device || (argc == 2 && std::strcmp(argv[1], "--rebound-tables") == 0);
     const bool window_cap = argc == 2 && std::strcmp(argv[1], "--window-cap") == 0;
     const bool window_write_back = argc == 2 && std::strcmp(argv[1], "--window-writeback") == 0;
+    const bool window_orphans = argc == 2 && std::strcmp(argv[1], "--window-orphans") == 0;
     const bool placed_write_back = argc == 2 && std::strcmp(argv[1], "--placed-writeback") == 0;
     const bool keep_refill = argc == 2 && std::strcmp(argv[1], "--shadow-keep-refill") == 0;
     if (window_cap) {
@@ -1369,6 +1544,15 @@ int main(int argc, char** argv) {
             }
             std::printf("title window write back: the GPU's writes reached the title's pages and the title's own "
                         "words won\n");
+            return 0;
+        }
+        if (window_orphans) {
+            if (check_window_orphans(c)) return 1;
+            if (d.validation_errors()) {
+                std::fprintf(stderr, "%u validation errors\n", d.validation_errors());
+                return 1;
+            }
+            std::printf("title window orphans: no window overlapped another; the one nothing reached was retired\n");
             return 0;
         }
         if (geometry && check_declined_imports(c)) return 1;

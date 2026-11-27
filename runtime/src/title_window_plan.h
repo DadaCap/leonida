@@ -8,7 +8,11 @@
 //     does not fit is not made, and the address is backed another way or written as a zero-size view, never raw;
 //   - a stream pool (the title's CPU view paired with a GPU-only alias, gfxgeom section 3) is one reservation of
 //     16-24 GiB, so it cannot be one allocation: one mapping serves a page-aligned readable run of it, and every
-//     request inside that run reuses it instead of asking for a 128 KiB window each.
+//     request inside that run reuses it instead of asking for a 128 KiB window each. A mapping never covers bytes
+//     another one already serves, in either view of the pool: a range entered over a live one replaces it whole
+//     (TitleVaAliases::add), and the copy that range answered from would be left answered by nothing.
+#include "title_va_alias.h"
+
 #include <algorithm>
 #include <cstdint>
 
@@ -61,6 +65,23 @@ inline bool title_pool_extent(std::uint64_t pool_lo, std::uint64_t pool_hi, std:
     if (end <= va || end <= start) return false;
     out = {start, end - start};
     return true;
+}
+
+// title_pool_extent inside the free span (TitleVaAliases::gap) around the request at `va` and around `twin`, the same
+// byte in the pair's other view (`va` itself when there is none): it ends at the next mapping in either view, and
+// starts after the last one before the request. False when a range already holds `va` or `twin` (that mapping serves
+// the request) or no page is left for it.
+inline bool title_pool_free_extent(const TitleVaAliases& aliases, std::uint64_t pool_lo, std::uint64_t pool_hi,
+                                   std::uint64_t va, std::uint64_t twin, std::uint64_t readable_end,
+                                   std::uint64_t align, std::uint64_t most, TitleWindowRange& out) {
+    std::uint64_t lo = 0, hi = 0, twin_lo = 0, twin_hi = 0;
+    aliases.gap(va, lo, hi);
+    aliases.gap(twin, twin_lo, twin_hi);
+    if (lo > va || twin_lo > twin) return false;
+    // The twin's span, moved to `va`'s view.
+    lo = (std::max)(lo, va - (std::min)(va, twin - twin_lo));
+    hi = (std::min)(hi, va + (std::min)(UINT64_MAX - va, twin_hi - twin));
+    return title_pool_extent((std::max)(pool_lo, lo), (std::min)(pool_hi, hi), va, readable_end, align, most, out);
 }
 
 }  // namespace leonida

@@ -1707,8 +1707,19 @@ The copies:
   (logged once otherwise).
 - Any **other address in the title's memory** gets a window: the 64 KiB-aligned pages it covers, clipped to the
   title's range, copied into the arena now and before every submission, through the same shadow refresh as slot 133
-  (so dirty-page tracking for that refresh applies to both). Windows stay until the device goes, up to
-  `LEONIDA_TITLE_WINDOWS_MB` (64 MiB by default). A window that
+  (so dirty-page tracking for that refresh applies to both). A window never covers bytes an existing range already
+  serves: it stays inside the free span around the address (and a stream-pool extent inside the free span in both of
+  the pair's views), because a range entered over a live one replaces it whole, and the copy that range answered from
+  would be left reached by nothing. Windows stay while an address range still answers from them, up to
+  `LEONIDA_TITLE_WINDOWS_MB` (64 MiB by default). A window that no range answers from any more (a slot-133 buffer the
+  title placed over its pages, or a BVH input's exact copy, replaced its ranges) is **retired** after the next
+  submission's refresh: the alias table's listener records the removed ranges' copies, and a window none of its
+  ranges is left for loses its tracker, its stream-pool extent and its bytes of the budget at once. Its memory is
+  freed as a retired geometry copy's is, once every `ExecuteCommandLists` replay in progress then has recorded its
+  submissions and those have completed. `d3d12_title_window_orphans` and `title_window_plan` cover it. A window is
+  not retired when its pages are released or remapped: a retail run measured no release at all of the pages windows
+  cover (the title remaps its pool frames instead), and the tracker follows the pages.
+  A tracker the window shared with a copy still live keeps its extent (a retirement never splits one). A window that
   cannot fit between the title's address reservations can use a separate mapped buffer. The buffer's device address
   must fit as a positive 47-bit offset from the arena base. The same window cap and dirty-page refresh apply.
   `LEONIDA_STREAM_BUFFER_WINDOWS=0` requires the window to fit in the arena.
@@ -1734,9 +1745,11 @@ The copies:
   loses the device. The refusal and the count of zero-size views are logged.
 - A **stream pool** (the title's CPU view paired with a 16-24 GiB GPU-only
   alias) is not windowed per request. The GPU-only pages are translated to the CPU view of the same frames (rule B in
-  that note), and **one mapping serves a page-aligned readable run** of the pool (at most 1 MiB, a geometry copy when
-  the cap allows, a window otherwise). Both addresses of the pair are entered in the table, so a V# naming either
-  reaches that one mapping instead of asking for a second one; `LEONIDA_GEOMETRY_MB` is the preferred backing.
+  that note), and **one mapping serves a page-aligned readable run** of the pool (at most 1 MiB, and never past the
+  next mapping in either view; a geometry copy when the cap allows, a window otherwise). A request whose byte a
+  mapping already holds in either view is served by it, and the other view is entered as far as that mapping reaches.
+  Both addresses of the pair are entered in the table, so a V# naming either reaches that one mapping instead of
+  asking for a second one; `LEONIDA_GEOMETRY_MB` is the preferred backing.
   Acceleration-structure destinations and scratch also resolve through the table, and a structure no window holds
   whole gets a copy of its whole range, so the BVH builder's commands are recorded.
 - `LEONIDA_GEOMETRY_MB` sets the device-local memory cap for streamed buffer views. The default is 0.

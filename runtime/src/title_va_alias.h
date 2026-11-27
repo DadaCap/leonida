@@ -23,10 +23,12 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <iterator>
 #include <map>
 #include <mutex>
 #include <shared_mutex>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -144,6 +146,14 @@ public:
         std::shared_lock lock(mutex_);
         BufferVaIndex<std::uint64_t>::Hit hit{};
         return by_shader_.find(shader_va, hit);
+    }
+
+    // Whether any range still answers from inside [shader_va, shader_va + bytes): a copy (a title window) that some
+    // address still reaches. A range entered over a live one replaces it whole (add), so a copy can be left with none.
+    bool answers_into(std::uint64_t shader_va, std::uint64_t bytes) const {
+        if (!count_.load(std::memory_order_acquire)) return false;
+        std::shared_lock lock(mutex_);
+        return by_shader_.overlaps(shader_va, bytes);
     }
 
     // Debug-only inverse lookup. V#s retain 48 bits, so an import below heap_base wraps.

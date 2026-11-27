@@ -143,11 +143,52 @@ int check_stream_pool() {
     return 0;
 }
 
+// A request just before an extent the pool already has: the new extent ends where that one starts, in either view, so
+// the older one keeps its ranges. A range entered over a live one replaces it whole (TitleVaAliases::add): an extent
+// run past the next one left that one's copy answered by nothing, refreshed and charged for the device's life.
+// Made-up addresses: nothing is mapped here.
+int check_pool_extent_stops_at_mapping() {
+    constexpr std::uint64_t cpu = 0x7ff612340000ull, gpu = 0x5612340000ull, pool = 4 * kMiB;
+    leonida::TitleVaAliases table;
+    leonida::TitleWindowRange first{}, second{}, bounded{}, unused{};
+    // The first request, 512 KiB in: its extent runs to the end of the readable run, 1 MiB at most.
+    EXPECT(leonida::title_pool_free_extent(table, cpu, cpu + pool, cpu + 0x80000, gpu + 0x80000, cpu + pool, kAlign,
+                                           kMiB, first));
+    EXPECT(first.start == cpu + 0x80000 && first.size == kMiB);
+    EXPECT(table.add_twin(first.start, gpu + 0x80000, first.size, 0x100000));
+    // The second, 384 KiB before it, stops at its start (it ran 1 MiB, over the first, before).
+    EXPECT(leonida::title_pool_free_extent(table, cpu, cpu + pool, cpu + 0x28000, gpu + 0x28000, cpu + pool, kAlign,
+                                           kMiB, second));
+    EXPECT(second.start == cpu + 0x20000 && second.size == 0x60000);
+    EXPECT(table.add_twin(second.start, gpu + 0x20000, second.size, 0x200000));
+    EXPECT(table.size() == 4);  // nothing replaced: both extents answer at both of their addresses
+    EXPECT(table.shader_va(cpu + 0x80000) == 0x100000 && table.shader_va(gpu + 0x80000) == 0x100000);
+    EXPECT(table.shader_va(cpu + 0x28000) == 0x208000 && table.shader_va(gpu + 0x28000) == 0x208000);
+    // A request whose byte a mapping already holds, in either view, gets no extent: that mapping serves it.
+    EXPECT(!leonida::title_pool_free_extent(table, cpu, cpu + pool, cpu + 0x90000, gpu + 0x90000, cpu + pool, kAlign,
+                                            kMiB, unused));
+    // Mappings only in the GPU-only view (buffers placed there) bound the extent in the CPU view too: it starts after
+    // the one before the request and ends at the one after it.
+    EXPECT(table.add(gpu + 0x1F8000, 0xC000, 0x300000));
+    EXPECT(table.add(gpu + 0x240000, 0x10000, 0x400000));
+    EXPECT(leonida::title_pool_free_extent(table, cpu, cpu + pool, cpu + 0x208000, gpu + 0x208000, cpu + pool, kAlign,
+                                           kMiB, bounded));
+    EXPECT(bounded.start == cpu + 0x204000 && bounded.size == 0x3C000);
+    EXPECT(!leonida::title_pool_free_extent(table, cpu, cpu + pool, cpu + 0x1F9000, gpu + 0x1F9000, cpu + pool,
+                                            kAlign, kMiB, unused));
+    std::printf("stream pool: an extent requested before another stops at it in either view (%llu KiB, then %llu "
+                "KiB between two GPU-view mappings); no range replaced\n",
+                static_cast<unsigned long long>(second.size >> 10),
+                static_cast<unsigned long long>(bounded.size >> 10));
+    return 0;
+}
+
 }  // namespace
 
 int main() {
     if (check_window_budget()) return 1;
     if (check_stream_pool()) return 1;
+    if (check_pool_extent_stops_at_mapping()) return 1;
     std::printf("title_window_plan: a refused window gives no raw base, and a stream pool's two views share one "
                 "mapping\n");
     return 0;
