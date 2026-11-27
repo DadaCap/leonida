@@ -10,11 +10,14 @@
 //     16-24 GiB, so it cannot be one allocation: one mapping serves a page-aligned readable run of it, and every
 //     request inside that run reuses it instead of asking for a 128 KiB window each. A mapping never covers bytes
 //     another one already serves, in either view of the pool: a range entered over a live one replaces it whole
-//     (TitleVaAliases::add), and the copy that range answered from would be left answered by nothing.
+//     (TitleVaAliases::add), and the copy that range answered from would be left answered by nothing. The exception
+//     is a request that runs into the next mapping, which gets one mapping over it and the windows it reaches, each
+//     whole (title_pool_cover), never one shorter than its bytes.
 #include "title_va_alias.h"
 
 #include <algorithm>
 #include <cstdint>
+#include <vector>
 
 namespace leonida {
 
@@ -82,6 +85,44 @@ inline bool title_pool_free_extent(const TitleVaAliases& aliases, std::uint64_t 
     lo = (std::max)(lo, va - (std::min)(va, twin - twin_lo));
     hi = (std::min)(hi, va + (std::min)(UINT64_MAX - va, twin_hi - twin));
     return title_pool_extent((std::max)(pool_lo, lo), (std::min)(pool_hi, hi), va, readable_end, align, most, out);
+}
+
+// The one mapping a stream-pool request [va, end) gets when what would serve it stops short: the free extent made
+// for it ends at the next mapping, or `va` lies in a mapping that ends before `end`. It starts at `start` (that
+// extent's start, or `va`) and covers the request and, whole, every range the result overlaps in either view (`twin`:
+// va's byte in the pair's other view, `va` when there is none), page-aligned at its end. A range entered over it
+// replaces those ranges whole (TitleVaAliases::add), so none of their bytes is left unanswered and no view reaches
+// past the copy it was given. `owned(shader_va)` says the caller can retire the copy a range answers from (a title
+// window); any other range in the way (a slot-133 buffer, a geometry copy) makes it false, as does a mapping past
+// `most` bytes or outside [pool_lo, pool_hi). `out` is unchanged on false.
+template <class Owned>
+inline bool title_pool_cover(const TitleVaAliases& aliases, std::uint64_t pool_lo, std::uint64_t pool_hi,
+                             std::uint64_t va, std::uint64_t twin, std::uint64_t start, std::uint64_t end,
+                             std::uint64_t align, std::uint64_t most, Owned&& owned, TitleWindowRange& out) {
+    if (!align || (align & (align - 1)) != 0 || start > va || va >= end || start < pool_lo || end > pool_hi)
+        return false;
+    const auto aligned_end = [&](std::uint64_t e) {
+        return e > pool_hi - (align - 1) ? pool_hi : (std::min)(pool_hi, (e + align - 1) & ~(align - 1));
+    };
+    const std::uint64_t shift = twin - va;  // a range at x in the other view is at x - shift in va's (modulo 2^64)
+    std::uint64_t lo = start, hi = aligned_end(end);
+    std::vector<TitleVaAliases::Mapping> hits;
+    for (bool grew = true; grew;) {
+        grew = false;
+        for (int view = 0; view < (shift ? 2 : 1); ++view) {
+            const std::uint64_t by = view ? shift : 0;
+            aliases.overlapping(lo + by, hi + by, hits);
+            for (const TitleVaAliases::Mapping& m : hits) {
+                const std::uint64_t b = m.title_va - by, e = m.end - by;
+                if (!owned(m.shader_va) || b < pool_lo || e > pool_hi) return false;  // not ours, or not coverable
+                if (b < lo) lo = b, grew = true;
+                if (e > hi) hi = aligned_end(e), grew = true;
+            }
+        }
+        if (lo < pool_lo || hi > pool_hi || hi - lo > most) return false;
+    }
+    out = {lo, hi - lo};
+    return true;
 }
 
 }  // namespace leonida

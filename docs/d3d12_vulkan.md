@@ -1714,9 +1714,14 @@ The copies:
   `LEONIDA_TITLE_WINDOWS_MB` (64 MiB by default). A window that no range answers from any more (a slot-133 buffer the
   title placed over its pages, or a BVH input's exact copy, replaced its ranges) is **retired** after the next
   submission's refresh: the alias table's listener records the removed ranges' copies, and a window none of its
-  ranges is left for loses its tracker, its stream-pool extent and its bytes of the budget at once. Its memory is
-  freed as a retired geometry copy's is, once every `ExecuteCommandLists` replay in progress then has recorded its
-  submissions and those have completed. `d3d12_title_window_orphans` and `title_window_plan` cover it. A window is
+  ranges is left for loses its stream-pool extent and its bytes of the budget at once. Its memory is freed as a
+  retired geometry copy's is, once every `ExecuteCommandLists` replay in progress then has recorded its submissions
+  and those have completed. Until then its copy stays a target of its pages' tracker, refreshed like the others, so
+  what those submissions wrote in it still goes back to the title's pages (the write-back of a submission runs at the
+  first refresh that sees it completed); it goes back only where no live copy over the same bytes changed them, and
+  every copy is compared with the title's bytes as they were before any copy went back. `d3d12_title_window_orphans`
+  (with a writing submission held on a fence while the next one's refresh retires its window) and
+  `title_window_plan` cover it. A window is
   not retired when its pages are released or remapped: a retail run measured no release at all of the pages windows
   cover (the title remaps its pool frames instead), and the tracker follows the pages.
   A tracker the window shared with a copy still live keeps its extent (a retirement never splits one). A window that
@@ -1748,6 +1753,13 @@ The copies:
   that note), and **one mapping serves a page-aligned readable run** of the pool (at most 1 MiB, and never past the
   next mapping in either view; a geometry copy when the cap allows, a window otherwise). A request whose byte a
   mapping already holds in either view is served by it, and the other view is entered as far as that mapping reaches.
+  A request never gets a mapping shorter than its bytes (a V#'s size, 64 KiB for a root view): one that runs into the
+  next mapping, or past the end of the one holding its first byte, gets one mapping over the request and every window
+  it reaches, each whole, in both views (`title_pool_cover`); a range entered over theirs replaces them, and they are
+  retired at the next submission. A short mapping would leave a root view reaching past its copy into whatever the
+  arena holds next (read, and written), and a V# refused every time it is looked up. With a range in the way that is
+  not a window (a slot-133 buffer, a geometry copy), a new extent is not made (a zero-size view), and a request inside
+  an existing mapping keeps that mapping's answer, as before.
   Both addresses of the pair are entered in the table, so a V# naming either reaches that one mapping instead of
   asking for a second one; `LEONIDA_GEOMETRY_MB` is the preferred backing.
   Acceleration-structure destinations and scratch also resolve through the table, and a structure no window holds
