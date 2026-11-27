@@ -1708,7 +1708,8 @@ The copies:
 - Any **other address in the title's memory** gets a window: the 64 KiB-aligned pages it covers, clipped to the
   title's range, copied into the arena now and before every submission, through the same shadow refresh as slot 133
   (so dirty-page tracking for that refresh applies to both). Windows stay until the device goes, up to
-  `LEONIDA_TITLE_WINDOWS_MB` (64 MiB by default). A window that
+  `LEONIDA_TITLE_WINDOWS_MB` (64 MiB by default); past `LEONIDA_TITLE_WINDOWS_ARENA_MB` (no limit by default) windows
+  are made in system-memory blocks outside the arena instead of in it. A window that
   cannot fit between the title's address reservations can use a separate mapped buffer. The buffer's device address
   must fit as a positive 47-bit offset from the arena base. The same window cap and dirty-page refresh apply.
   `LEONIDA_STREAM_BUFFER_WINDOWS=0` requires the window to fit in the arena.

@@ -3042,7 +3042,7 @@ struct DeviceState {
     std::atomic<bool> external_window_made{false};  // a window lies outside the arena: device_reachable looks there
     std::vector<TitleWindow> title_windows;
     std::atomic<std::size_t> title_window_count{0};  // title_windows.size(), read without the mutex
-    std::uint64_t title_window_bytes = 0;
+    std::uint64_t title_window_bytes = 0, title_window_arena_bytes = 0;  // all windows; those in the arena
     std::uint64_t title_window_cap = 64ull << 20;
     // What the GPU wrote into a copy of the title's memory goes back to the title's pages: the ranges reached since
     // the last submission (title_va_alias.h note_reached), copied back at the next refresh before the forward copy.
@@ -3244,8 +3244,23 @@ struct DeviceState {
         }
         VkDeviceSize offset = 0;
         std::uint8_t* mapped{};
-        if (arena_allocate(size, kTitleWindowAlign, offset, arena_buffer)) {
+        // LEONIDA_TITLE_WINDOWS_ARENA_MB: the most window bytes kept in the arena (no limit when unset). The rest go to
+        // blocks in system memory (external_windows), so a few GiB of windows need not be in VRAM.
+        static const std::uint64_t arena_cap = [] {
+            const char* v = std::getenv("LEONIDA_TITLE_WINDOWS_ARENA_MB");
+            return v && *v ? std::uint64_t(std::strtoull(v, nullptr, 10)) << 20 : ~std::uint64_t(0);
+        }();
+        const bool outside = stream_windows() && !leonida::title_window_fits(arena_cap, title_window_arena_bytes, size);
+        bool past_arena_share = false;
+        if (outside) {
+            const leonida::memory_breakdown::Owner owner(leonida::memory_breakdown::Consumer::windows);
+            past_arena_share = external_windows.allocate(*this, size, offset, mapped);
+        }
+        if (past_arena_share) {
+            external_window_made.store(true, std::memory_order_release);
+        } else if (arena_allocate(size, kTitleWindowAlign, offset, arena_buffer)) {
             mapped = arena.mapped + offset;
+            title_window_arena_bytes += size;
         } else if (leonida::memory_breakdown::Owner owner(leonida::memory_breakdown::Consumer::windows);
                    stream_windows() && external_windows.allocate(*this, size, offset, mapped)) {
             external_window_made.store(true, std::memory_order_release);
