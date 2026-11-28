@@ -60,7 +60,7 @@ def _unregister_process(proc):
 def _kill_process_tree(proc):
     if proc is None:
         return
-    if os.name == "nt":
+    if os.name == "nt" and proc.poll() is None:
         try:
             subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -75,11 +75,13 @@ def _kill_process_tree(proc):
 def _terminate_active_processes():
     with _processes_lock:
         procs = list(_active_processes)
-    for p in procs:
-        try:
-            p.terminate()
-        except OSError:
-            pass
+    if os.name != "nt":
+        for p in procs:
+            try:
+                p.terminate()
+            except OSError:
+                pass
+    # On Windows taskkill /T needs the root process alive to find its descendants.
     for p in procs:
         _kill_process_tree(p)
         try:

@@ -419,6 +419,28 @@ class RunnerTest(unittest.TestCase):
                     p.kill()
                 except OSError:
                     pass
+                r._unregister_process(p)
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows taskkill")
+    def test_windows_cancellation_stops_descendants(self):
+        marker = "descendant completed"
+        child = f"import time; time.sleep(3); print({marker!r}, flush=True)"
+        parent = (
+            "import subprocess, sys, time\n"
+            f"subprocess.Popen([sys.executable, '-c', {child!r}])\n"
+            "print('ready', flush=True)\n"
+            "time.sleep(5)\n"
+        )
+        cmd = [sys.executable, "-c", parent]
+        with subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True) as proc:
+            self.assertEqual(proc.stdout.readline().strip(), "ready")
+            r._register_process(proc)
+            try:
+                r._terminate_active_processes()
+                output, _ = proc.communicate(timeout=5)
+            finally:
+                r._unregister_process(proc)
+            self.assertNotIn(marker, output)
 
     @unittest.skipUnless(os.name == "posix", "POSIX process-group SIGINT test")
     def test_posix_sigint_cancels_queued_modules_and_stops_runner(self):
