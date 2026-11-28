@@ -379,7 +379,9 @@ def _device_per_vertex():
         try:
             r = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "vk_subgroup_info.py")],
                                capture_output=True, text=True, timeout=60)
-            answer = json.loads(r.stdout.strip().splitlines()[-1]).get("per_vertex_inputs")
+            report = json.loads(r.stdout.strip().splitlines()[-1])
+            if isinstance(report, dict):
+                answer = report.get("per_vertex_inputs")
         except (OSError, ValueError, IndexError, subprocess.SubprocessError):
             pass
         _PER_VERTEX.append(answer)
@@ -394,7 +396,9 @@ def _device_barycentric_fallback():
         try:
             r = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "vk_subgroup_info.py")],
                                capture_output=True, text=True, timeout=60)
-            answer = json.loads(r.stdout.strip().splitlines()[-1]).get("barycentric_fallback")
+            report = json.loads(r.stdout.strip().splitlines()[-1])
+            if isinstance(report, dict):
+                answer = report.get("barycentric_fallback")
         except (OSError, ValueError, IndexError, subprocess.SubprocessError):
             pass
         _BARYCENTRIC_FALLBACK.append(answer)
