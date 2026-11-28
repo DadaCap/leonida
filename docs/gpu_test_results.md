@@ -210,6 +210,7 @@ Setup: `cmake -S runtime -B runtime/build -DLLVM_MC=<path-to-llvm-mc.exe>`; `cma
 All 8 D3D12 shader tests (`d3d12_translated_draw`, `d3d12_m2_textured`, `d3d12_m2_formats`, `d3d12_m3_frame`, `d3d12_m3_first_pass`, `d3d12_m4_compute`, `d3d12_buffer_uav`, `d3d12_subgroup`) passed 8/8.
 
 AI-assisted: built `main` at `5d74c2723`, ran `ctest`, `build.py`, `check.py`, and `run_gpu_tests.py` on this GPU with synthetic inputs only (no game files).
+
 ## Intel Iris Xe Graphics (Alder Lake-P) — 2026-11-24
 
 ```
@@ -270,6 +271,7 @@ Skipped:    W64_EMULATE=1 skips are the 16 harness-external d3d12_* / w64_graphi
 ```
 
 AI-assisted: built the portable Vulkan test tools locally on Windows 11 with MSYS2 `clang64` and ran all synthetic shader and C++ `ctest` suites on both GPUs (no game files).
+
 ## AMD Radeon 780M — 2026-11-25
 
 ```
@@ -300,6 +302,7 @@ not carry the tag `vk_store_test` now expects (#1518), and pull request 1518 fix
 
 AI-assisted (MiniMax Code): built `main` at `bcaa13dad`, ran `run_gpu_tests.py` on this GPU natively and with
 `LEONIDA_W64_EMULATE=1`, and reran the `cs_imgatomic` family with 1518 applied.
+
 ## NVIDIA GeForce RTX 4060 Ti — 2026-11-24
 
 ```
@@ -368,6 +371,7 @@ AI-assisted (Hermes Agent): built `main` at `21625bc`, ran `build.py`, `check.py
 emulated, reproduced the two failures alone with `--filter tfe`, and reran the native suite with implicit layers
 disabled. The entry was first measured at `1c93c86`; `main` moved 42 commits while it was written, so every count
 above is from `21625bc`.
+
 ## AMD Radeon 660M — 2026-11-24
 
 ```
