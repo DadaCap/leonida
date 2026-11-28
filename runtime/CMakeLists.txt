@@ -4874,6 +4874,7 @@ if(TARGET Vulkan::Headers)
       endif()
     endif()
     add_test(NAME vk_xdxr_postbuild_readback COMMAND vk_xdxr_postbuild_readback_test)
+    set_tests_properties(vk_xdxr_postbuild_readback PROPERTIES SKIP_RETURN_CODE 77)
 
     # Title-placed buffer VAs (device slot 133) and the console VA shaders reach them by (src/title_va_alias.h).
     add_executable(title_va_alias_test test/title_va_alias_test.cpp)
