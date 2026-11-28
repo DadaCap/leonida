@@ -33,6 +33,7 @@ post counts and pass/fail lines there, never game shaders, logs or private paths
 | Intel UHD Graphics 630 (Coffee Lake GT2, Gen9.5), subgroup 8..32 | ANV, Mesa 26.1.6, Vulkan 1.4.354, Linux | `3aa9754` | 283/283 translated and valid | 182/222 pass, 40 skipped | 195/252 passed, 57 skipped (native); 226/252 passed, 26 skipped (`LEONIDA_W64_EMULATE=1`) | none in the shader suites; ctest: `vk_predicated_copy`, `xdxr_build_check` timeout (see note) | [local note](../gpu-test-results/UHD630-Linux.txt) |
 | Apple M5 (8-core GPU, Metal 4), subgroup 4..32 | MoltenVK 1.4.2 (Homebrew), Vulkan 1.4.357, macOS 27.2.1 (26B131) | `47c651174` | 281/281 translated and valid | 175/220 pass, 39 skipped, 6 failed | 185/249 passed, 61 skipped, 3 failed (native); 215/249 passed, 30 skipped, 4 failed (`LEONIDA_W64_EMULATE=1`) | `cs_fma_fused` (known row), `cs_imgload_tfe`, `cs_imgload_d16_tfe` (#31), `ps_imgatomic` flake (#543) | [local note](../gpu-test-results/AppleM5.txt) |
 | AMD Radeon 780M (RDNA3 iGPU, gfx1103), subgroup 32..64 | AMD proprietary 26.10.2 (LLPC), Vulkan 1.4.359, Windows 11 10.0.29712 | `bcaa13d` | not run; 273/273 translated and valid via run_gpu_tests.py | not run separately (run_gpu_tests.py below) | 243/263 passed, 18 skipped, 2 failed (native and emulated) | `cs_imgatomic_ext` (#1518), `cs_texture_uav` (no D3D12 build on this machine) | [local note](../gpu-test-results/780M.txt) |
+| NVIDIA GeForce RTX 4060 Ti (Ada, AD106), subgroup 32..32 | NVIDIA 610.88, Vulkan 1.4.341, Windows 11 26300.9974 | `8f481cf` | run via run_gpu_tests.py | run via run_gpu_tests.py | 197/248 passed, 49 skipped (native); 229/248 passed, 17 skipped (`LEONIDA_W64_EMULATE=1`) | `cs_imgload_tfe`, `cs_imgload_d16_tfe` (#31) | [local note](../gpu-test-results/RTX4060Ti.txt) |
 
 ## AMD Radeon RX 9070 GRE — 2026-11-23
 
@@ -292,3 +293,24 @@ not carry the tag `vk_store_test` now expects (#1518), and pull request 1518 fix
 
 AI-assisted (MiniMax Code): built `main` at `bcaa13dad`, ran `run_gpu_tests.py` on this GPU natively and with
 `LEONIDA_W64_EMULATE=1`, and reran the `cs_imgatomic` family with 1518 applied.
+## NVIDIA GeForce RTX 4060 Ti — 2026-11-24
+
+```
+GPU:        NVIDIA GeForce RTX 4060 Ti (Ada / AD106, PCI 10de:2805), subgroup 32..32
+Driver:     NVIDIA 610.88 (Windows driver 32.0.16.1088), Vulkan 1.4.341
+OS:         Windows 11, 10.0.26300.9974
+Commit:     8f481cf16 (main, 2026-11-24)
+run_gpu_tests.py: 257 shaders: 257 translated, 257 pass spirv-val
+            native: 197/248 passed, 49 skipped, 2 failed
+            LEONIDA_W64_EMULATE=1: 229/248 passed, 17 skipped, 2 failed
+Failed:     cs_imgload_tfe, cs_imgload_d16_tfe (#31)
+```
+
+The device has no 64-wide subgroup. Natively, the 33 wave64 tests skip; under `LEONIDA_W64_EMULATE=1` all but the
+64-wide fragment one run and pass. The other 16 skips are the documented "run by d3d12_*_test / w64_graphics.py"
+cases. On the same checkout `ctest` passed 302/303: `d3d12_execute_indirect_validation` fails 5 parity cases on this
+host's D3D12 runtime (10.0.26100.9818), and #337 makes it 303/303. The full record is in
+[`gpu-test-results/RTX4060Ti.txt`](../gpu-test-results/RTX4060Ti.txt).
+
+AI-assisted (Claude Code): built `main` at `8f481cf`, ran `run_gpu_tests.py` native and emulated, `ctest` and the
+translator suite on this GPU.
