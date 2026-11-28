@@ -842,6 +842,22 @@ exits 77, so CI skips it. `image_fuzz.py --oracle hw` loads a linear texture thr
 its CPU model; add `--negative-control` to check that wrong models are caught. A gfx1150 (RDNA3.5) is not RDNA2: a
 match supports the model and does not prove RDNA2. Run these one at a time: a second job on the same GPU can hang it.
 
+## Model oracle on any Vulkan GPU (no AMD hardware)
+
+`pk16_diff.py`, `vint_diff.py` and `sdwa_diff.py` judge their translated programs on a Vulkan GPU only against the words
+a native AMD GPU produced (`--oracle hw,vk`). `tools/vk_model_fuzz.py` runs the same programs, for the same seed, on
+whatever Vulkan GPU you have and judges them against the fuzzer's reference model instead:
+
+```sh
+python -I tools/vk_model_fuzz.py pk16_diff --programs 1500 --seed 11 --build runtime/build
+```
+
+`--build` is the folder with `vk_compute_test`; `llvm-mc` with the AMDGPU target is needed as for `valu_fuzz.py`. It exits
+0 when every judged program matched, 1 on a mismatch (the first few programs are printed), 2 when `vk_compute_test` is
+missing and 77 when nothing could be judged. A program the model declines counts as a skip. A mismatch here is the GPU
+disagreeing with the model, which is a driver difference, a translator bug or a model bug: re-read the program with
+the fuzzer itself (`pk16_diff.py --seed S --programs N`) before reporting it.
+
 ## Choosing the GPU
 
 With more than one GPU, pick one through the Vulkan loader, for example
