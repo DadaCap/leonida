@@ -334,7 +334,9 @@ def run_cmd(cmd: list[str], env: dict | None = None, gpu: bool = True, *,
     # gpu=False (the translator over the whole suite) runs without a limit.
     limit = gpu_test_timeout() if gpu else None
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=limit, cwd=cwd)
+        # Keep the exit status and the rest of the log if a tool emits bytes outside the host encoding.
+        p = subprocess.run(cmd, capture_output=True, text=True, errors="backslashreplace",
+                           env=env, timeout=limit, cwd=cwd)
     except subprocess.TimeoutExpired:
         return 1, timed_out(cmd[0], limit)
     except OSError as e:   # e.g. Smart App Control blocked a fresh build: fail this test, keep running the others
