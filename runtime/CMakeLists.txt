@@ -4481,6 +4481,11 @@ if(TARGET Vulkan::Headers)
     target_link_libraries(d3d12_set_descriptor_heaps_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
     target_compile_definitions(d3d12_set_descriptor_heaps_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(d3d12_set_descriptor_heaps_test PRIVATE /W4 /permissive- /utf-8)
+    if(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
+      target_sources(d3d12_set_descriptor_heaps_test PRIVATE ${LEONIDA_TEST_CS})
+      target_compile_definitions(d3d12_set_descriptor_heaps_test PRIVATE
+                                 LEONIDA_TEST_CS_SPV="${LEONIDA_TEST_CS}")
+    endif()
     add_test(NAME d3d12_set_descriptor_heaps COMMAND d3d12_set_descriptor_heaps_test)
     set_tests_properties(d3d12_set_descriptor_heaps PROPERTIES SKIP_RETURN_CODE 77
                          FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
