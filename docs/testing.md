@@ -362,12 +362,13 @@ of those fail for that reason.
 
 ### Run a Windows CI artifact under Wine
 
-The `Runtime` workflow uploads `runtime-windows` for seven days. It contains the Windows executables, DLLs,
+The [Runtime workflow](https://github.com/ubiquitarianism/leonida/actions/workflows/runtime.yml) uploads
+`runtime-windows` for seven days. It contains the Windows executables, DLLs,
 synthetic test shaders, CTest inventory and the path of the Windows checkout. From a clean checkout of the commit
 used by the Windows job, set `run_id` to the Actions run ID and download the artifact to `runtime/build`:
 
 ```sh
-gh run download "$run_id" --repo ItsNotRexed/Leonida --name runtime-windows --dir runtime/build
+gh run download "$run_id" --repo ubiquitarianism/leonida --name runtime-windows --dir runtime/build
 
 WINE=wine WINEPREFIX="$(mktemp -d)" WINEDLLOVERRIDES="mscoree,mshtml=" WINEDEBUG=-all \
   bash scripts/run_wine_session.sh python3 -I scripts/run_wine_tests.py \
@@ -654,7 +655,7 @@ constant `false` there instead makes the emulated `ms_tri` draw a frame byte-ide
 `ms_tri`, `ms_wave_info_s3`, `ms_w64x_ballot` and `ms_v5_workgroup` byte-identical to NVIDIA's at both widths (Mesa
 26.0.3, [measured by @TreXito](https://github.com/ItsNotRexed/Leonida/pull/3838#issuecomment-7086696759), with a 42-line reduced
 reproducer). llvmpipe is not a substitute for a result from a
-real GPU in [#166](https://github.com/ItsNotRexed/Leonida/issues/166): it catches regressions, not hardware
+real GPU in [gpu-test-results/](../gpu-test-results/): it catches regressions, not hardware
 differences.
 
 ## Macs in CI
