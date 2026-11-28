@@ -1707,14 +1707,15 @@ def run_suite(a, work: str) -> int:
                 ok, detail = check_flat(raw)
                 results.append((name, ok, detail))
 
-    if a.filter and not results:   # the filter matched only inputs/partners: say so rather than "0/0 passed"
+    if (a.filter or disasm_src is not None) and not results:
         names = [os.path.splitext(f)[0] for f in asm_files]
         partners = {os.path.splitext(f)[0] for f in DRAWN_WITH.values()} | set(TEXTURE_MIP_DEPENDENCIES)
         shown = ", ".join(names[:5]) + (", ..." if len(names) > 5 else "")
         role = "partners built for other tests" if partners.issuperset(names) else "inputs without a GPU test row"
         hint = ("; cs_bench_* shaders are benchmark inputs, run them with the benchmark tool"
                 if all(n.startswith("cs_bench_") for n in names) else "")
-        print(f"error: --filter {a.filter!r} selected {shown} but no runnable GPU test cases ({role}){hint}",
+        selected_by = f"--filter {a.filter!r}" if a.filter else f"--disasm-dir {disasm_src!r}"
+        print(f"error: {selected_by} selected {shown} but no runnable GPU test cases ({role}){hint}",
               file=sys.stderr)
         return 2
 
