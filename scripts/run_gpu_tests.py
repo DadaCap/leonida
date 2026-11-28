@@ -102,7 +102,7 @@ def make_ms_psv0(threads_x: int, maxv: int, maxp: int, topology: int = 2, group_
 TEXT_ONLY_MARK = "; run_gpu_tests: text only, llvm-mc has no gfx1013 encoding for an instruction here"
 
 
-def assemble_to_s(llvm_mc: str, asm_path: str, s_path: str, name: str) -> None:
+def assemble_to_s(llvm_mc: str | None, asm_path: str, s_path: str, name: str) -> None:
     """Assemble raw RDNA2 .asm with llvm-mc -show-encoding into .s format for rdna2spirv.py."""
     with open(asm_path, encoding="utf-8") as source:
         raw = source.read()
@@ -780,8 +780,11 @@ def native_folder(path: str, ansi: str = "mbcs") -> str | None:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--llvm-mc", default=os.environ.get("LLVM_MC", "llvm-mc"),
-                    help="llvm-mc path, or a whole command such as 'wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc'")
+    # No literal default: unset, mc_command() reads LLVM_MC and then finds llvm-mc on PATH or a versioned
+    # Debian/Ubuntu install (llvm-mc-21, /usr/lib/llvm-21/bin/llvm-mc), as the not-found message promises.
+    ap.add_argument("--llvm-mc", default=None,
+                    help="llvm-mc path, or a whole command such as 'wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc' "
+                         "(default: LLVM_MC, then llvm-mc on PATH, then the newest llvm-mc-<N>)")
     ap.add_argument("--build", default=os.path.join(ROOT, "runtime", "build"),
                     help="CMake build folder; with the Visual Studio generator the RelWithDebInfo/Release/... "
                          "subfolder that has the test programs is found by itself")
